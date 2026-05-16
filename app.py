@@ -130,67 +130,142 @@ def download_media(m3u8_url, title, mode="audio"):
 # ========================================================
 st.set_page_config(page_title="Gimymax Media Downloader", page_icon="🎬", layout="centered")
 
-st.title("🎬 線上短劇/影集 下載器")
-st.markdown("將 Gimymax 等影片網址的串流直接下載，可選擇儲存為 **高音質MP3** 或 **原畫質MP4**。")
+st.title("🎬 媒體下載與音訊提取器")
 
-target_urls = st.text_area("🔗 請輸入影片網址 (每行一個，最多15個):", placeholder="https://gimymax.com/ep/... \nhttps://gimymax.com/ep/... ")
+tab1, tab2 = st.tabs(["🌐 線上影片下載", "📁 本地影片音訊提取"])
 
-# 即時計算目前已輸入的有效網址數量，並提示剩餘可輸入數量
-current_urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
-current_count = len(current_urls)
-remaining = max(0, 15 - current_count)
-
-if current_count > 15:
-    st.error(f"⚠️ 目前已輸入 {current_count} 個網址，超過上限 15 個！")
-elif current_count > 0:
-    st.caption(f"ℹ️ 已輸入 **{current_count}** 個，您還可以再輸入 **{remaining}** 個網址。")
-else:
-    st.caption(f"ℹ️ 您可以輸入最多 **15** 個網址。")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    btn_video = st.button("⬇️ 開始批次下載影片", type="primary", use_container_width=True)
-with col2:
-    btn_audio = st.button("🎵 開始批次下載音訊", use_container_width=True)
-
-if btn_video or btn_audio:
-    mode = "video" if btn_video else "audio"
+with tab1:
+    st.markdown("將 Gimymax 或 X.com 等影片網址的串流直接下載，可選擇儲存為 **高音質MP3** 或 **原畫質MP4**。")
     
-    urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
+    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個，最多15個):", placeholder="https://gimymax.com/ep/... \nhttps://x.com/i/status/...")
     
-    if not urls:
-        st.warning("⚠️ 請先輸入網址！")
-    elif len(urls) > 15:
-        st.error("⚠️ 一次最多只能輸入 15 個網址，請減少數量後重試！")
+    # 即時計算目前已輸入的有效網址數量，並提示剩餘可輸入數量
+    current_urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
+    current_count = len(current_urls)
+    remaining = max(0, 15 - current_count)
+    
+    if current_count > 15:
+        st.error(f"⚠️ 目前已輸入 {current_count} 個網址，超過上限 15 個！")
+    elif current_count > 0:
+        st.caption(f"ℹ️ 已輸入 **{current_count}** 個，您還可以再輸入 **{remaining}** 個網址。")
     else:
-        mode_str = "影片" if mode == "video" else "音頻"
-        st.info(f"📥 準備下載 {len(urls)} 個{mode_str}檔案...")
+        st.caption(f"ℹ️ 您可以輸入最多 **15** 個網址。")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        btn_video = st.button("⬇️ 開始批次下載影片", type="primary", use_container_width=True)
+    with col2:
+        btn_audio = st.button("🎵 開始批次下載音訊", use_container_width=True)
+    
+    if btn_video or btn_audio:
+        mode = "video" if btn_video else "audio"
         
-        # 建立進度條
-        progress_bar = st.progress(0)
+        urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
         
-        # 遍歷網址進行下載
-        for i, url in enumerate(urls):
-            current_num = i + 1
-            st.markdown(f"### 📍 正在處理第 {current_num}/{len(urls)} 個...")
+        if not urls:
+            st.warning("⚠️ 請先輸入網址！")
+        elif len(urls) > 15:
+            st.error("⚠️ 一次最多只能輸入 15 個網址，請減少數量後重試！")
+        else:
+            mode_str = "影片" if mode == "video" else "音頻"
+            st.info(f"📥 準備下載 {len(urls)} 個{mode_str}檔案...")
             
-            try:
-                st.text(f"正在擷取網頁資訊: {url}")
-                with st.spinner("🔍 尋找影片串流中..."):
-                    m3u8_url, title = get_stream_info(url)
+            # 建立進度條
+            progress_bar = st.progress(0)
+            
+            # 遍歷網址進行下載
+            for i, url in enumerate(urls):
+                current_num = i + 1
+                st.markdown(f"### 📍 正在處理第 {current_num}/{len(urls)} 個...")
                 
-                if not m3u8_url:
-                    st.error(f"❌ 找不到有效的 m3u8 串流網址: {url}")
-                else:
-                    download_media(m3u8_url, title, mode=mode)
+                try:
+                    st.text(f"正在擷取網頁資訊: {url}")
+                    with st.spinner("🔍 尋找影片串流中..."):
+                        m3u8_url, title = get_stream_info(url)
                     
-            except Exception as e:
-                st.error(f"❌ 處理 {url} 時發生錯誤: {e}")
+                    if not m3u8_url:
+                        st.error(f"❌ 找不到有效的影片串流網址: {url}")
+                    else:
+                        download_media(m3u8_url, title, mode=mode)
+                        
+                except Exception as e:
+                    st.error(f"❌ 處理 {url} 時發生錯誤: {e}")
+                
+                # 更新進度條
+                progress_bar.progress(current_num / len(urls))
+                st.divider()
+                
+            st.balloons()
+            st.success("🎉 所有下載任務處理完畢！")
+
+with tab2:
+    st.markdown("從本地端的影片檔案提取出純音訊，完全在記憶體內處理，避免硬碟損耗。")
+    local_video_path = st.text_input("📁 請輸入本地影片檔案的絕對路徑:", placeholder="/Users/ericcheng/Movies/example.mp4")
+    audio_format = st.selectbox("🎵 請選擇輸出音訊格式:", ["預設 (原始格式)", "M4A", "MP3"])
+    
+    if st.button("▶️ 開始提取音訊", type="primary", use_container_width=True):
+        if not local_video_path.strip():
+            st.warning("⚠️ 請先輸入本地影片路徑！")
+        elif not os.path.isfile(local_video_path.strip()):
+            st.error("❌ 找不到指定的檔案，請確認路徑正確！")
+        else:
+            video_path = local_video_path.strip()
+            base_name = os.path.splitext(os.path.basename(video_path))[0]
+            out_dir = "/Users/ericcheng/Google Drive/我的雲端硬碟/美劇/New"
+            os.makedirs(out_dir, exist_ok=True)
             
-            # 更新進度條
-            progress_bar.progress(current_num / len(urls))
-            st.divider()
+            ext = ""
+            fmt = ""
+            ffmpeg_cmd = []
             
-        st.balloons()
-        st.success("🎉 所有下載任務處理完畢！")
+            if audio_format == "MP3":
+                ext = "mp3"
+                ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
+            elif audio_format == "M4A":
+                ext = "m4a"
+                ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
+            else:
+                try:
+                    probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
+                    codec = subprocess.check_output(probe_cmd, text=True).strip()
+                    
+                    if codec == "aac":
+                        ext = "aac"
+                        fmt = "adts"
+                    elif codec == "mp3":
+                        ext = "mp3"
+                        fmt = "mp3"
+                    elif codec == "opus":
+                        ext = "opus"
+                        fmt = "opus"
+                    else:
+                        ext = "m4a"
+                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
+                        codec = "unknown"
+                        
+                    if codec != "unknown":
+                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "copy", "-f", fmt, "pipe:1"]
+                except Exception as e:
+                    st.warning("⚠️ 無法解析原始音訊格式，將預設轉換為 MP3。")
+                    ext = "mp3"
+                    ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
+
+            out_path = os.path.join(out_dir, f"{base_name}.{ext}")
+            
+            if os.path.exists(out_path):
+                st.success(f"⏭️ 檔案已存在: `{out_path}`")
+            else:
+                try:
+                    with st.spinner(f"⏳ 正在提取音訊為 {ext.upper()} (100% RAM 處理中)..."):
+                        process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        if process.returncode == 0:
+                            with open(out_path, "wb") as f:
+                                f.write(process.stdout)
+                            st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
+                        else:
+                            st.error("❌ 提取失敗！")
+                            with st.expander("錯誤日誌"):
+                                st.text(process.stderr.decode('utf-8', errors='ignore'))
+                except Exception as e:
+                    st.error(f"❌ 發生例外錯誤: {e}")
