@@ -125,8 +125,11 @@ def download_media(m3u8_url, title, mode="audio"):
         st.error(f"❌ 發生例外錯誤: {e}")
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
 
-def extract_local_audio(video_path, audio_format):
-    base_name = os.path.splitext(os.path.basename(video_path))[0]
+def extract_local_audio(video_path, audio_format, title=None):
+    if title:
+        base_name = title
+    else:
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
     out_dir = "/Users/ericcheng/Google Drive/我的雲端硬碟/美劇/New"
     os.makedirs(out_dir, exist_ok=True)
     
@@ -261,14 +264,60 @@ with tab1:
             st.success("🎉 所有下載任務處理完畢！")
 
 with tab2:
-    st.markdown("從本地端的影片檔案提取出純音訊，完全在記憶體內處理，避免硬碟損耗。")
-    local_video_path = st.text_input("📁 請輸入本地影片檔案的絕對路徑:", placeholder="/Users/ericcheng/Movies/example.mp4")
+    st.markdown("從本地檔案或線上播放清單提取出純音訊，完全在記憶體內處理，避免硬碟損耗。")
+    local_video_path = st.text_input("📁 請輸入路徑 (本地影片/資料夾，或 YouTube 網址/播放清單):", placeholder="/Users/ericcheng/Movies/ 或 https://youtube.com/playlist?list=...")
     audio_format = st.selectbox("🎵 請選擇輸出音訊格式:", ["預設 (原始格式)", "M4A", "MP3"])
     
     if st.button("▶️ 開始提取音訊", type="primary", use_container_width=True):
         input_path = local_video_path.strip()
         if not input_path:
-            st.warning("⚠️ 請先輸入本地影片或資料夾路徑！")
+            st.warning("⚠️ 請先輸入路徑！")
+        elif input_path.startswith("http://") or input_path.startswith("https://"):
+            import yt_dlp
+            urls_to_process = []
+            
+            ydl_opts = {
+                'quiet': True,
+                'extract_flat': 'in_playlist',
+            }
+            
+            try:
+                with st.spinner("🔍 正在解析線上網址/播放清單..."):
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(input_path, download=False)
+                        if 'entries' in info:
+                            for entry in info['entries']:
+                                urls_to_process.append(entry.get('url'))
+                        else:
+                            urls_to_process.append(input_path)
+            except Exception as e:
+                st.error(f"❌ 解析網址失敗: {e}")
+                
+            urls_to_process = [u for u in urls_to_process if u]
+            
+            if urls_to_process:
+                st.info(f"📥 準備處理 {len(urls_to_process)} 個線上影片...")
+                progress_bar = st.progress(0)
+                
+                for i, url in enumerate(urls_to_process):
+                    st.markdown(f"### 📍 正在處理第 {i+1}/{len(urls_to_process)} 個影片...")
+                    try:
+                        with st.spinner("🔍 尋找最佳串流..."):
+                            media_url, v_title = get_stream_info(url)
+                            
+                        if media_url:
+                            extract_local_audio(media_url, audio_format, title=v_title)
+                        else:
+                            st.error(f"❌ 無法取得串流: {url}")
+                    except Exception as e:
+                        st.error(f"❌ 發生例外錯誤: {e}")
+                    
+                    progress_bar.progress((i + 1) / len(urls_to_process))
+                    st.divider()
+                    
+                st.balloons()
+                st.success("🎉 所有線上提取任務處理完畢！")
+
         elif not os.path.exists(input_path):
             st.error("❌ 找不到指定的路徑，請確認路徑正確！")
         else:
