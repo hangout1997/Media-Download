@@ -3,6 +3,8 @@ import re
 import json
 import requests
 import subprocess
+import shutil
+import tempfile
 import streamlit as st
 
 def get_stream_info(url):
@@ -56,47 +58,50 @@ def download_media(m3u8_url, title, mode="audio"):
     os.makedirs(downloads_dir, exist_ok=True)
     out_path = os.path.join(downloads_dir, f"{title}.{ext}")
     
+    # 優化 1：下載前檢查，避免重複下載覆寫
+    if os.path.exists(out_path):
+        st.success(f"⏭️ 檔案已存在，自動跳過下載: `{title}.{ext}`")
+        return
+        
     st.info(f"📍 檔案將以 {ext.upper()} 格式儲存至: `{out_path}`")
     
-    if mode == "audio":
-        # 建構 FFmpeg 執行指令 (音訊)
-        # -y: 覆寫已存在檔案
-        # -i: 輸入網址 (M3U8)
-        # -vn: 不需要影像 (Video None)
-        # -c:a libmp3lame: 強制轉碼為 MP3
-        # -b:a 192k: 設定 192k 音質
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-i", m3u8_url,
-            "-vn",
-            "-c:a", "libmp3lame",
-            "-b:a", "192k",
-            out_path
-        ]
-        spinner_msg = f"⏳ 正在下載與轉碼為 {ext.upper()}，這可能需要幾分鐘的時間..."
-    else:
-        # 建構 FFmpeg 執行指令 (影片)
-        # -y: 覆寫已存在檔案
-        # -i: 輸入網址 (M3U8)
-        # -c copy: 複製原始視訊與音訊（不轉碼，無損直出）
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-i", m3u8_url,
-            "-c", "copy",
-            out_path
-        ]
-        spinner_msg = f"⏳ 正在下載影片串流並封裝為 {ext.upper()}，原始畫質無損直出中..."
-    
     try:
-        with st.spinner(spinner_msg):
-            process = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        # 優化 2：使用本地系統暫存資料夾，避免直接對 Google Drive 即時同步寫入，減少大量 I/O 碎片化
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_out_path = os.path.join(temp_dir, f"{title}.{ext}")
             
-            if process.returncode == 0:
-                st.success(f"✅ 下載完成！檔案已存入您的 Downloads 資料夾: `{title}.{ext}`")
+            if mode == "audio":
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", m3u8_url,
+                    "-vn",
+                    "-c:a", "libmp3lame",
+                    "-b:a", "192k",
+                    temp_out_path
+                ]
+                spinner_msg = f"⏳ 正在下載與轉碼為 {ext.upper()}，這可能需要幾分鐘的時間..."
             else:
-                st.error("❌ FFmpeg 下載失敗！")
-                with st.expander("檢視詳細錯誤日誌"):
-                    st.text(process.stderr)
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", m3u8_url,
+                    "-c", "copy",
+                    # 優化 3：加入 HLS 轉 MP4 常需的 bsf 標籤修正，提升播放相容性
+                    "-bsf:a", "aac_adtstoasc",
+                    temp_out_path
+                ]
+                spinner_msg = f"⏳ 正在下載影片串流並封裝為 {ext.upper()}，原始畫質無損直出中..."
+            
+            with st.spinner(spinner_msg):
+                process = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                
+                if process.returncode == 0:
+                    # 下載成功後再一次性移動到 Google Drive
+                    shutil.move(temp_out_path, out_path)
+                    st.success(f"✅ 下載完成！檔案已存入 Google Drive: `{title}.{ext}`")
+                else:
+                    st.error("❌ FFmpeg 下載失敗！")
+                    with st.expander("檢視詳細錯誤日誌"):
+                        st.text(process.stderr)
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
