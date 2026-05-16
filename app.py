@@ -125,6 +125,67 @@ def download_media(m3u8_url, title, mode="audio"):
         st.error(f"❌ 發生例外錯誤: {e}")
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
 
+def extract_local_audio(video_path, audio_format):
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    out_dir = "/Users/ericcheng/Google Drive/我的雲端硬碟/美劇/New"
+    os.makedirs(out_dir, exist_ok=True)
+    
+    ext = ""
+    fmt = ""
+    ffmpeg_cmd = []
+    
+    if audio_format == "MP3":
+        ext = "mp3"
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
+    elif audio_format == "M4A":
+        ext = "m4a"
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
+    else:
+        try:
+            probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
+            codec = subprocess.check_output(probe_cmd, text=True).strip()
+            
+            if codec == "aac":
+                ext = "aac"
+                fmt = "adts"
+            elif codec == "mp3":
+                ext = "mp3"
+                fmt = "mp3"
+            elif codec == "opus":
+                ext = "opus"
+                fmt = "opus"
+            else:
+                ext = "m4a"
+                ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
+                codec = "unknown"
+                
+            if codec != "unknown":
+                ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "copy", "-f", fmt, "pipe:1"]
+        except Exception as e:
+            st.warning(f"⚠️ `{base_name}` 無法解析原始音訊格式，將預設轉換為 MP3。")
+            ext = "mp3"
+            ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
+
+    out_path = os.path.join(out_dir, f"{base_name}.{ext}")
+    
+    if os.path.exists(out_path):
+        st.success(f"⏭️ 檔案已存在: `{out_path}`")
+        return
+        
+    try:
+        with st.spinner(f"⏳ 正在提取 `{base_name}` 音訊為 {ext.upper()} (100% RAM 處理中)..."):
+            process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if process.returncode == 0:
+                with open(out_path, "wb") as f:
+                    f.write(process.stdout)
+                st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
+            else:
+                st.error(f"❌ 提取 `{base_name}` 失敗！")
+                with st.expander("錯誤日誌"):
+                    st.text(process.stderr.decode('utf-8', errors='ignore'))
+    except Exception as e:
+        st.error(f"❌ 發生例外錯誤: {e}")
+
 # ========================================================
 # Streamlit Web App Interface
 # ========================================================
@@ -205,67 +266,35 @@ with tab2:
     audio_format = st.selectbox("🎵 請選擇輸出音訊格式:", ["預設 (原始格式)", "M4A", "MP3"])
     
     if st.button("▶️ 開始提取音訊", type="primary", use_container_width=True):
-        if not local_video_path.strip():
-            st.warning("⚠️ 請先輸入本地影片路徑！")
-        elif not os.path.isfile(local_video_path.strip()):
-            st.error("❌ 找不到指定的檔案，請確認路徑正確！")
+        input_path = local_video_path.strip()
+        if not input_path:
+            st.warning("⚠️ 請先輸入本地影片或資料夾路徑！")
+        elif not os.path.exists(input_path):
+            st.error("❌ 找不到指定的路徑，請確認路徑正確！")
         else:
-            video_path = local_video_path.strip()
-            base_name = os.path.splitext(os.path.basename(video_path))[0]
-            out_dir = "/Users/ericcheng/Google Drive/我的雲端硬碟/美劇/New"
-            os.makedirs(out_dir, exist_ok=True)
+            video_files = []
+            if os.path.isfile(input_path):
+                video_files.append(input_path)
+            elif os.path.isdir(input_path):
+                # 取得資料夾內所有的影片檔
+                valid_exts = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts"}
+                for root, dirs, files in os.walk(input_path):
+                    for f in files:
+                        if os.path.splitext(f)[1].lower() in valid_exts:
+                            video_files.append(os.path.join(root, f))
+                
+                if not video_files:
+                    st.warning("⚠️ 該資料夾內找不到任何支援的影片檔案！")
             
-            ext = ""
-            fmt = ""
-            ffmpeg_cmd = []
-            
-            if audio_format == "MP3":
-                ext = "mp3"
-                ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
-            elif audio_format == "M4A":
-                ext = "m4a"
-                ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
-            else:
-                try:
-                    probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
-                    codec = subprocess.check_output(probe_cmd, text=True).strip()
+            if video_files:
+                st.info(f"📥 準備處理 {len(video_files)} 個影片檔案...")
+                progress_bar = st.progress(0)
+                
+                for i, v_path in enumerate(video_files):
+                    st.markdown(f"### 📍 正在處理第 {i+1}/{len(video_files)} 個檔案: `{os.path.basename(v_path)}`")
+                    extract_local_audio(v_path, audio_format)
+                    progress_bar.progress((i + 1) / len(video_files))
+                    st.divider()
                     
-                    if codec == "aac":
-                        ext = "aac"
-                        fmt = "adts"
-                    elif codec == "mp3":
-                        ext = "mp3"
-                        fmt = "mp3"
-                    elif codec == "opus":
-                        ext = "opus"
-                        fmt = "opus"
-                    else:
-                        ext = "m4a"
-                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
-                        codec = "unknown"
-                        
-                    if codec != "unknown":
-                        ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "copy", "-f", fmt, "pipe:1"]
-                except Exception as e:
-                    st.warning("⚠️ 無法解析原始音訊格式，將預設轉換為 MP3。")
-                    ext = "mp3"
-                    ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
-
-            out_path = os.path.join(out_dir, f"{base_name}.{ext}")
-            
-            if os.path.exists(out_path):
-                st.success(f"⏭️ 檔案已存在: `{out_path}`")
-            else:
-                try:
-                    with st.spinner(f"⏳ 正在提取音訊為 {ext.upper()} (100% RAM 處理中)..."):
-                        process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        if process.returncode == 0:
-                            with open(out_path, "wb") as f:
-                                f.write(process.stdout)
-                            st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
-                        else:
-                            st.error("❌ 提取失敗！")
-                            with st.expander("錯誤日誌"):
-                                st.text(process.stderr.decode('utf-8', errors='ignore'))
-                except Exception as e:
-                    st.error(f"❌ 發生例外錯誤: {e}")
+                st.balloons()
+                st.success("🎉 所有本地提取任務處理完畢！")
