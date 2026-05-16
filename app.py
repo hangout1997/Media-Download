@@ -8,11 +8,8 @@ import tempfile
 import streamlit as st
 
 def get_stream_info(url):
-    # 支援各大平台 (YouTube, X, Facebook, Instagram, Threads, TikTok 等)
-    if any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "threads.net", "threads.com", "tiktok.com"]):
-        # yt-dlp 的 threads extractor 綁定 threads.net，若是 .com 則先替換
-        url = url.replace("threads.com", "threads.net")
-        
+    # 支援各大平台 (YouTube, X, Facebook, Instagram, TikTok 等)
+    if any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "tiktok.com"]):
         import yt_dlp
         ydl_opts = {
             'quiet': True,
@@ -202,7 +199,7 @@ st.title("🎬 媒體下載與音訊提取器")
 tab1, tab2 = st.tabs(["🌐 線上影片下載", "📁 影片音訊提取"])
 
 with tab1:
-    st.markdown("將 Gimymax, X, YouTube, Facebook, IG, Threads, TikTok 等影片網址直接下載。")
+    st.markdown("將 Gimymax, X, YouTube, Facebook, IG, TikTok 等影片網址直接下載。")
     
     target_urls = st.text_area("🔗 請輸入影片網址 (每行一個，最多15個):", placeholder="https://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
     
@@ -278,10 +275,8 @@ with tab2:
             
             try:
                 with st.spinner("🔍 正在解析線上網址/播放清單..."):
-                    # yt-dlp 的 threads extractor 綁定 threads.net
-                    query_path = input_path.replace("threads.com", "threads.net")
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(query_path, download=False)
+                        info = ydl.extract_info(input_path, download=False)
                         if 'entries' in info:
                             for entry in info['entries']:
                                 urls_to_process.append(entry.get('url'))
