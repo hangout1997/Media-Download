@@ -8,6 +8,23 @@ import tempfile
 import streamlit as st
 
 def get_stream_info(url):
+    # 支援 X.com (Twitter) 等大平台
+    if any(domain in url for domain in ["x.com", "twitter.com", "youtube.com", "youtu.be"]):
+        import yt_dlp
+        ydl_opts = {
+            'quiet': True,
+            'extract_flat': False,
+            'format': 'best',
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', 'video')
+            media_url = info.get('url')
+            # 處理特殊字元
+            title = re.sub(r'[\\/:*?"<>|]', '_', title)
+            return media_url, title
+            
+    # 原有的 Gimymax 網頁解析邏輯
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
