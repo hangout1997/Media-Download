@@ -196,7 +196,7 @@ st.set_page_config(page_title="Gimymax Media Downloader", page_icon="🎬", layo
 
 st.title("🎬 媒體下載與音訊提取器")
 
-tab1, tab2 = st.tabs(["🌐 線上影片下載", "📁 本地影片音訊提取"])
+tab1, tab2 = st.tabs(["🌐 線上影片下載", "📁 影片音訊提取"])
 
 with tab1:
     st.markdown("將 Gimymax 或 X.com 等影片網址的串流直接下載，可選擇儲存為 **高音質MP3** 或 **原畫質MP4**。")
