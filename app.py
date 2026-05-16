@@ -8,8 +8,8 @@ import tempfile
 import streamlit as st
 
 def get_stream_info(url):
-    # 支援 X.com (Twitter) 等大平台
-    if any(domain in url for domain in ["x.com", "twitter.com", "youtube.com", "youtu.be"]):
+    # 支援各大平台 (YouTube, X, Facebook, Instagram, Threads, TikTok 等)
+    if any(domain in url for domain in ["x.com", "twitter.com", "youtube.com", "youtu.be", "facebook.com", "fb.watch", "instagram.com", "threads.net", "tiktok.com"]):
         import yt_dlp
         ydl_opts = {
             'quiet': True,
@@ -199,9 +199,9 @@ st.title("🎬 媒體下載與音訊提取器")
 tab1, tab2 = st.tabs(["🌐 線上影片下載", "📁 影片音訊提取"])
 
 with tab1:
-    st.markdown("將 Gimymax 或 X.com 等影片網址的串流直接下載，可選擇儲存為 **高音質MP3** 或 **原畫質MP4**。")
+    st.markdown("將 Gimymax, X, YouTube, Facebook, IG, Threads, TikTok 等影片網址直接下載。")
     
-    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個，最多15個):", placeholder="https://gimymax.com/ep/... \nhttps://x.com/i/status/...")
+    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個，最多15個):", placeholder="https://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
     
     # 即時計算目前已輸入的有效網址數量，並提示剩餘可輸入數量
     current_urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
@@ -257,7 +257,7 @@ with tab1:
 
 with tab2:
     st.markdown("從本地檔案或線上播放清單提取出純音訊，完全在記憶體內處理，避免硬碟損耗。")
-    local_video_path = st.text_input("📁 請輸入路徑 (本地影片/資料夾，或 YouTube 網址/播放清單):", placeholder="/Users/ericcheng/Movies/ 或 https://youtube.com/playlist?list=...")
+    local_video_path = st.text_input("📁 請輸入路徑 (本地影片/資料夾，或 YouTube, FB, IG 等網址/播放清單):", placeholder="/Users/ericcheng/Movies/ 或 https://youtube.com/playlist?list=... 或 https://www.facebook.com/watch/?v=...")
     audio_format = st.selectbox("🎵 請選擇輸出音訊格式:", ["預設 (原始格式)", "M4A", "MP3"])
     
     if st.button("▶️ 開始提取音訊", type="primary", use_container_width=True):
