@@ -10,6 +10,9 @@ import streamlit as st
 def get_stream_info(url):
     # 支援各大平台 (YouTube, X, Facebook, Instagram, Threads, TikTok 等)
     if any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "threads.net", "threads.com", "tiktok.com"]):
+        # yt-dlp 的 threads extractor 綁定 threads.net，若是 .com 則先替換
+        url = url.replace("threads.com", "threads.net")
+        
         import yt_dlp
         ydl_opts = {
             'quiet': True,
@@ -275,8 +278,10 @@ with tab2:
             
             try:
                 with st.spinner("🔍 正在解析線上網址/播放清單..."):
+                    # yt-dlp 的 threads extractor 綁定 threads.net
+                    query_path = input_path.replace("threads.com", "threads.net")
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(input_path, download=False)
+                        info = ydl.extract_info(query_path, download=False)
                         if 'entries' in info:
                             for entry in info['entries']:
                                 urls_to_process.append(entry.get('url'))
