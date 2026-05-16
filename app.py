@@ -9,7 +9,7 @@ import streamlit as st
 
 def get_stream_info(url):
     # 支援各大平台 (YouTube, X, Facebook, Instagram, Threads, TikTok 等)
-    if any(domain in url for domain in ["x.com", "twitter.com", "youtube.com", "youtu.be", "facebook.com", "fb.watch", "instagram.com", "threads.net", "tiktok.com"]):
+    if any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "threads.net", "threads.com", "tiktok.com"]):
         import yt_dlp
         ydl_opts = {
             'quiet': True,
