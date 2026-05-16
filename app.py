@@ -215,16 +215,9 @@ with tab1:
     else:
         st.caption(f"ℹ️ 您可以輸入最多 **15** 個網址。")
     
-    col1, col2 = st.columns(2)
+    btn_video = st.button("⬇️ 開始批次下載影片", type="primary", use_container_width=True)
     
-    with col1:
-        btn_video = st.button("⬇️ 開始批次下載影片", type="primary", use_container_width=True)
-    with col2:
-        btn_audio = st.button("🎵 開始批次下載音訊", use_container_width=True)
-    
-    if btn_video or btn_audio:
-        mode = "video" if btn_video else "audio"
-        
+    if btn_video:
         urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
         
         if not urls:
@@ -232,8 +225,7 @@ with tab1:
         elif len(urls) > 15:
             st.error("⚠️ 一次最多只能輸入 15 個網址，請減少數量後重試！")
         else:
-            mode_str = "影片" if mode == "video" else "音頻"
-            st.info(f"📥 準備下載 {len(urls)} 個{mode_str}檔案...")
+            st.info(f"📥 準備下載 {len(urls)} 個影片檔案...")
             
             # 建立進度條
             progress_bar = st.progress(0)
@@ -251,7 +243,7 @@ with tab1:
                     if not m3u8_url:
                         st.error(f"❌ 找不到有效的影片串流網址: {url}")
                     else:
-                        download_media(m3u8_url, title, mode=mode)
+                        download_media(m3u8_url, title, mode="video")
                         
                 except Exception as e:
                     st.error(f"❌ 處理 {url} 時發生錯誤: {e}")
