@@ -9,6 +9,106 @@ import streamlit as st
 
 def get_media_items(url):
     items = []
+    
+    # Facebook 貼文特殊圖片下載邏輯
+    if any(domain in url for domain in ["facebook.com", "fb.com", "fb.watch"]):
+        try:
+            import urllib.parse
+            import html as html_lib
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'DNT': '1',
+                'Connection': 'keep-alive'
+            }
+            session = requests.Session()
+            # 1. 解析跳轉，取得永久連結
+            res = session.get(url, headers=headers, allow_redirects=True, timeout=15)
+            final_url = res.url
+            
+            # 轉換為行動版網頁
+            mobile_url = final_url.replace("www.facebook.com", "m.facebook.com")
+            
+            # 2. 使用行動版 Header 抓取內容，繞過登入牆
+            mobile_headers = headers.copy()
+            mobile_headers['User-Agent'] = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+            
+            m_res = session.get(mobile_url, headers=mobile_headers, allow_redirects=True, timeout=15)
+            html_content = m_res.text
+            
+            # 3. 提取貼文標題/群組名稱
+            native_texts = re.findall(r'<div dir=\"auto\" class=\"native-text rslh\"[^>]*>(.*?)</div>', html_content, re.S)
+            title_parts = []
+            for nt in native_texts:
+                clean = re.sub(r'<[^>]+>', ' ', nt)
+                clean = html_lib.unescape(clean)
+                clean = re.sub(r'\s+', ' ', clean).strip()
+                if clean and clean not in ['開啟應用程式', '登入', '加入社團', '關於這個社團', '&nbsp;'] and not clean.startswith('本社團歡迎大家'):
+                    title_parts.append(clean)
+            
+            group_name = ""
+            post_desc = ""
+            for tp in title_parts:
+                if len(tp) > 10 and not group_name:
+                    group_name = tp
+                elif len(tp) > 10 and group_name and not post_desc:
+                    post_desc = tp
+                    break
+                    
+            post_title = "Facebook_Post"
+            if group_name and post_desc:
+                post_title = f"{group_name}_{post_desc}"
+            elif group_name:
+                post_title = group_name
+                
+            post_title = re.sub(r'[\\/:*?\"<>|]', '_', post_title).strip()
+            post_title = post_title[:100]
+            if not post_title:
+                post_title = "Facebook_Post"
+            
+            # 4. 提取 scontent 圖片
+            img_srcs = re.findall(r'<img[^>]+src=\"([^\"]+)\"', html_content)
+            photo_urls = []
+            for src in img_srcs:
+                src = html_lib.unescape(src)
+                src = urllib.parse.unquote(src)
+                if 'scontent' in src and 't39.30808-6' in src:
+                    photo_urls.append(src)
+            
+            seen_ids = set()
+            unique_photos = []
+            for p_url in photo_urls:
+                match = re.search(r'/([^/]+_n\.[a-z0-9]+)', p_url)
+                if match:
+                    filename = match.group(1)
+                    parts = filename.split('_')
+                    if len(parts) >= 2:
+                        photo_id = '_'.join(parts[:2])
+                        if photo_id not in seen_ids:
+                            seen_ids.add(photo_id)
+                            unique_photos.append(p_url)
+            
+            if unique_photos:
+                fb_items = []
+                for idx, p_url in enumerate(unique_photos):
+                    fb_items.append({
+                        'url': p_url,
+                        'title': f"{post_title}_{idx+1}" if len(unique_photos) > 1 else post_title,
+                        'ext': 'jpg',
+                        'type': 'image'
+                    })
+                return fb_items
+        except Exception as e:
+            # 錯誤時紀錄日誌，並降級使用原有的 yt-dlp 解析
+            print(f"Facebook custom photo scrape failed: {e}, falling back to yt-dlp...")
+
     # 支援各大平台 (YouTube, X, Facebook, Instagram, TikTok 等)
     if any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "tiktok.com"]):
         # yt-dlp 的 threads extractor 綁定 threads.net，若是 .com 則先替換
