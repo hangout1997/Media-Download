@@ -56,6 +56,8 @@ def get_media_items(url):
             group_name = ""
             post_desc = ""
             for tp in title_parts:
+                if "http" in tp or "www." in tp:
+                    continue
                 if len(tp) > 10 and not group_name:
                     group_name = tp
                 elif len(tp) > 10 and group_name and not post_desc:
