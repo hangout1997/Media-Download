@@ -16,6 +16,18 @@ def get_media_items(url):
             import urllib.parse
             import html as html_lib
             
+            # 讀取 Streamlit Session State 中的 Facebook Cookie
+            fb_cookies_dict = {}
+            if "fb_cookie" in st.session_state and st.session_state.fb_cookie:
+                cookie_str = st.session_state.fb_cookie.strip()
+                for item in cookie_str.split(';'):
+                    item = item.strip()
+                    if not item:
+                        continue
+                    parts = item.split('=', 1)
+                    if len(parts) == 2:
+                        fb_cookies_dict[parts[0]] = parts[1]
+            
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -29,6 +41,9 @@ def get_media_items(url):
                 'Connection': 'keep-alive'
             }
             session = requests.Session()
+            if fb_cookies_dict:
+                session.cookies.update(fb_cookies_dict)
+                
             # 1. 解析跳轉，取得永久連結
             res = session.get(url, headers=headers, allow_redirects=True, timeout=15)
             final_url = res.url
@@ -75,13 +90,16 @@ def get_media_items(url):
             if not post_title:
                 post_title = "Facebook_Post"
             
-            # 4. 提取 scontent 圖片
+            # 4. 提取 scontent 圖片 (支援各種類型的 CDN 圖片連結)
             img_srcs = re.findall(r'<img[^>]+src=\"([^\"]+)\"', html_content)
             photo_urls = []
             for src in img_srcs:
                 src = html_lib.unescape(src)
                 src = urllib.parse.unquote(src)
-                if 'scontent' in src and 't39.30808-6' in src:
+                if 'scontent' in src:
+                    # 過濾掉極小的頭像與表情圖示 (如 144x144, 48x48, 75x75)
+                    if any(size in src for size in ['p144x144', 'p48x48', 'p75x75']):
+                        continue
                     photo_urls.append(src)
             
             seen_ids = set()
@@ -96,6 +114,10 @@ def get_media_items(url):
                         if photo_id not in seen_ids:
                             seen_ids.add(photo_id)
                             unique_photos.append(p_url)
+                else:
+                    if p_url not in seen_ids:
+                        seen_ids.add(p_url)
+                        unique_photos.append(p_url)
             
             if unique_photos:
                 fb_items = []
@@ -353,6 +375,9 @@ with tab1:
     st.markdown("將 Gimymax, X, YouTube, Facebook, IG, TikTok 等影片網址直接下載。")
     
     target_urls = st.text_area("🔗 請輸入影片網址 (每行一個，最多15個):", placeholder="https://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
+    
+    fb_cookie_str = st.text_input("🔑 Facebook Cookie (選填，用於下載私密社團或好友貼文圖片):", type="password", placeholder="c_user=xxxx; xs=xxxx; ...", help="若要下載私密社團、好友貼文或無法下載時，請在 Chrome 開啟 Facebook -> 按 F12 -> 於 Application (應用程式) -> Cookies 中複製 c_user 與 xs 拼接（或直接複製整段 Cookie 值）並在此貼上。下載公開內容免填。")
+    st.session_state.fb_cookie = fb_cookie_str
     
     # 即時計算目前已輸入的有效網址數量，並提示剩餘可輸入數量
     current_urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
