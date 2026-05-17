@@ -44,9 +44,16 @@ def get_media_items(url):
             if fb_cookies_dict:
                 session.cookies.update(fb_cookies_dict)
                 
-            # 1. 解析跳轉，取得永久連結
-            res = session.get(url, headers=headers, allow_redirects=True, timeout=15)
-            final_url = res.url
+            # 1. 用 HEAD 請求獲取 302 重定向 Location，避開直接 GET 產生的 400 錯誤
+            try:
+                res = session.head(url, headers=headers, allow_redirects=False, timeout=10)
+                final_url = res.headers.get('Location', url)
+            except Exception:
+                try:
+                    res = session.get(url, headers=headers, allow_redirects=True, timeout=15)
+                    final_url = res.url
+                except Exception:
+                    final_url = url
             
             # 轉換為行動版網頁
             mobile_url = final_url.replace("www.facebook.com", "m.facebook.com")
@@ -58,7 +65,7 @@ def get_media_items(url):
             m_res = session.get(mobile_url, headers=mobile_headers, allow_redirects=True, timeout=15)
             html_content = m_res.text
             
-            # 3. 提取貼文標題/群組名稱
+            # 3. 提取貼文標題/群組名稱 (用於檔名)
             native_texts = re.findall(r'<div dir=\"auto\" class=\"native-text rslh\"[^>]*>(.*?)</div>', html_content, re.S)
             title_parts = []
             for nt in native_texts:
@@ -90,34 +97,76 @@ def get_media_items(url):
             if not post_title:
                 post_title = "Facebook_Post"
             
-            # 4. 提取 scontent 圖片 (支援各種類型的 CDN 圖片連結)
-            img_srcs = re.findall(r'<img[^>]+src=\"([^\"]+)\"', html_content)
-            photo_urls = []
-            for src in img_srcs:
-                src = html_lib.unescape(src)
-                src = urllib.parse.unquote(src)
-                if 'scontent' in src:
-                    # 過濾掉極小的頭像與表情圖示 (如 144x144, 48x48, 75x75)
-                    if any(size in src for size in ['p144x144', 'p48x48', 'p75x75']):
-                        continue
-                    photo_urls.append(src)
-            
-            seen_ids = set()
+            # 4. 嘗試提取相簿/貼文圖片合集 (Set ID) 以獲取完整的所有圖片 (例如 25 張)
             unique_photos = []
-            for p_url in photo_urls:
-                match = re.search(r'/([^/]+_n\.[a-z0-9]+)', p_url)
-                if match:
-                    filename = match.group(1)
-                    parts = filename.split('_')
-                    if len(parts) >= 2:
-                        photo_id = '_'.join(parts[:2])
-                        if photo_id not in seen_ids:
-                            seen_ids.add(photo_id)
+            set_match = re.search(r'set=(pcb\.\d+|a\.\d+)', html_content)
+            if set_match:
+                set_param = set_match.group(1)
+                st.info(f"📸 偵測到多張相片合集 ({set_param})，正在透過基礎行動版擷取完整的相片清單...")
+                
+                # 使用 mbasic 讀取相集，因為結構極度單純且穩定
+                set_url = f"https://mbasic.facebook.com/media/set/?set={set_param}"
+                try:
+                    set_res = session.get(set_url, headers=mobile_headers, timeout=15)
+                    if set_res.status_code == 200:
+                        set_html = set_res.text
+                        # 擷取所有 /photo.php 連結
+                        photo_links = re.findall(r'href=\"(/photo\.php\?[^\"]+)\"', set_html)
+                        if not photo_links:
+                            photo_links = re.findall(r"href=\'(/photo\.php\?[^\'\s]+)\'", set_html)
+                            
+                        if photo_links:
+                            st.info(f"🔗 成功找到 {len(photo_links)} 張相片的連結，開始逐一解析高清原始圖...")
+                            # 遍歷每一張相片網頁，提取高清原始圖網址
+                            for p_link in photo_links:
+                                p_url = "https://mbasic.facebook.com" + html_lib.unescape(p_link)
+                                try:
+                                    p_res = session.get(p_url, headers=mobile_headers, timeout=10)
+                                    if p_res.status_code == 200:
+                                        p_html = p_res.text
+                                        # 尋找頁面中的高解析度 scontent 網址
+                                        img_match = re.search(r'<img[^>]+src=\"([^\"]*scontent[^\"]*)\"', p_html)
+                                        if not img_match:
+                                            img_match = re.search(r'src=\"([^\"]*scontent[^\"]*)\"', p_html)
+                                        
+                                        if img_match:
+                                            raw_img_url = html_lib.unescape(img_match.group(1))
+                                            raw_img_url = urllib.parse.unquote(raw_img_url)
+                                            # 去除 profile 等小圖
+                                            if not any(size in raw_img_url for size in ['p144x144', 'p48x48', 'p75x75']):
+                                                unique_photos.append(raw_img_url)
+                                except Exception as e:
+                                    print(f"Error scraping single photo page: {e}")
+                except Exception as e:
+                    print(f"Failed to fetch set photos: {e}")
+            
+            # Fallback 5：如果沒有 Set ID 或 Set 擷取失敗，使用頁面中可見的圖片
+            if not unique_photos:
+                img_srcs = re.findall(r'<img[^>]+src=\"([^\"]+)\"', html_content)
+                photo_urls = []
+                for src in img_srcs:
+                    src = html_lib.unescape(src)
+                    src = urllib.parse.unquote(src)
+                    if 'scontent' in src:
+                        if any(size in src for size in ['p144x144', 'p48x48', 'p75x75']):
+                            continue
+                        photo_urls.append(src)
+                
+                seen_ids = set()
+                for p_url in photo_urls:
+                    match = re.search(r'/([^/]+_n\.[a-z0-9]+)', p_url)
+                    if match:
+                        filename = match.group(1)
+                        parts = filename.split('_')
+                        if len(parts) >= 2:
+                            photo_id = '_'.join(parts[:2])
+                            if photo_id not in seen_ids:
+                                seen_ids.add(photo_id)
+                                unique_photos.append(p_url)
+                    else:
+                        if p_url not in seen_ids:
+                            seen_ids.add(p_url)
                             unique_photos.append(p_url)
-                else:
-                    if p_url not in seen_ids:
-                        seen_ids.add(p_url)
-                        unique_photos.append(p_url)
             
             if unique_photos:
                 fb_items = []
