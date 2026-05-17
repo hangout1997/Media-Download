@@ -7,9 +7,13 @@ import shutil
 import tempfile
 import streamlit as st
 
-def get_stream_info(url):
+def get_media_items(url):
+    items = []
     # 支援各大平台 (YouTube, X, Facebook, Instagram, TikTok 等)
     if any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "tiktok.com"]):
+        # yt-dlp 的 threads extractor 綁定 threads.net，若是 .com 則先替換
+        url = url.replace("threads.com", "threads.net")
+        
         import yt_dlp
         ydl_opts = {
             'quiet': True,
@@ -18,15 +22,35 @@ def get_stream_info(url):
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            title = info.get('title', 'video')
-            media_url = info.get('url')
-            # 處理特殊字元
-            title = re.sub(r'[\\/:*?"<>|]', '_', title)
-            return media_url, title
+            
+            # 處理可能的多個 entry (例如 Instagram Carousel 或 YouTube 播放清單)
+            entries = info.get('entries', [info])
+            
+            for i, entry in enumerate(entries):
+                title = entry.get('title') or info.get('title') or f"media_{i}"
+                title = re.sub(r'[\\/:*?"<>|]', '_', title)
+                
+                # 取得副檔名與媒體類型
+                ext = entry.get('ext')
+                media_url = entry.get('url')
+                
+                if not media_url:
+                    continue
+                
+                # 判斷是否為圖片 (有些平台會回傳 thumbnail 作為 entry)
+                is_image = ext in ['jpg', 'jpeg', 'png', 'webp'] or entry.get('protocol') == 'https' and '.jpg' in media_url
+                
+                items.append({
+                    'url': media_url,
+                    'title': title if len(entries) == 1 else f"{title}_{i+1}",
+                    'ext': ext or ('jpg' if is_image else 'mp4'),
+                    'type': 'image' if is_image else 'video'
+                })
+        return items
             
     # 原有的 Gimymax 網頁解析邏輯
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/122.0.0.0"
     }
     response = requests.get(url, headers=headers)
     response.raise_for_status()
@@ -42,7 +66,7 @@ def get_stream_info(url):
         raise ValueError("Failed to parse player_data JSON.")
         
     m3u8_url = data.get("url")
-    title = data.get("vod_data", {}).get("vod_name", "downloaded_audio")
+    title = data.get("vod_data", {}).get("vod_name", "downloaded_media")
     
     # 將「第X季」替換為 S1, S2...
     zh_num = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
@@ -65,28 +89,54 @@ def get_stream_info(url):
     
     # 處理檔名特殊字元
     title = re.sub(r'[\\/:*?"<>|]', '_', title)
-    return m3u8_url, title
-
-def download_media(m3u8_url, title, mode="audio"):
-    st.info(f"📍 解析到標題: **{title}**")
     
-    ext = "mp3" if mode == "audio" else "mp4"
+    items = [{
+        'url': m3u8_url,
+        'title': title,
+        'ext': 'mp4',
+        'type': 'video'
+    }]
+    return items
+
+def download_media(media_item, force_audio=False):
+    title = media_item['title']
+    media_url = media_item['url']
+    media_type = media_item['type']
+    
+    st.info(f"📍 正在處理媒體: **{title}** ({media_type})")
+    
+    # 決定最終副檔名
+    if force_audio:
+        ext = "mp3"
+    else:
+        ext = media_item['ext']
+    
     downloads_dir = "/Users/ericcheng/Google Drive/我的雲端硬碟/美劇/New"
     os.makedirs(downloads_dir, exist_ok=True)
     out_path = os.path.join(downloads_dir, f"{title}.{ext}")
     
     # 優化 1：下載前檢查，避免重複下載覆寫
     if os.path.exists(out_path):
-        st.success(f"⏭️ 檔案已存在，自動跳過下載: `{title}.{ext}`")
+        st.success(f"⏭️ 檔案已存在，自動跳過: `{title}.{ext}`")
         return
         
     st.info(f"📍 檔案將以 {ext.upper()} 格式儲存至: `{out_path}`")
     
     try:
-        if mode == "audio":
+        if media_type == 'image':
+            with st.spinner(f"⏳ 正在下載圖片 (RAM 處理中)..."):
+                response = requests.get(media_url, timeout=30)
+                response.raise_for_status()
+                with open(out_path, "wb") as f:
+                    f.write(response.content)
+            st.success(f"✅ 圖片下載完成！`{title}.{ext}`")
+            return
+
+        # 影片處理 (含轉音訊)
+        if force_audio:
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
-                "-i", m3u8_url,
+                "-i", media_url,
                 "-vn",
                 "-c:a", "libmp3lame",
                 "-b:a", "192k",
@@ -97,11 +147,10 @@ def download_media(m3u8_url, title, mode="audio"):
         else:
             ffmpeg_cmd = [
                 "ffmpeg", "-y",
-                "-i", m3u8_url,
+                "-i", media_url,
                 "-c", "copy",
                 "-bsf:a", "aac_adtstoasc",
                 "-f", "mp4",
-                # MP4 必須加上這兩個 flag 才能支援非 seekable 的 pipe 輸出
                 "-movflags", "frag_keyframe+empty_moov", 
                 "pipe:1"
             ]
@@ -238,12 +287,13 @@ with tab1:
                 try:
                     st.text(f"正在擷取網頁資訊: {url}")
                     with st.spinner("🔍 尋找影片串流中..."):
-                        m3u8_url, title = get_stream_info(url)
+                        media_items = get_media_items(url)
                     
-                    if not m3u8_url:
+                    if not media_items:
                         st.error(f"❌ 找不到有效的影片串流網址: {url}")
                     else:
-                        download_media(m3u8_url, title, mode="video")
+                        for item in media_items:
+                            download_media(item)
                         
                 except Exception as e:
                     st.error(f"❌ 處理 {url} 時發生錯誤: {e}")
@@ -295,10 +345,11 @@ with tab2:
                     st.markdown(f"### 📍 正在處理第 {i+1}/{len(urls_to_process)} 個影片...")
                     try:
                         with st.spinner("🔍 尋找最佳串流..."):
-                            media_url, v_title = get_stream_info(url)
+                            media_items = get_media_items(url)
                             
-                        if media_url:
-                            extract_local_audio(media_url, audio_format, title=v_title)
+                        if media_items:
+                            for item in media_items:
+                                extract_local_audio(item['url'], audio_format, title=item['title'])
                         else:
                             st.error(f"❌ 無法取得串流: {url}")
                     except Exception as e:
