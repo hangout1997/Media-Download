@@ -176,7 +176,8 @@ def get_media_items(url):
             
             # Fallback 5：如果沒有 Set ID 或 Set 擷取失敗，使用頁面中可見的圖片
             if not unique_photos:
-                img_srcs = re.findall(r'<img[^>]+src=\"([^\"]+)\"', html_content)
+                # 1. 匹配 img src 屬性 (支援雙引號與單引號)
+                img_srcs = re.findall(r'<img[^>]+src=[\"\']([^\'\"]+)[\"\']', html_content)
                 photo_urls = []
                 for src in img_srcs:
                     src = html_lib.unescape(src)
@@ -185,6 +186,17 @@ def get_media_items(url):
                         if any(size in src for size in ['p144x144', 'p48x48', 'p75x75']):
                             continue
                         photo_urls.append(src)
+                
+                # 2. 如果沒有匹配到 img 標籤，全局搜尋 HTML 中的 scontent 連結 (極致防禦)
+                if not photo_urls:
+                    raw_urls = re.findall(r'https?://[a-zA-Z0-9_\.\-\\/]+fbcdn[a-zA-Z0-9_\.\-\/\?\&=\+;%\\:]+', html_content)
+                    for r_url in raw_urls:
+                        r_url = r_url.replace('\\/', '/').replace('\\\\/', '/')
+                        r_url = html_lib.unescape(urllib.parse.unquote(r_url))
+                        if 'scontent' in r_url:
+                            if any(size in r_url for size in ['p144x144', 'p48x48', 'p75x75']):
+                                continue
+                            photo_urls.append(r_url)
                 
                 seen_ids = set()
                 for p_url in photo_urls:
@@ -237,32 +249,39 @@ def get_media_items(url):
             ydl_opts['cookiefile'] = temp_cookie_path
             
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                
-                # 處理可能的多個 entry (例如 Instagram Carousel 或 YouTube 播放清單)
-                entries = info.get('entries', [info])
-                
-                for i, entry in enumerate(entries):
-                    title = entry.get('title') or info.get('title') or f"media_{i}"
-                    title = re.sub(r'[\\/:*?"<>|]', '_', title)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
                     
-                    # 取得副檔名與媒體類型
-                    ext = entry.get('ext')
-                    media_url = entry.get('url')
+                    # 處理可能的多個 entry (例如 Instagram Carousel 或 YouTube 播放清單)
+                    entries = info.get('entries', [info])
                     
-                    if not media_url:
-                        continue
-                    
-                    # 判斷是否為圖片 (有些平台會回傳 thumbnail 作為 entry)
-                    is_image = ext in ['jpg', 'jpeg', 'png', 'webp'] or entry.get('protocol') == 'https' and '.jpg' in media_url
-                    
-                    items.append({
-                        'url': media_url,
-                        'title': title if len(entries) == 1 else f"{title}_{i+1}",
-                        'ext': ext or ('jpg' if is_image else 'mp4'),
-                        'type': 'image' if is_image else 'video'
-                    })
+                    for i, entry in enumerate(entries):
+                        title = entry.get('title') or info.get('title') or f"media_{i}"
+                        title = re.sub(r'[\\/:*?"<>|]', '_', title)
+                        
+                        # 取得副檔名與媒體類型
+                        ext = entry.get('ext')
+                        media_url = entry.get('url')
+                        
+                        if not media_url:
+                            continue
+                        
+                        # 判斷是否為圖片 (有些平台會回傳 thumbnail 作為 entry)
+                        is_image = ext in ['jpg', 'jpeg', 'png', 'webp'] or entry.get('protocol') == 'https' and '.jpg' in media_url
+                        
+                        items.append({
+                            'url': media_url,
+                            'title': title if len(entries) == 1 else f"{title}_{i+1}",
+                            'ext': ext or ('jpg' if is_image else 'mp4'),
+                            'type': 'image' if is_image else 'video'
+                        })
+            except Exception as e:
+                err_msg = str(e)
+                if "No video formats found" in err_msg or "Unsupported URL" in err_msg:
+                    if "facebook.com" in url or "fb.com" in url or "fb.watch" in url:
+                        raise ValueError("此貼文為「純相片貼文」或「非影片內容」。\n\n💡 **下載相片建議**：請確認您已在下方填入有效的 **Facebook Cookie**。私密社團或好友限閱貼文的相片必須有 Cookie 授權才能進行下載。")
+                raise e
         finally:
             try:
                 if temp_cookie_path and os.path.exists(temp_cookie_path):
