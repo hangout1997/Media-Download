@@ -37,6 +37,13 @@ def create_temp_cookiefile(fb_cookie_str):
 def get_media_items(url):
     items = []
     
+    # 阻擋並辨識 Facebook 社團首頁，引導使用者使用貼文連結
+    if "facebook.com/groups/" in url or "fb.com/groups/" in url:
+        clean_url = url.split('?')[0].rstrip('/')
+        parts = clean_url.split('/groups/')
+        if len(parts) == 2 and '/' not in parts[1]:
+            raise ValueError("此網址為「社團首頁」，並非單一貼文或影片。請在社團中找到貼文，點選其「發佈時間」獲取正確的貼文網址（例如含有 /permalink/ 或 /share/p/）再進行下載。")
+            
     # Facebook 貼文特殊圖片下載邏輯
     if any(domain in url for domain in ["facebook.com", "fb.com", "fb.watch"]):
         try:
@@ -495,6 +502,20 @@ with tab1:
             for i, url in enumerate(urls):
                 current_num = i + 1
                 st.markdown(f"### 📍 正在處理第 {current_num}/{len(urls)} 個...")
+                
+                # 偵測是否為社團首頁網址
+                is_fb_group_home = False
+                if "facebook.com/groups/" in url or "fb.com/groups/" in url:
+                    clean_url = url.split('?')[0].rstrip('/')
+                    parts = clean_url.split('/groups/')
+                    if len(parts) == 2 and '/' not in parts[1]:
+                        is_fb_group_home = True
+                        
+                if is_fb_group_home:
+                    st.warning("⚠️ 偵測到您輸入的是 **社團首頁** 的網址，而非個別貼文！\n\n👉 **正確做法**：請在社團中找到該貼文，點擊貼文下方的 **「發佈時間」**（例如：3小時前、昨天下午 5:00），進入個別貼文頁面後，再複製網址貼到下載器中。")
+                    progress_bar.progress(current_num / len(urls))
+                    st.divider()
+                    continue
                 
                 try:
                     st.text(f"正在擷取網頁資訊: {url}")
