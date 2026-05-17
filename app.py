@@ -7,6 +7,33 @@ import shutil
 import tempfile
 import streamlit as st
 
+def create_temp_cookiefile(fb_cookie_str):
+    if not fb_cookie_str:
+        return None
+    import tempfile
+    import os
+    # Parse cookies
+    cookie_dict = {}
+    items = fb_cookie_str.split(';')
+    for item in items:
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split('=', 1)
+        if len(parts) == 2:
+            cookie_dict[parts[0].strip()] = parts[1].strip()
+            
+    if not cookie_dict:
+        return None
+        
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="fb_cookies_")
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        f.write("# This file is generated automatically by Media Downloader\n")
+        for k, v in cookie_dict.items():
+            f.write(f".facebook.com\tTRUE\t/\tTRUE\t0\t{k}\t{v}\n")
+    return path
+
 def get_media_items(url):
     items = []
     
@@ -188,37 +215,53 @@ def get_media_items(url):
         url = url.replace("threads.com", "threads.net")
         
         import yt_dlp
+        
+        fb_cookie_str = st.session_state.get('fb_cookie')
+        temp_cookie_path = None
+        if "facebook.com" in url or "fb.com" in url or "fb.watch" in url:
+            temp_cookie_path = create_temp_cookiefile(fb_cookie_str)
+            
         ydl_opts = {
             'quiet': True,
             'extract_flat': False,
             'format': 'best',
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        if temp_cookie_path:
+            ydl_opts['cookiefile'] = temp_cookie_path
             
-            # 處理可能的多個 entry (例如 Instagram Carousel 或 YouTube 播放清單)
-            entries = info.get('entries', [info])
-            
-            for i, entry in enumerate(entries):
-                title = entry.get('title') or info.get('title') or f"media_{i}"
-                title = re.sub(r'[\\/:*?"<>|]', '_', title)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
                 
-                # 取得副檔名與媒體類型
-                ext = entry.get('ext')
-                media_url = entry.get('url')
+                # 處理可能的多個 entry (例如 Instagram Carousel 或 YouTube 播放清單)
+                entries = info.get('entries', [info])
                 
-                if not media_url:
-                    continue
-                
-                # 判斷是否為圖片 (有些平台會回傳 thumbnail 作為 entry)
-                is_image = ext in ['jpg', 'jpeg', 'png', 'webp'] or entry.get('protocol') == 'https' and '.jpg' in media_url
-                
-                items.append({
-                    'url': media_url,
-                    'title': title if len(entries) == 1 else f"{title}_{i+1}",
-                    'ext': ext or ('jpg' if is_image else 'mp4'),
-                    'type': 'image' if is_image else 'video'
-                })
+                for i, entry in enumerate(entries):
+                    title = entry.get('title') or info.get('title') or f"media_{i}"
+                    title = re.sub(r'[\\/:*?"<>|]', '_', title)
+                    
+                    # 取得副檔名與媒體類型
+                    ext = entry.get('ext')
+                    media_url = entry.get('url')
+                    
+                    if not media_url:
+                        continue
+                    
+                    # 判斷是否為圖片 (有些平台會回傳 thumbnail 作為 entry)
+                    is_image = ext in ['jpg', 'jpeg', 'png', 'webp'] or entry.get('protocol') == 'https' and '.jpg' in media_url
+                    
+                    items.append({
+                        'url': media_url,
+                        'title': title if len(entries) == 1 else f"{title}_{i+1}",
+                        'ext': ext or ('jpg' if is_image else 'mp4'),
+                        'type': 'image' if is_image else 'video'
+                    })
+        finally:
+            try:
+                if temp_cookie_path and os.path.exists(temp_cookie_path):
+                    os.remove(temp_cookie_path)
+            except Exception:
+                pass
         return items
             
     # 原有的 Gimymax 網頁解析邏輯
