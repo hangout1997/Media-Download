@@ -423,22 +423,17 @@ tab1, tab2 = st.tabs(["🌐 線上影片下載", "📁 影片音訊提取"])
 with tab1:
     st.markdown("將 Gimymax, X, YouTube, Facebook, IG, TikTok 等影片網址直接下載。")
     
-    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個，最多15個):", placeholder="https://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
+    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個):", placeholder="https://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
     
     fb_cookie_str = st.text_input("🔑 Facebook Cookie (選填，用於下載私密社團或好友貼文圖片):", type="password", placeholder="c_user=xxxx; xs=xxxx; ...", help="若要下載私密社團、好友貼文或無法下載時，請在 Chrome 開啟 Facebook -> 按 F12 -> 於 Application (應用程式) -> Cookies 中複製 c_user 與 xs 拼接（或直接複製整段 Cookie 值）並在此貼上。下載公開內容免填。")
     st.session_state.fb_cookie = fb_cookie_str
     
-    # 即時計算目前已輸入的有效網址數量，並提示剩餘可輸入數量
+    # 即時計算目前已輸入的有效網址數量
     current_urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
     current_count = len(current_urls)
-    remaining = max(0, 15 - current_count)
     
-    if current_count > 15:
-        st.error(f"⚠️ 目前已輸入 {current_count} 個網址，超過上限 15 個！")
-    elif current_count > 0:
-        st.caption(f"ℹ️ 已輸入 **{current_count}** 個，您還可以再輸入 **{remaining}** 個網址。")
-    else:
-        st.caption(f"ℹ️ 您可以輸入最多 **15** 個網址。")
+    if current_count > 0:
+        st.caption(f"ℹ️ 已輸入 **{current_count}** 個網址。")
     
     btn_video = st.button("⬇️ 開始批次下載影片", type="primary", use_container_width=True)
     
@@ -447,8 +442,6 @@ with tab1:
         
         if not urls:
             st.warning("⚠️ 請先輸入網址！")
-        elif len(urls) > 15:
-            st.error("⚠️ 一次最多只能輸入 15 個網址，請減少數量後重試！")
         else:
             st.info(f"📥 準備下載 {len(urls)} 個影片檔案...")
             
