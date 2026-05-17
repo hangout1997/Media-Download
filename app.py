@@ -89,8 +89,8 @@ def get_media_items(url):
                 except Exception:
                     final_url = url
             
-            # 轉換為行動版網頁
-            mobile_url = final_url.replace("www.facebook.com", "m.facebook.com")
+            # 轉換為基礎行動版網頁 (mbasic.facebook.com)，避開 React/JS 動態渲染，直接取得靜態 HTML 內容
+            mobile_url = final_url.replace("www.facebook.com", "mbasic.facebook.com").replace("m.facebook.com", "mbasic.facebook.com")
             
             # 2. 使用行動版 Header 抓取內容，繞過登入牆
             mobile_headers = headers.copy()
