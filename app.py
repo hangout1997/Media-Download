@@ -224,6 +224,10 @@ def get_media_items(url):
                         'type': 'image'
                     })
                 return fb_items
+            else:
+                # 如果擺明是相片貼文，且我們沒抓到任何照片，就直接拋出錯誤，阻止降級到 yt-dlp
+                if any(p_pattern in url for p_pattern in ["/share/p/", "/posts/", "/permalink/", "/photos/", "/photo.php", "/photo/"]):
+                    raise ValueError("此貼文為「Facebook 相片或非影片貼文」，必須提供有效的 Facebook Cookie 授權才能進行下載。\n\n💡 **下載相片建議**：請確認您已在下方填入有效的 **Facebook Cookie**。私密社團、好友限閱或部分公開貼文的相片必須有 Cookie 授權才能順利下載。")
         except Exception as e:
             # 錯誤時紀錄日誌，並降級使用原有的 yt-dlp 解析
             print(f"Facebook custom photo scrape failed: {e}, falling back to yt-dlp...")
@@ -278,9 +282,9 @@ def get_media_items(url):
                         })
             except Exception as e:
                 err_msg = str(e)
-                if "No video formats found" in err_msg or "Unsupported URL" in err_msg:
+                if any(kw in err_msg for kw in ["No video formats found", "Unsupported URL", "Cannot parse data", "Private video", "login"]):
                     if "facebook.com" in url or "fb.com" in url or "fb.watch" in url:
-                        raise ValueError("此貼文為「純相片貼文」或「非影片內容」。\n\n💡 **下載相片建議**：請確認您已在下方填入有效的 **Facebook Cookie**。私密社團或好友限閱貼文的相片必須有 Cookie 授權才能進行下載。")
+                        raise ValueError("此 Facebook 連結可能為「純相片貼文」、「非影片內容」或「私密/限制級內容」。\n\n💡 **下載建議**：請確認您已在下方填入有效的 **Facebook Cookie**。私密社團、好友限閱、相片貼文或部分特定影片必須有 Cookie 授權才能進行下載。")
                 raise e
         finally:
             try:
