@@ -542,12 +542,17 @@ with st.sidebar:
     st.markdown("管理系統資源與進行手動清理維護。")
     st.divider()
     
-    if st.button("♻️ 釋放所有資源", type="secondary", use_container_width=True):
-        with st.spinner("正在釋放系統資源中..."):
+    if st.button("♻️ 釋放所有資源並關閉", type="primary", use_container_width=True):
+        with st.spinner("正在釋放系統資源與關閉程式中..."):
             info = release_resources()
             for msg in info:
                 st.success(msg)
-            st.toast("♻️ 資源釋放成功")
+            st.toast("♻️ 資源釋放成功，程式即將關閉...")
+            st.warning("⚠️ 程式已終止，請手動關閉此網頁分頁。")
+            import time
+            time.sleep(1.5)
+            import os
+            os._exit(0)
 
 st.title("🎬 媒體下載與音訊提取器")
 
