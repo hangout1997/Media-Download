@@ -508,6 +508,10 @@ def download_media(media_item, force_audio=False):
         if extra_headers:
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in extra_headers.items())
             headers_arg = ["-headers", headers_str]
+        
+        # Add allowed_segment_extensions ALL and extension_picky 0 for HLS urls to support .jpeg segment files (like MissAV)
+        if "m3u8" in media_url:
+            headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
 
         # 影片處理 (含轉音訊)
         if force_audio:
@@ -569,6 +573,9 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
     if headers:
         headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         headers_arg = ["-headers", headers_str]
+        
+    if "m3u8" in video_path:
+        headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
     
     if audio_format == "MP3":
         ext = "mp3"
