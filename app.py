@@ -35,8 +35,131 @@ def create_temp_cookiefile(fb_cookie_str):
             f.write(f".facebook.com\tTRUE\t/\tTRUE\t0\t{k}\t{v}\n")
     return path
 
+def extract_packer_blocks(html):
+    blocks = []
+    start_pattern = "eval(function(p,a,c,k,e,d)"
+    idx = 0
+    while True:
+        idx = html.find(start_pattern, idx)
+        if idx == -1:
+            break
+        paren_count = 0
+        end_idx = idx
+        for i in range(idx + 4, len(html)):
+            if html[i] == '(':
+                paren_count += 1
+            elif html[i] == ')':
+                paren_count -= 1
+                if paren_count == -1:
+                    end_idx = i
+                    break
+        blocks.append(html[idx:end_idx+1])
+        idx = end_idx + 1
+    return blocks
+
+def unpack_dean_packer(packed_js):
+    match = re.search(r'}\s*\(\s*([\'\"].*?[\'\"])\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\'\"].*?[\'\"])\.split\([\'\"]\|[\'\"]\)', packed_js, re.DOTALL)
+    if not match:
+        return ""
+    
+    packed_code = match.group(1)
+    if packed_code.startswith("'") and packed_code.endswith("'"):
+        packed_code = packed_code[1:-1]
+    elif packed_code.startswith('"') and packed_code.endswith('"'):
+        packed_code = packed_code[1:-1]
+        
+    packed_code = packed_code.replace("\\'", "'").replace('\\"', '"')
+    
+    a = int(match.group(2))
+    c = int(match.group(3))
+    
+    words_str = match.group(4)
+    if words_str.startswith("'") and words_str.endswith("'"):
+        words_str = words_str[1:-1]
+    elif words_str.startswith('"') and words_str.endswith('"'):
+        words_str = words_str[1:-1]
+    words = words_str.split('|')
+    
+    def baseN(num, b):
+        if num == 0:
+            return "0"
+        digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+        res = ""
+        while num > 0:
+            res = digits[num % b] + res
+            num = num // b
+        return res
+
+    for i in range(c - 1, -1, -1):
+        if i < len(words) and words[i]:
+            encoded = baseN(i, a)
+            pattern = r'\b' + re.escape(encoded) + r'\b'
+            packed_code = re.sub(pattern, words[i], packed_code)
+            
+    return packed_code
+
 def get_media_items(url):
     items = []
+    
+    if "missav" in url:
+        from curl_cffi import requests as curl_requests
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+        try:
+            response = curl_requests.get(url, headers=headers, impersonate="chrome", timeout=15)
+            response.raise_for_status()
+            
+            # 1. 提取標題
+            title = "MissAV_Video"
+            og_title_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']', response.text)
+            if og_title_match:
+                title = og_title_match.group(1)
+            else:
+                og_title_match = re.search(r'<meta\s+content=["\'](.*?)["\']\s+property=["\']og:title["\']', response.text)
+                if og_title_match:
+                    title = og_title_match.group(1)
+                else:
+                    title_match = re.search(r'<title>(.*?)</title>', response.text)
+                    if title_match:
+                        title = title_match.group(1)
+            
+            title = title.strip().rstrip('-').strip()
+            title = re.sub(r'[\\/:*?"<>|]', '_', title)
+            
+            # 2. 尋找與解密 Dean Edwards Packer 區塊
+            blocks = extract_packer_blocks(response.text)
+            m3u8_url = None
+            
+            if blocks:
+                unpacked = unpack_dean_packer(blocks[0])
+                source_1080p = re.search(r"source1280\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
+                source_720p = re.search(r"source842\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
+                source_playlist = re.search(r"source\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
+                
+                if source_1080p:
+                    m3u8_url = source_1080p.group(1)
+                elif source_720p:
+                    m3u8_url = source_720p.group(1)
+                elif source_playlist:
+                    m3u8_url = source_playlist.group(1)
+                    
+            if not m3u8_url:
+                raise ValueError("無法從頁面中解析出影片串流網址 (m3u8)。")
+                
+            items.append({
+                'url': m3u8_url,
+                'title': title,
+                'ext': 'mp4',
+                'type': 'video',
+                'headers': {
+                    'Referer': url
+                }
+            })
+            return items
+            
+        except Exception as e:
+            raise ValueError(f"MissAV 解析失敗: {e}")
     
     # 阻擋並辨識 Facebook 社團首頁，引導使用者使用貼文連結
     if "facebook.com/groups/" in url or "fb.com/groups/" in url:
@@ -379,10 +502,18 @@ def download_media(media_item, force_audio=False):
             st.success(f"✅ 圖片下載完成！`{title}.{ext}`")
             return
 
+        # Determine if we need to add custom headers (like Referer for MissAV)
+        extra_headers = media_item.get('headers', {})
+        headers_arg = []
+        if extra_headers:
+            headers_str = "".join(f"{k}: {v}\r\n" for k, v in extra_headers.items())
+            headers_arg = ["-headers", headers_str]
+
         # 影片處理 (含轉音訊)
         if force_audio:
             ffmpeg_cmd = [
-                "ffmpeg", "-y",
+                "ffmpeg", "-y"
+            ] + headers_arg + [
                 "-i", media_url,
                 "-vn",
                 "-c:a", "libmp3lame",
@@ -393,7 +524,8 @@ def download_media(media_item, force_audio=False):
             spinner_msg = f"⏳ 正在下載與轉碼為 {ext.upper()} (100% RAM 處理中)..."
         else:
             ffmpeg_cmd = [
-                "ffmpeg", "-y",
+                "ffmpeg", "-y"
+            ] + headers_arg + [
                 "-i", media_url,
                 "-c", "copy",
                 "-bsf:a", "aac_adtstoasc",
@@ -421,7 +553,7 @@ def download_media(media_item, force_audio=False):
         st.error(f"❌ 發生例外錯誤: {e}")
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
 
-def extract_local_audio(video_path, audio_format, title=None):
+def extract_local_audio(video_path, audio_format, title=None, headers=None):
     if title:
         base_name = title
     else:
@@ -433,15 +565,20 @@ def extract_local_audio(video_path, audio_format, title=None):
     fmt = ""
     ffmpeg_cmd = []
     
+    headers_arg = []
+    if headers:
+        headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        headers_arg = ["-headers", headers_str]
+    
     if audio_format == "MP3":
         ext = "mp3"
-        ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
+        ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
     elif audio_format == "M4A":
         ext = "m4a"
-        ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
+        ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
     else:
         try:
-            probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
+            probe_cmd = ["ffprobe", "-v", "error"] + headers_arg + ["-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
             codec = subprocess.check_output(probe_cmd, text=True).strip()
             
             if codec == "aac":
@@ -455,15 +592,15 @@ def extract_local_audio(video_path, audio_format, title=None):
                 fmt = "opus"
             else:
                 ext = "m4a"
-                ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
+                ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
                 codec = "unknown"
                 
             if codec != "unknown":
-                ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "copy", "-f", fmt, "pipe:1"]
+                ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "copy", "-f", fmt, "pipe:1"]
         except Exception as e:
             st.warning(f"⚠️ `{base_name}` 無法解析原始音訊格式，將預設轉換為 MP3。")
             ext = "mp3"
-            ffmpeg_cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
+            ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
 
     out_path = os.path.join(out_dir, f"{base_name}.{ext}")
     
@@ -670,7 +807,7 @@ with tab2:
                             
                         if media_items:
                             for item in media_items:
-                                extract_local_audio(item['url'], audio_format, title=item['title'])
+                                extract_local_audio(item['url'], audio_format, title=item['title'], headers=item.get('headers'))
                         else:
                             st.error(f"❌ 無法取得串流: {url}")
                     except Exception as e:
