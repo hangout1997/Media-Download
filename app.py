@@ -5,6 +5,7 @@ import requests
 import subprocess
 import shutil
 import tempfile
+import gc
 import streamlit as st
 
 def create_temp_cookiefile(fb_cookie_str):
@@ -484,10 +485,69 @@ def extract_local_audio(video_path, audio_format, title=None):
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
 
+def release_resources():
+    released_info = []
+    
+    # 1. 垃圾回收
+    collected = gc.collect()
+    released_info.append(f"🧹 已執行 Python 垃圾回收，回收了 {collected} 個物件。")
+    
+    # 2. 清除 Streamlit 快取
+    try:
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        released_info.append("💾 已清除 Streamlit 應用程式快取數據。")
+    except Exception as e:
+        released_info.append(f"⚠️ 清除快取時發生錯誤: {e}")
+        
+    # 3. 刪除暫存 Cookie 檔案
+    import glob
+    temp_dir = tempfile.gettempdir()
+    cookie_patterns = [
+        os.path.join(temp_dir, "fb_cookies_*.txt"),
+        os.path.join(os.getcwd(), "fb_cookies_*.txt")
+    ]
+    
+    deleted_files = 0
+    for pattern in cookie_patterns:
+        for fpath in glob.glob(pattern):
+            try:
+                os.remove(fpath)
+                deleted_files += 1
+            except Exception:
+                pass
+                
+    if deleted_files > 0:
+        released_info.append(f"🗑️ 已成功清理 {deleted_files} 個暫存 Cookie 檔案。")
+    else:
+        released_info.append("✨ 未偵測到殘留的暫存 Cookie 檔案。")
+        
+    # 4. 嘗試關閉殘留的 ffmpeg 與 yt-dlp 進程
+    try:
+        subprocess.run(["pkill", "-f", "ffmpeg"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "-f", "yt-dlp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        released_info.append("⚙️ 已嘗試終止背景殘留的 FFmpeg 與 yt-dlp 進程。")
+    except Exception as e:
+        released_info.append(f"⚠️ 嘗試終止進程時發生錯誤: {e}")
+        
+    return released_info
+
 # ========================================================
 # Streamlit Web App Interface
 # ========================================================
 st.set_page_config(page_title="Gimymax Media Downloader", page_icon="🎬", layout="centered")
+
+with st.sidebar:
+    st.title("⚙️ 系統控制")
+    st.markdown("管理系統資源與進行手動清理維護。")
+    st.divider()
+    
+    if st.button("♻️ 釋放所有資源", type="secondary", use_container_width=True):
+        with st.spinner("正在釋放系統資源中..."):
+            info = release_resources()
+            for msg in info:
+                st.success(msg)
+            st.toast("♻️ 資源釋放成功")
 
 st.title("🎬 媒體下載與音訊提取器")
 

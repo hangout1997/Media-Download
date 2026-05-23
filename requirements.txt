@@ -6,6 +6,7 @@ cachetools==7.1.1
 certifi==2026.4.22
 charset-normalizer==3.4.7
 click==8.3.3
+gallery_dl==1.32.1
 gitdb==4.0.12
 GitPython==3.1.50
 h11==0.16.0
