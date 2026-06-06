@@ -547,12 +547,16 @@ def download_media(media_item, force_audio=False):
                 # 寫入 Google Drive (一筆到底，對 GDrive 同步最友善，且過程中完全不碰 SSD)
                 with open(out_path, "wb") as f:
                     f.write(process.stdout)
-                
                 st.success(f"✅ 下載完成！檔案已從 RAM 一次性寫入 Google Drive: `{title}.{ext}`")
             else:
                 st.error("❌ FFmpeg 下載失敗！")
                 with st.expander("檢視詳細錯誤日誌"):
                     st.text(process.stderr.decode('utf-8', errors='ignore'))
+            
+            # 立即手動釋放大型 bytes 快取並進行 GC
+            del process
+            import gc
+            gc.collect()
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
@@ -626,6 +630,11 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 st.error(f"❌ 提取 `{base_name}` 失敗！")
                 with st.expander("錯誤日誌"):
                     st.text(process.stderr.decode('utf-8', errors='ignore'))
+            
+            # 立即手動釋放大 bytes 快取並進行 GC
+            del process
+            import gc
+            gc.collect()
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
 
@@ -685,6 +694,16 @@ with st.sidebar:
     st.title("⚙️ 系統控制")
     st.markdown("管理系統資源與進行手動清理維護。")
     st.divider()
+    
+    if st.button("🧹 僅釋放記憶體快取 (不關閉服務)", use_container_width=True, help="清空下載快取、暫存 Cookie 與釋放垃圾回收 RAM"):
+        with st.spinner("正在釋放系統快取與垃圾回收中..."):
+            info = release_resources()
+            st.success("🧹 記憶體與快取清理完畢！")
+            for msg in info:
+                # 過濾掉會關閉程式的文字，僅呈現清理資訊
+                if "關閉" not in msg and "終止" not in msg:
+                    st.toast(msg, icon="ℹ️")
+    st.write("")
     
     if st.button("♻️ 釋放所有資源並關閉", type="primary", use_container_width=True):
         with st.spinner("正在釋放系統資源與關閉程式中..."):
