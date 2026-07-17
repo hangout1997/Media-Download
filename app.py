@@ -447,14 +447,56 @@ def get_media_items(url):
         title = re.sub(r'第[一二三四五六七八九十\d]+季', f'S{s_num}', title)
 
     # 嘗試抓取集數資訊，將「第X集」替換為 E01, E02...
+    ep_str = None
+    
+    # 策略 1: 舊有 Gimymax 邏輯 data-playname
     match_ep = re.search(r'data-playname="([^"]+)"', response.text)
     if match_ep:
-        ep_raw = match_ep.group(1)
+        ep_raw = match_ep.group(1).strip()
         match_e = re.search(r'第(\d+)集', ep_raw)
         if match_e:
             ep_str = f"E{int(match_e.group(1)):02d}"
         else:
             ep_str = ep_raw
+            
+    # 策略 2: 針對 Gimymax / Gimyplus 或者是其他變體，從 URL filename 反查 HTML 中對應的 a 標籤
+    if not ep_str:
+        url_filename = url.split('/')[-1].split('?')[0]
+        if url_filename:
+            pattern = r'href=["\'][^\'\"]*' + re.escape(url_filename) + r'[^>]*>\s*(.*?)\s*</a>'
+            matches = re.findall(pattern, response.text)
+            if matches:
+                ep_raw = None
+                for m in matches:
+                    m_clean = m.strip()
+                    if "第" in m_clean or "集" in m_clean:
+                        ep_raw = m_clean
+                        break
+                if not ep_raw:
+                    for m in matches:
+                        m_clean = m.strip()
+                        if re.search(r'\d+', m_clean):
+                            ep_raw = m_clean
+                            break
+                if not ep_raw:
+                    ep_raw = matches[-1].strip()
+                
+                if ep_raw:
+                    match_e = re.search(r'第(\d+)集', ep_raw)
+                    if match_e:
+                        ep_str = f"E{int(match_e.group(1)):02d}"
+                    else:
+                        ep_str = ep_raw
+
+    # 策略 3: 如果還是沒拿到，但 URL 結尾有集數特徵 (例如 232804-3-10.html -> "10"，或是 ep_1.html -> "1")
+    if not ep_str:
+        url_filename = url.split('/')[-1].split('?')[0]
+        url_id = url_filename.split('.')[0]
+        match_num = re.search(r'[-_](\d+)$', url_id)
+        if match_num:
+            ep_str = f"E{int(match_num.group(1)):02d}"
+            
+    if ep_str:
         title = f"{title}_{ep_str}"
     
     # 處理檔名特殊字元
