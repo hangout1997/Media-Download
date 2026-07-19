@@ -35,6 +35,33 @@ def create_temp_cookiefile(fb_cookie_str):
             f.write(f".facebook.com\tTRUE\t/\tTRUE\t0\t{k}\t{v}\n")
     return path
 
+def cn_to_an(cn_str):
+    if cn_str.isdigit():
+        return int(cn_str)
+    
+    zh_num = {'零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+    
+    if len(cn_str) == 1:
+        return zh_num.get(cn_str, 1)
+    
+    # 處理「十一」~「十九」
+    if cn_str.startswith('十'):
+        if len(cn_str) == 2:
+            return 10 + zh_num.get(cn_str[1], 0)
+        return 10
+        
+    # 處理「二十」、「三十」...「九十」或「二十一」、「三十五」等
+    if '十' in cn_str:
+        parts = cn_str.split('十')
+        prefix = zh_num.get(parts[0], 1)
+        suffix = zh_num.get(parts[1], 0) if parts[1] else 0
+        return prefix * 10 + suffix
+        
+    val = 0
+    for char in cn_str:
+        val = val * 10 + zh_num.get(char, 0)
+    return val if val > 0 else 1
+
 def extract_packer_blocks(html):
     blocks = []
     start_pattern = "eval(function(p,a,c,k,e,d)"
@@ -439,11 +466,10 @@ def get_media_items(url):
     title = data.get("vod_data", {}).get("vod_name", "downloaded_media")
     
     # 將「第X季」替換為 S1, S2...
-    zh_num = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
     match_s = re.search(r'第([一二三四五六七八九十\d]+)季', title)
     if match_s:
         num_str = match_s.group(1)
-        s_num = int(num_str) if num_str.isdigit() else zh_num.get(num_str, 1)
+        s_num = cn_to_an(num_str)
         title = re.sub(r'第[一二三四五六七八九十\d]+季', f'S{s_num}', title)
 
     # 嘗試抓取集數資訊，將「第X集」替換為 E01, E02...
