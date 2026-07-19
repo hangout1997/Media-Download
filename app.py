@@ -85,26 +85,18 @@ def extract_packer_blocks(html):
     return blocks
 
 def unpack_dean_packer(packed_js):
-    match = re.search(r'}\s*\(\s*([\'\"].*?[\'\"])\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\'\"].*?[\'\"])\.split\([\'\"]\|[\'\"]\)', packed_js, re.DOTALL)
+    pattern = r'\}\s*\(\s*(["\'])((?:(?!\1).|\\.)*)\1\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(["\'])((?:(?!\5).|\\.)*)\5(?:\.split\([\'"]\|[\'"]\))?'
+    match = re.search(pattern, packed_js, re.DOTALL)
     if not match:
         return ""
     
-    packed_code = match.group(1)
-    if packed_code.startswith("'") and packed_code.endswith("'"):
-        packed_code = packed_code[1:-1]
-    elif packed_code.startswith('"') and packed_code.endswith('"'):
-        packed_code = packed_code[1:-1]
-        
+    packed_code = match.group(2)
     packed_code = packed_code.replace("\\'", "'").replace('\\"', '"')
     
-    a = int(match.group(2))
-    c = int(match.group(3))
+    a = int(match.group(3))
+    c = int(match.group(4))
     
-    words_str = match.group(4)
-    if words_str.startswith("'") and words_str.endswith("'"):
-        words_str = words_str[1:-1]
-    elif words_str.startswith('"') and words_str.endswith('"'):
-        words_str = words_str[1:-1]
+    words_str = match.group(6)
     words = words_str.split('|')
     
     def baseN(num, b):
@@ -134,7 +126,7 @@ def get_media_items(url):
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         }
         try:
-            response = curl_requests.get(url, headers=headers, impersonate="chrome", timeout=15)
+            response = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=15)
             response.raise_for_status()
             
             # 1. 提取標題
