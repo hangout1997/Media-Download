@@ -120,7 +120,7 @@ def unpack_dean_packer(packed_js):
 def get_media_items(url):
     items = []
     
-    if "missav" in url:
+    if "missav" in url.lower():
         import html as html_lib
         from curl_cffi import requests as curl_requests
         headers = {
@@ -181,6 +181,8 @@ def get_media_items(url):
                 source_1080p = re.search(r"source1280\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
                 source_720p = re.search(r"source842\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
                 source_playlist = re.search(r"source\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
+                source_generic = re.search(r"source\w*\s*=\s*['\"](https?://[^'\"]+?\.m3u8[^\'\"]*)['\"]", unpacked)
+                m3u8_direct = re.search(r"['\"](https?://[^'\"]+?\.m3u8[^\'\"]*)['\"]", unpacked)
 
                 if source_1080p:
                     m3u8_url = source_1080p.group(1)
@@ -190,6 +192,12 @@ def get_media_items(url):
                     break
                 elif source_playlist:
                     m3u8_url = source_playlist.group(1)
+                    break
+                elif source_generic:
+                    m3u8_url = source_generic.group(1)
+                    break
+                elif m3u8_direct:
+                    m3u8_url = m3u8_direct.group(1)
                     break
 
             if not m3u8_url:
@@ -201,7 +209,8 @@ def get_media_items(url):
                 'ext': 'mp4',
                 'type': 'video',
                 'headers': {
-                    'Referer': url
+                    'Referer': url,
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
                 }
             })
             return items
