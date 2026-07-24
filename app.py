@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import time
+import threading
 import requests
 import subprocess
 import shutil
@@ -566,6 +568,98 @@ def get_media_items(url):
     }]
     return items
 
+def format_time(seconds):
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def get_media_duration(media_url, headers=None):
+    headers_arg = []
+    if headers:
+        headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        headers_arg = ["-headers", headers_str]
+    if "m3u8" in media_url:
+        headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+    
+    probe_cmd = ["ffprobe", "-v", "error"] + headers_arg + [
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        media_url
+    ]
+    try:
+        res = subprocess.check_output(probe_cmd, text=True, stderr=subprocess.DEVNULL).strip()
+        return float(res)
+    except Exception:
+        return 0.0
+
+def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+
+    cmd = [ffmpeg_cmd[0], "-y", "-progress", "pipe:2"] + ffmpeg_cmd[2:]
+    
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    stdout_bytes = bytearray()
+
+    def read_stdout():
+        nonlocal stdout_bytes
+        stdout_bytes = process.stdout.read()
+
+    t_out = threading.Thread(target=read_stdout)
+    t_out.start()
+
+    current_sec = 0.0
+    speed = "1.0x"
+    last_update_time = 0.0
+    stderr_lines = []
+
+    for line in iter(process.stderr.readline, b''):
+        line_str = line.decode('utf-8', errors='ignore').strip()
+        if not line_str:
+            continue
+        stderr_lines.append(line_str)
+        if len(stderr_lines) > 50:
+            stderr_lines.pop(0)
+
+        if line_str.startswith("out_time_us="):
+            try:
+                us = int(line_str.split("=")[1])
+                current_sec = us / 1000000.0
+            except ValueError:
+                pass
+        elif line_str.startswith("speed="):
+            speed = line_str.split("=")[1].strip()
+
+        now = time.time()
+        if now - last_update_time >= 0.2:
+            last_update_time = now
+            if total_duration > 0:
+                pct = min(1.0, max(0.0, current_sec / total_duration))
+                pct_num = pct * 100
+                progress_bar.progress(pct)
+                status_text.markdown(f"⏳ **{label}進度**: `{pct_num:.1f}%` ({format_time(current_sec)} / {format_time(total_duration)}) | 速度: `{speed}`")
+            else:
+                status_text.markdown(f"⏳ **{label}處理中...** 已完成 `{format_time(current_sec)}` | 速度: `{speed}`")
+
+    t_out.join()
+    process.wait()
+
+    if total_duration > 0:
+        progress_bar.progress(1.0)
+    status_text.empty()
+    progress_bar.empty()
+
+    stderr_log = "\n".join(stderr_lines)
+    return process.returncode, bytes(stdout_bytes), stderr_log
+
 def download_media(media_item, force_audio=False):
     title = media_item['title']
     media_url = media_item['url']
@@ -623,7 +717,7 @@ def download_media(media_item, force_audio=False):
                 "-f", "mp3",    # 指定輸出格式為 mp3
                 "pipe:1"        # 輸出到標準輸出 (stdout)
             ]
-            spinner_msg = f"⏳ 正在下載與轉碼為 {ext.upper()} (100% RAM 處理中)..."
+            label_text = "音訊轉碼"
         else:
             ffmpeg_cmd = [
                 "ffmpeg", "-y"
@@ -635,26 +729,28 @@ def download_media(media_item, force_audio=False):
                 "-movflags", "frag_keyframe+empty_moov", 
                 "pipe:1"
             ]
-            spinner_msg = f"⏳ 正在下載影片串流並封裝為 {ext.upper()} (100% RAM 處理中)..."
+            label_text = "影片下載"
         
-        with st.spinner(spinner_msg):
-            # 不使用 tempfile，直接將輸出捕捉到記憶體中 (stdout=subprocess.PIPE)
-            process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-            if process.returncode == 0:
-                # 寫入 Google Drive (一筆到底，對 GDrive 同步最友善，且過程中完全不碰 SSD)
-                with open(out_path, "wb") as f:
-                    f.write(process.stdout)
-                st.success(f"✅ 下載完成！檔案已從 RAM 一次性寫入 Google Drive: `{title}.{ext}`")
-            else:
-                st.error("❌ FFmpeg 下載失敗！")
-                with st.expander("檢視詳細錯誤日誌"):
-                    st.text(process.stderr.decode('utf-8', errors='ignore'))
-            
-            # 立即手動釋放大型 bytes 快取並進行 GC
-            del process
-            import gc
-            gc.collect()
+        # 先獲取媒體總時長 (用於進度百分比計算)
+        total_dur = get_media_duration(media_url, headers=extra_headers)
+
+        returncode, stdout_data, stderr_log = run_ffmpeg_with_progress(
+            ffmpeg_cmd, total_duration=total_dur, label=label_text
+        )
+
+        if returncode == 0:
+            with open(out_path, "wb") as f:
+                f.write(stdout_data)
+            st.success(f"✅ 下載完成！檔案已從 RAM 一次性寫入 Google Drive: `{title}.{ext}`")
+        else:
+            st.error("❌ FFmpeg 下載失敗！")
+            with st.expander("檢視詳細錯誤日誌"):
+                st.text(stderr_log)
+        
+        # 立即手動釋放大型 bytes 快取並進行 GC
+        del stdout_data
+        import gc
+        gc.collect()
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
@@ -718,21 +814,23 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         return
         
     try:
-        with st.spinner(f"⏳ 正在提取 `{base_name}` 音訊為 {ext.upper()} (100% RAM 處理中)..."):
-            process = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if process.returncode == 0:
-                with open(out_path, "wb") as f:
-                    f.write(process.stdout)
-                st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
-            else:
-                st.error(f"❌ 提取 `{base_name}` 失敗！")
-                with st.expander("錯誤日誌"):
-                    st.text(process.stderr.decode('utf-8', errors='ignore'))
-            
-            # 立即手動釋放大 bytes 快取並進行 GC
-            del process
-            import gc
-            gc.collect()
+        total_dur = get_media_duration(video_path, headers=headers)
+        returncode, stdout_data, stderr_log = run_ffmpeg_with_progress(
+            ffmpeg_cmd, total_duration=total_dur, label="音訊提取"
+        )
+        if returncode == 0:
+            with open(out_path, "wb") as f:
+                f.write(stdout_data)
+            st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
+        else:
+            st.error(f"❌ 提取 `{base_name}` 失敗！")
+            with st.expander("錯誤日誌"):
+                st.text(stderr_log)
+        
+        # 立即手動釋放大 bytes 快取並進行 GC
+        del stdout_data
+        import gc
+        gc.collect()
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
 
