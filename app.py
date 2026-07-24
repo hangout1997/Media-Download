@@ -656,6 +656,115 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     stderr_log = "\n".join(stderr_lines)
     return process.returncode, bytes(stdout_bytes), stderr_log
 
+def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=16, label="影片"):
+    import urllib.parse
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from curl_cffi import requests as curl_requests
+
+    req_headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    }
+    if extra_headers:
+        req_headers.update(extra_headers)
+
+    res = curl_requests.get(m3u8_url, headers=req_headers, impersonate="chrome124", timeout=10)
+    if res.status_code != 200:
+        raise ValueError(f"無法讀取 m3u8 串流 (HTTP {res.status_code})")
+    
+    text = res.text
+
+    if "#EXT-X-STREAM-INF" in text:
+        sub_playlists = []
+        current_inf = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("#EXT-X-STREAM-INF"):
+                bw_match = re.search(r"BANDWIDTH=(\d+)", line)
+                current_inf['bw'] = int(bw_match.group(1)) if bw_match else 0
+            elif line and not line.startswith("#"):
+                sub_playlists.append((current_inf.get('bw', 0), urllib.parse.urljoin(m3u8_url, line)))
+                current_inf = {}
+        if sub_playlists:
+            sub_playlists.sort(key=lambda x: x[0], reverse=True)
+            m3u8_url = sub_playlists[0][1]
+            res = curl_requests.get(m3u8_url, headers=req_headers, impersonate="chrome124", timeout=10)
+            text = res.text
+
+    lines = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith('#')]
+    segment_urls = [urllib.parse.urljoin(m3u8_url, l) for l in lines]
+    
+    if not segment_urls:
+        raise ValueError("m3u8 清單內無有效的切片網址")
+
+    total_segments = len(segment_urls)
+    
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
+
+    def download_segment(args):
+        idx, seg_url = args
+        for attempt in range(3):
+            try:
+                r = curl_requests.get(seg_url, headers=req_headers, impersonate="chrome124", timeout=12)
+                if r.status_code == 200 and len(r.content) > 0:
+                    return idx, r.content
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return idx, b""
+
+    t0 = time.time()
+    last_update_time = 0.0
+    segments_data = [b""] * total_segments
+    completed = 0
+    total_downloaded_bytes = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(download_segment, (i, url)) for i, url in enumerate(segment_urls)]
+        for f in as_completed(futures):
+            idx, content = f.result()
+            segments_data[idx] = content
+            completed += 1
+            total_downloaded_bytes += len(content)
+
+            now = time.time()
+            if now - last_update_time >= 0.25 or completed == total_segments:
+                last_update_time = now
+                pct = completed / total_segments
+                elapsed = max(0.1, now - t0)
+                speed_mb = (total_downloaded_bytes / 1024 / 1024) / elapsed
+                mb_downloaded = total_downloaded_bytes / 1024 / 1024
+                status_text.markdown(f"🚀 **{label}極速多線程傳輸中**: `{pct*100:.1f}%` ({completed}/{total_segments} 切片, {mb_downloaded:.1f} MB) | 速度: `{speed_mb:.2f} MB/s`")
+                progress_bar.progress(pct)
+
+    status_text.markdown("⚡ **多線程切片下載完成，正在記憶體中無損封裝為 MP4...**")
+    
+    full_raw_stream = b"".join(segments_data)
+    del segments_data
+    gc.collect()
+
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-i", "pipe:0",
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-f", "mp4",
+        "-movflags", "frag_keyframe+empty_moov",
+        "pipe:1"
+    ]
+    
+    proc = subprocess.run(ffmpeg_cmd, input=full_raw_stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    del full_raw_stream
+    gc.collect()
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if proc.returncode != 0:
+        raise ValueError(f"FFmpeg 無損封裝失敗: {proc.stderr.decode('utf-8', errors='ignore')}")
+
+    return proc.stdout
+
 def download_media(media_item, force_audio=False):
     title = media_item['title']
     media_url = media_item['url']
@@ -690,8 +799,22 @@ def download_media(media_item, force_audio=False):
             st.success(f"✅ 圖片下載完成！`{title}.{ext}`")
             return
 
-        # Determine if we need to add custom headers (like Referer for MissAV)
         extra_headers = media_item.get('headers', {})
+
+        # 優先嘗試 16 線程平行極速 HLS 下載
+        if "m3u8" in media_url and not force_audio:
+            try:
+                mp4_bytes = download_fast_parallel_hls(media_url, extra_headers=extra_headers, max_workers=16, label="影片")
+                with open(out_path, "wb") as f:
+                    f.write(mp4_bytes)
+                st.success(f"✅ 極速下載完成！檔案已從 RAM 一次性寫入 Google Drive: `{title}.{ext}`")
+                del mp4_bytes
+                gc.collect()
+                return
+            except Exception as hls_err:
+                st.warning(f"⚠️ 多線程下載失敗 ({hls_err})，降級使用標準 FFmpeg 串流處理...")
+
+        # Determine if we need to add custom headers (like Referer for MissAV)
         headers_arg = []
         if extra_headers:
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in extra_headers.items())
