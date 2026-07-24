@@ -712,13 +712,15 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=20, lab
             m3u8_url = sub_playlists[0][1]
             text = fetch_text(m3u8_url)
 
-    lines = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith('#')]
-    segment_urls = [urllib.parse.urljoin(m3u8_url, l) for l in lines]
-    
-    if not segment_urls:
-        raise ValueError("m3u8 清單內無有效的切片網址")
+    extinfs = [float(x) for x in re.findall(r'#EXTINF:([\d\.]+)', text)]
+    if len(extinfs) == total_segments:
+        segment_durations = extinfs
+    else:
+        total_dur = sum(extinfs) if extinfs else 0.0
+        avg_dur = total_dur / total_segments if (total_dur > 0 and total_segments > 0) else 1.0
+        segment_durations = [avg_dur] * total_segments
 
-    total_segments = len(segment_urls)
+    total_duration = sum(segment_durations)
     
     progress_bar = st.progress(0.0)
     status_text = st.empty()
@@ -745,6 +747,7 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=20, lab
     last_update_time = 0.0
     segments_data = [b""] * total_segments
     completed = 0
+    completed_duration = 0.0
     total_downloaded_bytes = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -753,16 +756,22 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=20, lab
             idx, content = f.result()
             segments_data[idx] = content
             completed += 1
+            completed_duration += segment_durations[idx]
             total_downloaded_bytes += len(content)
 
             now = time.time()
             if now - last_update_time >= 0.25 or completed == total_segments:
                 last_update_time = now
-                pct = completed / total_segments
                 elapsed = max(0.1, now - t0)
-                speed_mb = (total_downloaded_bytes / 1024 / 1024) / elapsed
-                mb_downloaded = total_downloaded_bytes / 1024 / 1024
-                status_text.markdown(f"🚀 **{label}極速多線程傳輸中**: `{pct*100:.1f}%` ({completed}/{total_segments} 切片, {mb_downloaded:.1f} MB) | 速度: `{speed_mb:.2f} MB/s`")
+                speed_x = completed_duration / elapsed
+                if total_duration > 0:
+                    pct = min(1.0, max(0.0, completed_duration / total_duration))
+                    pct_num = pct * 100
+                    status_text.markdown(f"⏳ **{label}進度**: `{pct_num:.1f}%` ({format_time(completed_duration)} / {format_time(total_duration)}) | 速度: `{speed_x:.2f}x`")
+                else:
+                    pct = completed / total_segments
+                    pct_num = pct * 100
+                    status_text.markdown(f"⏳ **{label}處理中...** 已完成切片 `{completed}/{total_segments}` | 速度: `{speed_x:.2f}x`")
                 progress_bar.progress(pct)
 
     status_text.markdown("⚡ **多線程切片下載完成，正在記憶體中無損封裝為 MP4...**")
