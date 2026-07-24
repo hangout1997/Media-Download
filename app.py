@@ -564,7 +564,11 @@ def get_media_items(url):
         'url': m3u8_url,
         'title': title,
         'ext': 'mp4',
-        'type': 'video'
+        'type': 'video',
+        'headers': {
+            'Referer': url,
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        }
     }]
     return items
 
@@ -656,7 +660,7 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     stderr_log = "\n".join(stderr_lines)
     return process.returncode, bytes(stdout_bytes), stderr_log
 
-def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=16, label="影片"):
+def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=20, label="影片"):
     import urllib.parse
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from curl_cffi import requests as curl_requests
@@ -667,11 +671,30 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=16, lab
     if extra_headers:
         req_headers.update(extra_headers)
 
-    res = curl_requests.get(m3u8_url, headers=req_headers, impersonate="chrome124", timeout=10)
-    if res.status_code != 200:
-        raise ValueError(f"無法讀取 m3u8 串流 (HTTP {res.status_code})")
-    
-    text = res.text
+    if 'Referer' not in req_headers:
+        req_headers['Referer'] = f"https://{urllib.parse.urlparse(m3u8_url).netloc}/"
+
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=max_workers*2, pool_maxsize=max_workers*2, max_retries=3)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+
+    def fetch_text(url):
+        try:
+            r = session.get(url, headers=req_headers, timeout=10)
+            if r.status_code == 200:
+                return r.text
+        except Exception:
+            pass
+        try:
+            r = curl_requests.get(url, headers=req_headers, impersonate="chrome124", timeout=10)
+            if r.status_code == 200:
+                return r.text
+        except Exception:
+            pass
+        raise ValueError(f"無法讀取 m3u8 串流選單 ({url})")
+
+    text = fetch_text(m3u8_url)
 
     if "#EXT-X-STREAM-INF" in text:
         sub_playlists = []
@@ -687,8 +710,7 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=16, lab
         if sub_playlists:
             sub_playlists.sort(key=lambda x: x[0], reverse=True)
             m3u8_url = sub_playlists[0][1]
-            res = curl_requests.get(m3u8_url, headers=req_headers, impersonate="chrome124", timeout=10)
-            text = res.text
+            text = fetch_text(m3u8_url)
 
     lines = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith('#')]
     segment_urls = [urllib.parse.urljoin(m3u8_url, l) for l in lines]
@@ -705,12 +727,18 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=16, lab
         idx, seg_url = args
         for attempt in range(3):
             try:
-                r = curl_requests.get(seg_url, headers=req_headers, impersonate="chrome124", timeout=12)
+                r = session.get(seg_url, headers=req_headers, timeout=10)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
             except Exception:
                 pass
-            time.sleep(0.1)
+            try:
+                r = curl_requests.get(seg_url, headers=req_headers, impersonate="chrome124", timeout=10)
+                if r.status_code == 200 and len(r.content) > 0:
+                    return idx, r.content
+            except Exception:
+                pass
+            time.sleep(0.05)
         return idx, b""
 
     t0 = time.time()
