@@ -699,14 +699,7 @@ def download_media(media_item, force_audio=False):
         
         # Add allowed_segment_extensions ALL and extension_picky 0 for HLS urls to support .jpeg segment files (like MissAV)
         if "m3u8" in media_url:
-            headers_arg += [
-                "-http_persistent", "1",
-                "-reconnect", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "5",
-                "-allowed_segment_extensions", "ALL",
-                "-extension_picky", "0"
-            ]
+            headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
 
         # 影片處理 (含轉音訊)
         if force_audio:
@@ -776,14 +769,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         headers_arg = ["-headers", headers_str]
         
     if "m3u8" in video_path:
-        headers_arg += [
-            "-http_persistent", "1",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
-            "-allowed_segment_extensions", "ALL",
-            "-extension_picky", "0"
-        ]
+        headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
     
     if audio_format == "MP3":
         ext = "mp3"
