@@ -577,23 +577,19 @@ def format_time(seconds):
     return f"{m:02d}:{s:02d}"
 
 def get_media_duration(media_url, headers=None):
-    headers_arg = []
-    if headers:
-        headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-        headers_arg = ["-headers", headers_str]
     if "m3u8" in media_url:
-        headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
-    
-    probe_cmd = ["ffprobe", "-v", "error"] + headers_arg + [
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        media_url
-    ]
-    try:
-        res = subprocess.check_output(probe_cmd, text=True, stderr=subprocess.DEVNULL).strip()
-        return float(res)
-    except Exception:
-        return 0.0
+        try:
+            req_headers = {}
+            if headers:
+                req_headers.update(headers)
+            res = requests.get(media_url, headers=req_headers, timeout=4)
+            if res.status_code == 200:
+                extinfs = re.findall(r'#EXTINF:([\d\.]+)', res.text)
+                if extinfs:
+                    return sum(float(x) for x in extinfs)
+        except Exception:
+            pass
+    return 0.0
 
 def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     progress_bar = st.progress(0.0)
@@ -639,7 +635,7 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
             speed = line_str.split("=")[1].strip()
 
         now = time.time()
-        if now - last_update_time >= 0.2:
+        if now - last_update_time >= 0.5:
             last_update_time = now
             if total_duration > 0:
                 pct = min(1.0, max(0.0, current_sec / total_duration))
@@ -703,7 +699,14 @@ def download_media(media_item, force_audio=False):
         
         # Add allowed_segment_extensions ALL and extension_picky 0 for HLS urls to support .jpeg segment files (like MissAV)
         if "m3u8" in media_url:
-            headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+            headers_arg += [
+                "-http_persistent", "1",
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-allowed_segment_extensions", "ALL",
+                "-extension_picky", "0"
+            ]
 
         # 影片處理 (含轉音訊)
         if force_audio:
@@ -773,7 +776,14 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         headers_arg = ["-headers", headers_str]
         
     if "m3u8" in video_path:
-        headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+        headers_arg += [
+            "-http_persistent", "1",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-allowed_segment_extensions", "ALL",
+            "-extension_picky", "0"
+        ]
     
     if audio_format == "MP3":
         ext = "mp3"
