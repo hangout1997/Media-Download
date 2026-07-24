@@ -121,14 +121,40 @@ def get_media_items(url):
     items = []
     
     if "missav" in url:
+        import html as html_lib
         from curl_cffi import requests as curl_requests
         headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"macOS"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
         }
+        impersonates = ["chrome124", "chrome120", "chrome110", "safari15_5"]
+        response = None
+        last_err = None
+
+        for imp in impersonates:
+            try:
+                res = curl_requests.get(url, headers=headers, impersonate=imp, timeout=15)
+                if res.status_code == 200:
+                    response = res
+                    break
+                else:
+                    last_err = f"HTTP Error {res.status_code}"
+            except Exception as e:
+                last_err = str(e)
+
+        if not response:
+            raise ValueError(f"MissAV 解析失敗: HTTP 請求失敗 ({last_err})")
+
         try:
-            response = curl_requests.get(url, headers=headers, impersonate="chrome120", timeout=15)
-            response.raise_for_status()
-            
             # 1. 提取標題
             title = "MissAV_Video"
             og_title_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']', response.text)
@@ -142,30 +168,33 @@ def get_media_items(url):
                     title_match = re.search(r'<title>(.*?)</title>', response.text)
                     if title_match:
                         title = title_match.group(1)
-            
-            title = title.strip().rstrip('-').strip()
+
+            title = html_lib.unescape(title).strip().rstrip('-').strip()
             title = re.sub(r'[\\/:*?"<>|]', '_', title)
-            
-            # 2. 尋找與解密 Dean Edwards Packer 區塊
+
+            # 2. 尋找與解密 Dean Edwards Packer 區塊 (掃描所有區塊)
             blocks = extract_packer_blocks(response.text)
             m3u8_url = None
-            
-            if blocks:
-                unpacked = unpack_dean_packer(blocks[0])
+
+            for block in blocks:
+                unpacked = unpack_dean_packer(block)
                 source_1080p = re.search(r"source1280\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
                 source_720p = re.search(r"source842\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
                 source_playlist = re.search(r"source\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
-                
+
                 if source_1080p:
                     m3u8_url = source_1080p.group(1)
+                    break
                 elif source_720p:
                     m3u8_url = source_720p.group(1)
+                    break
                 elif source_playlist:
                     m3u8_url = source_playlist.group(1)
-                    
+                    break
+
             if not m3u8_url:
                 raise ValueError("無法從頁面中解析出影片串流網址 (m3u8)。")
-                
+
             items.append({
                 'url': m3u8_url,
                 'title': title,
@@ -176,7 +205,7 @@ def get_media_items(url):
                 }
             })
             return items
-            
+
         except Exception as e:
             raise ValueError(f"MissAV 解析失敗: {e}")
     
