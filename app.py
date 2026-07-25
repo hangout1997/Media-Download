@@ -8,6 +8,7 @@ import subprocess
 import shutil
 import tempfile
 import gc
+import traceback
 import streamlit as st
 
 def create_temp_cookiefile(fb_cookie_str):
@@ -586,6 +587,13 @@ def format_time(seconds):
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
+def show_error_log_box(error_msg, log_text=None, title="詳細錯誤日誌"):
+    st.error(error_msg)
+    if log_text and str(log_text).strip():
+        with st.expander(f"📋 {title} (點擊開啟一鍵複製)", expanded=True):
+            st.caption("💡 請點擊下方框框右上角的 **「📋 複製 (Copy)」** 按鈕，即可快速複製完整日誌提供給 AI：")
+            st.code(str(log_text).strip(), language="log")
+
 def get_media_duration(media_url, headers=None):
     if "m3u8" in media_url:
         try:
@@ -962,17 +970,13 @@ def download_media(media_item, force_audio=False):
                 if os.path.exists(out_path) or any(os.path.exists(f"{out_base}.{e}") for e in ["mp4", "mkv", "webm"]):
                     st.success(f"✅ 下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
                 else:
-                    st.error("❌ 下載失敗！")
-                    with st.expander("檢視詳細錯誤日誌"):
-                        st.text(stderr_log)
+                    show_error_log_box("❌ 下載失敗！", stderr_log)
             else:
-                st.error("❌ FFmpeg 下載失敗！")
-                with st.expander("檢視詳細錯誤日誌"):
-                    st.text(stderr_log)
+                show_error_log_box("❌ FFmpeg 下載失敗！", stderr_log)
         
         gc.collect()
     except Exception as e:
-        st.error(f"❌ 發生例外錯誤: {e}")
+        show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊")
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
 
 def extract_local_audio(video_path, audio_format, title=None, headers=None):
@@ -1035,13 +1039,11 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         if returncode == 0:
             st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
         else:
-            st.error(f"❌ 提取 `{base_name}` 失敗！")
-            with st.expander("錯誤日誌"):
-                st.text(stderr_log)
+            show_error_log_box(f"❌ 提取 `{base_name}` 失敗！", stderr_log)
         
         gc.collect()
     except Exception as e:
-        st.error(f"❌ 發生例外錯誤: {e}")
+        show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊")
 
 def release_resources():
     released_info = []
@@ -1185,7 +1187,7 @@ with tab1:
                             download_media(item)
                         
                 except Exception as e:
-                    st.error(f"❌ 處理 {url} 時發生錯誤: {e}")
+                    show_error_log_box(f"❌ 處理 {url} 時發生錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊")
                 
                 # 更新進度條
                 progress_bar.progress(current_num / len(urls))
@@ -1242,7 +1244,7 @@ with tab2:
                         else:
                             st.error(f"❌ 無法取得串流: {url}")
                     except Exception as e:
-                        st.error(f"❌ 發生例外錯誤: {e}")
+                        show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊")
                     
                     progress_bar.progress((i + 1) / len(urls_to_process))
                     st.divider()
