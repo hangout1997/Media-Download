@@ -1006,6 +1006,66 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
     out_dir = "/Users/ericcheng/Google Drive/我的雲端硬碟/美劇/New"
     os.makedirs(out_dir, exist_ok=True)
     
+    # 優先處置：針對 YouTube 平台線上網址提取音訊 (防止將 HTML 網頁傳給 FFmpeg 引發 Invalid data found 錯誤)
+    is_youtube = any(k in video_path for k in ["youtube.com", "youtu.be", "googlevideo.com"])
+    if is_youtube:
+        target_ext = "mp3" if audio_format == "MP3" else ("m4a" if audio_format == "M4A" else "mp3")
+        expected_out_path = os.path.join(out_dir, f"{base_name}.{target_ext}")
+        if os.path.exists(expected_out_path):
+            st.success(f"⏭️ 檔案已存在: `{expected_out_path}`")
+            return
+
+        try:
+            import yt_dlp
+            out_base = os.path.splitext(expected_out_path)[0]
+            postprocessors = []
+            if audio_format == "MP3" or audio_format == "預設 (原始格式)":
+                postprocessors.append({
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                })
+            elif audio_format == "M4A":
+                postprocessors.append({
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'm4a',
+                    'preferredquality': '192',
+                })
+
+            ydl_opts = {
+                'outtmpl': f"{out_base}.%(ext)s",
+                'quiet': True,
+                'overwrites': True,
+                'nocheckcertificate': True,
+                'legacy_server_connect': True,
+                'format': 'bestaudio/best',
+                'postprocessors': postprocessors
+            }
+            with st.spinner("⏳ 正在透過 yt-dlp 從 YouTube 提取高品質音訊..."):
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([video_path])
+            
+            # 檢查產出檔 (比對精確檔名或去除引號差檔名)
+            matched_file = None
+            if os.path.exists(expected_out_path):
+                matched_file = expected_out_path
+            else:
+                import glob
+                candidates = glob.glob(f"{out_base}.*") + glob.glob(os.path.join(out_dir, f"{base_name[:30]}*"))
+                if candidates:
+                    matched_file = candidates[0]
+
+            if matched_file:
+                st.success(f"✅ 提取完成！音訊已儲存至 Google Drive: `{os.path.basename(matched_file)}`")
+                gc.collect()
+                return
+            else:
+                show_error_log_box(f"❌ 提取 `{base_name}` 失敗！無法產出音訊檔。", f"Expected Output Path: {expected_out_path}", title="YouTube 音訊提取失敗", url=video_path)
+                return
+        except Exception as yt_err:
+            show_error_log_box(f"❌ YouTube 音訊提取失敗: {yt_err}", traceback.format_exc(), title="YouTube 音訊提取詳細錯誤日誌", url=video_path)
+            return
+
     ext = ""
     ffmpeg_cmd = []
     out_path = ""
@@ -1049,50 +1109,6 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
     if os.path.exists(out_path):
         st.success(f"⏭️ 檔案已存在: `{out_path}`")
         return
-
-    # 針對 YouTube 平台線上網址提取音訊 (防止將 HTML 網頁直接傳給 FFmpeg 引發 Invalid data found 錯誤)
-    is_youtube = any(k in video_path for k in ["youtube.com", "youtu.be", "googlevideo.com"])
-    if is_youtube:
-        try:
-            import yt_dlp
-            out_base = os.path.splitext(out_path)[0]
-            postprocessors = []
-            if audio_format == "MP3":
-                postprocessors.append({
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                })
-            elif audio_format == "M4A":
-                postprocessors.append({
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'm4a',
-                    'preferredquality': '192',
-                })
-
-            ydl_opts = {
-                'outtmpl': f"{out_base}.%(ext)s",
-                'quiet': True,
-                'overwrites': True,
-                'nocheckcertificate': True,
-                'legacy_server_connect': True,
-                'format': 'bestaudio/best',
-                'postprocessors': postprocessors
-            }
-            with st.spinner("⏳ 正在透過 yt-dlp 從 YouTube 提取高品質音訊..."):
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([video_path])
-            
-            if os.path.exists(out_path) or any(os.path.exists(f"{out_base}.{e}") for e in ["mp3", "m4a", "opus", "aac"]):
-                st.success(f"✅ 提取完成！音訊已儲存至 Google Drive: `{base_name}.{ext}`")
-                gc.collect()
-                return
-            else:
-                show_error_log_box(f"❌ 提取 `{base_name}` 失敗！無法產出音訊檔。", title="YouTube 音訊提取失敗", url=video_path)
-                return
-        except Exception as yt_err:
-            show_error_log_box(f"❌ YouTube 音訊提取失敗: {yt_err}", traceback.format_exc(), title="YouTube 音訊提取詳細錯誤日誌", url=video_path)
-            return
 
     try:
         total_dur = get_media_duration(video_path, headers=headers)
