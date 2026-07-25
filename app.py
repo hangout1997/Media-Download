@@ -1050,6 +1050,50 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         st.success(f"⏭️ 檔案已存在: `{out_path}`")
         return
 
+    # 針對 YouTube 平台線上網址提取音訊 (防止將 HTML 網頁直接傳給 FFmpeg 引發 Invalid data found 錯誤)
+    is_youtube = any(k in video_path for k in ["youtube.com", "youtu.be", "googlevideo.com"])
+    if is_youtube:
+        try:
+            import yt_dlp
+            out_base = os.path.splitext(out_path)[0]
+            postprocessors = []
+            if audio_format == "MP3":
+                postprocessors.append({
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                })
+            elif audio_format == "M4A":
+                postprocessors.append({
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'm4a',
+                    'preferredquality': '192',
+                })
+
+            ydl_opts = {
+                'outtmpl': f"{out_base}.%(ext)s",
+                'quiet': True,
+                'overwrites': True,
+                'nocheckcertificate': True,
+                'legacy_server_connect': True,
+                'format': 'bestaudio/best',
+                'postprocessors': postprocessors
+            }
+            with st.spinner("⏳ 正在透過 yt-dlp 從 YouTube 提取高品質音訊..."):
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([video_path])
+            
+            if os.path.exists(out_path) or any(os.path.exists(f"{out_base}.{e}") for e in ["mp3", "m4a", "opus", "aac"]):
+                st.success(f"✅ 提取完成！音訊已儲存至 Google Drive: `{base_name}.{ext}`")
+                gc.collect()
+                return
+            else:
+                show_error_log_box(f"❌ 提取 `{base_name}` 失敗！無法產出音訊檔。", title="YouTube 音訊提取失敗", url=video_path)
+                return
+        except Exception as yt_err:
+            show_error_log_box(f"❌ YouTube 音訊提取失敗: {yt_err}", traceback.format_exc(), title="YouTube 音訊提取詳細錯誤日誌", url=video_path)
+            return
+
     try:
         total_dur = get_media_duration(video_path, headers=headers)
         returncode, stderr_log = run_ffmpeg_with_progress(
