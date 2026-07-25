@@ -928,7 +928,6 @@ def download_media(media_item, force_audio=False):
         
         # 立即手動釋放大型 bytes 快取並進行 GC
         del stdout_data
-        import gc
         gc.collect()
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
@@ -1008,7 +1007,6 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         
         # 立即手動釋放大 bytes 快取並進行 GC
         del stdout_data
-        import gc
         gc.collect()
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
