@@ -457,11 +457,17 @@ def get_media_items(url):
                         # 判斷是否為圖片 (有些平台會回傳 thumbnail 作為 entry)
                         is_image = ext in ['jpg', 'jpeg', 'png', 'webp'] or entry.get('protocol') == 'https' and '.jpg' in media_url
                         
+                        # 取得 http_headers (包含 User-Agent 等) 以避免 FFmpeg 連線 403 Forbidden
+                        http_headers = entry.get('http_headers') or info.get('http_headers') or {}
+                        webpage_url = entry.get('webpage_url') or info.get('webpage_url') or url
+
                         items.append({
                             'url': media_url,
                             'title': title if len(entries) == 1 else f"{title}_{i+1}",
                             'ext': ext or ('jpg' if is_image else 'mp4'),
-                            'type': 'image' if is_image else 'video'
+                            'type': 'image' if is_image else 'video',
+                            'headers': http_headers,
+                            'webpage_url': webpage_url
                         })
             except Exception as e:
                 err_msg = str(e)
@@ -933,12 +939,36 @@ def download_media(media_item, force_audio=False):
             ffmpeg_cmd, total_duration=total_dur, label=label_text
         )
 
-        if returncode == 0:
+        if returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             st.success(f"✅ 下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
         else:
-            st.error("❌ FFmpeg 下載失敗！")
-            with st.expander("檢視詳細錯誤日誌"):
-                st.text(stderr_log)
+            webpage_url = media_item.get('webpage_url')
+            if webpage_url or "googlevideo.com" in media_url or "403 Forbidden" in stderr_log:
+                st.warning("⚠️ FFmpeg 存取受限 (403)，自動啟動 yt-dlp 穩健下載引擎...")
+                target_url = webpage_url or media_url
+                import yt_dlp
+                out_base = os.path.splitext(out_path)[0]
+                ydl_opts = {
+                    'outtmpl': f"{out_base}.%(ext)s",
+                    'quiet': True,
+                    'overwrites': True,
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                }
+                with st.spinner("⏳ 正在透過 yt-dlp 下載中..."):
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([target_url])
+                
+                # 檢查是否有產出對應檔案
+                if os.path.exists(out_path) or any(os.path.exists(f"{out_base}.{e}") for e in ["mp4", "mkv", "webm"]):
+                    st.success(f"✅ 下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
+                else:
+                    st.error("❌ 下載失敗！")
+                    with st.expander("檢視詳細錯誤日誌"):
+                        st.text(stderr_log)
+            else:
+                st.error("❌ FFmpeg 下載失敗！")
+                with st.expander("檢視詳細錯誤日誌"):
+                    st.text(stderr_log)
         
         gc.collect()
     except Exception as e:
