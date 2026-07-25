@@ -431,7 +431,7 @@ def get_media_items(url):
         ydl_opts = {
             'quiet': True,
             'extract_flat': False,
-            'format': 'best',
+            'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
         }
         if temp_cookie_path:
             ydl_opts['cookiefile'] = temp_cookie_path
@@ -905,6 +905,33 @@ def download_media(media_item, force_audio=False):
                 return
             except Exception as hls_err:
                 st.warning(f"⚠️ 多線程下載失敗 ({hls_err})，降級使用標準 FFmpeg 串流處理...")
+
+        # 針對 YouTube 平台預設鎖定 1080p 高清畫質與音訊自動無損合併
+        webpage_url = media_item.get('webpage_url', '')
+        is_youtube = any(k in media_url or k in webpage_url for k in ["youtube.com", "youtu.be", "googlevideo.com"])
+
+        if is_youtube and not force_audio:
+            try:
+                target_url = webpage_url or media_url
+                import yt_dlp
+                out_base = os.path.splitext(out_path)[0]
+                ydl_opts = {
+                    'outtmpl': f"{out_base}.%(ext)s",
+                    'quiet': True,
+                    'overwrites': True,
+                    'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+                    'merge_output_format': 'mp4',
+                }
+                with st.spinner("⏳ 正在下載 YouTube 1080p 高清影片..."):
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([target_url])
+                
+                if os.path.exists(out_path) or any(os.path.exists(f"{out_base}.{e}") for e in ["mp4", "mkv", "webm"]):
+                    st.success(f"✅ 下載完成！1080p 影片已寫入 Google Drive: `{title}.{ext}`")
+                    gc.collect()
+                    return
+            except Exception as yt_err:
+                st.warning(f"⚠️ YouTube 1080p 下載嘗試失敗 ({yt_err})，降級使用標準串流處理...")
 
         # Determine if we need to add custom headers (like Referer for MissAV)
         headers_arg = []
