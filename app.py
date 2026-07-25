@@ -823,7 +823,6 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     progress_bar.empty()
     status_text.empty()
-    return True
 
 def download_media(media_item, force_audio=False):
     title = media_item['title']
