@@ -660,7 +660,7 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     stderr_log = "\n".join(stderr_lines)
     return process.returncode, bytes(stdout_bytes), stderr_log
 
-def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=5, label="影片"):
+def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_workers=16, label="影片"):
     import urllib.parse
     import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -864,11 +864,12 @@ def download_media(media_item, force_audio=False):
         # 優先嘗試 16 線程平行極速 HLS 下載
         if "m3u8" in media_url and not force_audio:
             try:
-                mp4_bytes = download_fast_parallel_hls(media_url, extra_headers=extra_headers, max_workers=5, label="影片")
-                with open(out_path, "wb") as f:
-                    f.write(mp4_bytes)
-                st.success(f"✅ 極速下載完成！檔案已從 RAM 一次性寫入 Google Drive: `{title}.{ext}`")
-                del mp4_bytes
+                mp4_bytes = download_fast_parallel_hls(media_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
+                if mp4_bytes:
+                    with open(out_path, "wb") as f:
+                        f.write(mp4_bytes)
+                    del mp4_bytes
+                st.success(f"✅ 極速下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
                 gc.collect()
                 return
             except Exception as hls_err:
