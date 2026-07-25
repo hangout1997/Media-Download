@@ -593,6 +593,27 @@ def get_media_duration(media_url, headers=None):
                     return sum(float(x) for x in extinfs)
         except Exception:
             pass
+    
+    # 支援本地影片檔案與非 m3u8 串流，使用 ffprobe 獲取精準媒體總時長
+    try:
+        headers_arg = []
+        if headers:
+            headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+            headers_arg = ["-headers", headers_str]
+            if "m3u8" in media_url:
+                headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+        
+        probe_cmd = ["ffprobe", "-v", "error"] + headers_arg + [
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            media_url
+        ]
+        out = subprocess.check_output(probe_cmd, text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+        dur = float(out)
+        if dur > 0:
+            return dur
+    except Exception:
+        pass
     return 0.0
 
 def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
