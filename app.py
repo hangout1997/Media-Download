@@ -739,19 +739,21 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     def download_segment(args):
         idx, seg_url = args
         for attempt in range(3):
+            wait = 0.5 * (2 ** attempt)  # exponential backoff: 0.5s, 1s, 2s
             try:
-                r = session.get(seg_url, headers=req_headers, timeout=45)
+                r = session.get(seg_url, headers=req_headers, timeout=15)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
             except Exception:
                 pass
             try:
-                r = get_curl_session().get(seg_url, headers=req_headers, timeout=45)
+                r = get_curl_session().get(seg_url, headers=req_headers, timeout=15)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
             except Exception:
                 pass
-            time.sleep(0.05)
+            if attempt < 2:
+                time.sleep(wait)
         return idx, b""
 
     t0 = time.time()
@@ -862,11 +864,7 @@ def download_media(media_item, force_audio=False):
         # 優先嘗試 16 線程平行極速 HLS 下載
         if "m3u8" in media_url and not force_audio:
             try:
-                mp4_bytes = download_fast_parallel_hls(media_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
-                if mp4_bytes:
-                    with open(out_path, "wb") as f:
-                        f.write(mp4_bytes)
-                    del mp4_bytes
+                download_fast_parallel_hls(media_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
                 st.success(f"✅ 極速下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
                 gc.collect()
                 return
@@ -935,8 +933,8 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
     os.makedirs(out_dir, exist_ok=True)
     
     ext = ""
-    fmt = ""
     ffmpeg_cmd = []
+    out_path = ""
     
     headers_arg = []
     if headers:
@@ -964,7 +962,10 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
             else:
                 ext = "m4a"
             out_path = os.path.join(out_dir, f"{base_name}.{ext}")
-            ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "copy" if codec in ["aac", "mp3", "opus"] else "aac", "-b:a", "192k", out_path]
+            if codec in ["aac", "mp3", "opus"]:
+                ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "copy", out_path]
+            else:
+                ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", out_path]
         except Exception:
             st.warning(f"⚠️ `{base_name}` 無法解析原始音訊格式，將預設轉換為 MP3。")
             ext = "mp3"
