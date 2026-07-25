@@ -589,12 +589,18 @@ def format_time(seconds):
         return f"{h:02d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
-def show_error_log_box(error_msg, log_text=None, title="詳細錯誤日誌"):
+def show_error_log_box(error_msg, log_text=None, title="詳細錯誤日誌", url=None):
     st.error(error_msg)
-    if log_text and str(log_text).strip():
+    if log_text or url:
+        full_log = ""
+        if url:
+            full_log += f"🔗 相關網址 (Target URL):\n{url}\n\n"
+        if log_text:
+            full_log += str(log_text).strip()
+            
         with st.expander(f"📋 {title} (點擊開啟一鍵複製)", expanded=True):
-            st.caption("💡 請點擊下方框框右上角的 **「📋 複製 (Copy)」** 按鈕，即可快速複製完整日誌提供給 AI：")
-            st.code(str(log_text).strip(), language="log")
+            st.caption("💡 點擊下方框框右上角的 **「📋 複製 (Copy)」** 按鈕，即可快速複製完整日誌（包含目標網址）提供給 AI：")
+            st.code(full_log.strip(), language="log")
 
 def get_media_duration(media_url, headers=None):
     if "m3u8" in media_url:
@@ -913,8 +919,8 @@ def download_media(media_item, force_audio=False):
         is_youtube = any(k in media_url or k in webpage_url for k in ["youtube.com", "youtu.be", "googlevideo.com"])
 
         if is_youtube and not force_audio:
+            target_url = webpage_url or media_url
             try:
-                target_url = webpage_url or media_url
                 import yt_dlp
                 out_base = os.path.splitext(out_path)[0]
                 ydl_opts = {
@@ -934,8 +940,12 @@ def download_media(media_item, force_audio=False):
                     st.success(f"✅ 下載完成！1080p 影片已寫入 Google Drive: `{title}.{ext}`")
                     gc.collect()
                     return
+                else:
+                    show_error_log_box("❌ 下載失敗！無法產生影片檔案。", f"Target Output Path: {out_path}", title="YouTube 下載失敗", url=target_url)
+                    return
             except Exception as yt_err:
-                st.warning(f"⚠️ YouTube 1080p 下載嘗試失敗 ({yt_err})，降級使用標準串流處理...")
+                show_error_log_box(f"❌ YouTube 下載失敗: {yt_err}", traceback.format_exc(), title="YouTube 下載詳細錯誤日誌", url=target_url)
+                return
 
         # Determine if we need to add custom headers (like Referer for MissAV)
         headers_arg = []
@@ -981,36 +991,11 @@ def download_media(media_item, force_audio=False):
         if returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             st.success(f"✅ 下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
         else:
-            webpage_url = media_item.get('webpage_url')
-            if webpage_url or "googlevideo.com" in media_url or "403 Forbidden" in stderr_log:
-                st.warning("⚠️ FFmpeg 存取受限 (403)，自動啟動 yt-dlp 穩健下載引擎...")
-                target_url = webpage_url or media_url
-                import yt_dlp
-                out_base = os.path.splitext(out_path)[0]
-                ydl_opts = {
-                    'outtmpl': f"{out_base}.%(ext)s",
-                    'quiet': True,
-                    'overwrites': True,
-                    'nocheckcertificate': True,
-                    'legacy_server_connect': True,
-                    'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
-                    'merge_output_format': 'mp4',
-                }
-                with st.spinner("⏳ 正在透過 yt-dlp 下載中..."):
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([target_url])
-                
-                # 檢查是否有產出對應檔案
-                if os.path.exists(out_path) or any(os.path.exists(f"{out_base}.{e}") for e in ["mp4", "mkv", "webm"]):
-                    st.success(f"✅ 下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
-                else:
-                    show_error_log_box("❌ 下載失敗！", stderr_log)
-            else:
-                show_error_log_box("❌ FFmpeg 下載失敗！", stderr_log)
+            show_error_log_box("❌ FFmpeg 下載失敗！", stderr_log, url=media_url)
         
         gc.collect()
     except Exception as e:
-        show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊")
+        show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=media_url)
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
 
 def extract_local_audio(video_path, audio_format, title=None, headers=None):
@@ -1221,7 +1206,7 @@ with tab1:
                             download_media(item)
                         
                 except Exception as e:
-                    show_error_log_box(f"❌ 處理 {url} 時發生錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊")
+                    show_error_log_box(f"❌ 處理 {url} 時發生錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=url)
                 
                 # 更新進度條
                 progress_bar.progress(current_num / len(urls))
