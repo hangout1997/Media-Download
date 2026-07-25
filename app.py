@@ -608,7 +608,7 @@ def get_media_duration(media_url, headers=None):
             "-of", "default=noprint_wrappers=1:nokey=1",
             media_url
         ]
-        out = subprocess.check_output(probe_cmd, text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+        out = subprocess.check_output(probe_cmd, text=True, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).strip()
         dur = float(out)
         if dur > 0:
             return dur
@@ -624,6 +624,7 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     
     process = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE
     )
@@ -975,7 +976,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
     else:
         try:
             probe_cmd = ["ffprobe", "-v", "error"] + headers_arg + ["-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
-            codec = subprocess.check_output(probe_cmd, text=True).strip()
+            codec = subprocess.check_output(probe_cmd, text=True, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).strip()
             
             if codec in ["aac", "mp3", "opus"]:
                 ext = codec
