@@ -660,8 +660,9 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     stderr_log = "\n".join(stderr_lines)
     return process.returncode, bytes(stdout_bytes), stderr_log
 
-def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=20, label="影片"):
+def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=5, label="影片"):
     import urllib.parse
+    import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from curl_cffi import requests as curl_requests
 
@@ -679,15 +680,25 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=20, lab
     session.mount('https://', adapter)
     session.mount('http://', adapter)
 
+    # 部分反爬 CDN 對「新連線」會先重度限速，同一條連線持續使用一段時間後才會提速。
+    # 因此每個 worker thread 維持一條專屬的長連線 (thread-local Session) 重複使用，
+    # 而不是每個請求都重新建立連線，藉此讓連線有機會「暖身」提速。
+    thread_local = threading.local()
+
+    def get_curl_session():
+        if not hasattr(thread_local, "curl_session"):
+            thread_local.curl_session = curl_requests.Session(impersonate="chrome124")
+        return thread_local.curl_session
+
     def fetch_text(url):
         try:
-            r = session.get(url, headers=req_headers, timeout=10)
+            r = session.get(url, headers=req_headers, timeout=30)
             if r.status_code == 200:
                 return r.text
         except Exception:
             pass
         try:
-            r = curl_requests.get(url, headers=req_headers, impersonate="chrome124", timeout=10)
+            r = get_curl_session().get(url, headers=req_headers, timeout=30)
             if r.status_code == 200:
                 return r.text
         except Exception:
@@ -712,6 +723,16 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=20, lab
             m3u8_url = sub_playlists[0][1]
             text = fetch_text(m3u8_url)
 
+    segment_urls = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            segment_urls.append(urllib.parse.urljoin(m3u8_url, line))
+
+    total_segments = len(segment_urls)
+    if total_segments == 0:
+        raise ValueError("m3u8 播放列表中找不到任何影片切片 (segments)。")
+
     extinfs = [float(x) for x in re.findall(r'#EXTINF:([\d\.]+)', text)]
     if len(extinfs) == total_segments:
         segment_durations = extinfs
@@ -729,13 +750,13 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=20, lab
         idx, seg_url = args
         for attempt in range(3):
             try:
-                r = session.get(seg_url, headers=req_headers, timeout=10)
+                r = session.get(seg_url, headers=req_headers, timeout=45)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
             except Exception:
                 pass
             try:
-                r = curl_requests.get(seg_url, headers=req_headers, impersonate="chrome124", timeout=10)
+                r = get_curl_session().get(seg_url, headers=req_headers, timeout=45)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
             except Exception:
@@ -764,14 +785,16 @@ def download_fast_parallel_hls(m3u8_url, extra_headers=None, max_workers=20, lab
                 last_update_time = now
                 elapsed = max(0.1, now - t0)
                 speed_x = completed_duration / elapsed
+                mb_downloaded = total_downloaded_bytes / 1024 / 1024
+                speed_mb = mb_downloaded / elapsed
                 if total_duration > 0:
                     pct = min(1.0, max(0.0, completed_duration / total_duration))
                     pct_num = pct * 100
-                    status_text.markdown(f"⏳ **{label}進度**: `{pct_num:.1f}%` ({format_time(completed_duration)} / {format_time(total_duration)}) | 速度: `{speed_x:.2f}x`")
+                    status_text.markdown(f"⏳ **{label}進度**: `{pct_num:.1f}%` ({format_time(completed_duration)} / {format_time(total_duration)}) | 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)")
                 else:
                     pct = completed / total_segments
                     pct_num = pct * 100
-                    status_text.markdown(f"⏳ **{label}處理中...** 已完成切片 `{completed}/{total_segments}` | 速度: `{speed_x:.2f}x`")
+                    status_text.markdown(f"⏳ **{label}處理中...** 已完成切片 `{completed}/{total_segments}` (`{mb_downloaded:.1f} MB`) | 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)")
                 progress_bar.progress(pct)
 
     status_text.markdown("⚡ **多線程切片下載完成，正在記憶體中無損封裝為 MP4...**")
@@ -841,7 +864,7 @@ def download_media(media_item, force_audio=False):
         # 優先嘗試 16 線程平行極速 HLS 下載
         if "m3u8" in media_url and not force_audio:
             try:
-                mp4_bytes = download_fast_parallel_hls(media_url, extra_headers=extra_headers, max_workers=16, label="影片")
+                mp4_bytes = download_fast_parallel_hls(media_url, extra_headers=extra_headers, max_workers=5, label="影片")
                 with open(out_path, "wb") as f:
                     f.write(mp4_bytes)
                 st.success(f"✅ 極速下載完成！檔案已從 RAM 一次性寫入 Google Drive: `{title}.{ext}`")
