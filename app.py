@@ -603,18 +603,9 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     
     process = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE
     )
-
-    stdout_bytes = bytearray()
-
-    def read_stdout():
-        nonlocal stdout_bytes
-        stdout_bytes = process.stdout.read()
-
-    t_out = threading.Thread(target=read_stdout)
-    t_out.start()
 
     current_sec = 0.0
     speed = "1.0x"
@@ -649,7 +640,6 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
             else:
                 status_text.markdown(f"⏳ **{label}處理中...** 已完成 `{format_time(current_sec)}` | 速度: `{speed}`")
 
-    t_out.join()
     process.wait()
 
     if total_duration > 0:
@@ -658,7 +648,7 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     progress_bar.empty()
 
     stderr_log = "\n".join(stderr_lines)
-    return process.returncode, bytes(stdout_bytes), stderr_log
+    return process.returncode, stderr_log
 
 def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_workers=16, label="影片"):
     import urllib.parse
@@ -797,33 +787,41 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                     status_text.markdown(f"⏳ **{label}處理中...** 已完成切片 `{completed}/{total_segments}` (`{mb_downloaded:.1f} MB`) | 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)")
                 progress_bar.progress(pct)
 
-    status_text.markdown("⚡ **多線程切片下載完成，正在記憶體中無損封裝為 MP4...**")
+    status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
     
-    full_raw_stream = b"".join(segments_data)
+    # 寫入暫存檔以進行低記憶體消耗封裝
+    with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as tmp_ts:
+        tmp_ts_path = tmp_ts.name
+        for chunk in segments_data:
+            if chunk:
+                tmp_ts.write(chunk)
+    
     del segments_data
     gc.collect()
 
-    ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-i", "pipe:0",
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-f", "mp4",
-        "-movflags", "frag_keyframe+empty_moov",
-        "pipe:1"
-    ]
-    
-    proc = subprocess.run(ffmpeg_cmd, input=full_raw_stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    del full_raw_stream
-    gc.collect()
+    try:
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-i", tmp_ts_path,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            "-movflags", "+faststart",
+            out_path
+        ]
+        
+        proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            raise ValueError(f"FFmpeg 無損封裝失敗: {proc.stderr.decode('utf-8', errors='ignore')}")
+    finally:
+        if os.path.exists(tmp_ts_path):
+            try:
+                os.remove(tmp_ts_path)
+            except Exception:
+                pass
 
     progress_bar.empty()
     status_text.empty()
-
-    if proc.returncode != 0:
-        raise ValueError(f"FFmpeg 無損封裝失敗: {proc.stderr.decode('utf-8', errors='ignore')}")
-
-    return proc.stdout
+    return True
 
 def download_media(media_item, force_audio=False):
     title = media_item['title']
@@ -894,8 +892,7 @@ def download_media(media_item, force_audio=False):
                 "-vn",
                 "-c:a", "libmp3lame",
                 "-b:a", "192k",
-                "-f", "mp3",    # 指定輸出格式為 mp3
-                "pipe:1"        # 輸出到標準輸出 (stdout)
+                out_path
             ]
             label_text = "音訊轉碼"
         else:
@@ -905,30 +902,25 @@ def download_media(media_item, force_audio=False):
                 "-i", media_url,
                 "-c", "copy",
                 "-bsf:a", "aac_adtstoasc",
-                "-f", "mp4",
-                "-movflags", "frag_keyframe+empty_moov", 
-                "pipe:1"
+                "-movflags", "+faststart",
+                out_path
             ]
             label_text = "影片下載"
         
         # 先獲取媒體總時長 (用於進度百分比計算)
         total_dur = get_media_duration(media_url, headers=extra_headers)
 
-        returncode, stdout_data, stderr_log = run_ffmpeg_with_progress(
+        returncode, stderr_log = run_ffmpeg_with_progress(
             ffmpeg_cmd, total_duration=total_dur, label=label_text
         )
 
         if returncode == 0:
-            with open(out_path, "wb") as f:
-                f.write(stdout_data)
-            st.success(f"✅ 下載完成！檔案已從 RAM 一次性寫入 Google Drive: `{title}.{ext}`")
+            st.success(f"✅ 下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
         else:
             st.error("❌ FFmpeg 下載失敗！")
             with st.expander("檢視詳細錯誤日誌"):
                 st.text(stderr_log)
         
-        # 立即手動釋放大型 bytes 快取並進行 GC
-        del stdout_data
         gc.collect()
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
@@ -956,58 +948,45 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
     
     if audio_format == "MP3":
         ext = "mp3"
-        ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
+        out_path = os.path.join(out_dir, f"{base_name}.{ext}")
+        ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out_path]
     elif audio_format == "M4A":
         ext = "m4a"
-        ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
+        out_path = os.path.join(out_dir, f"{base_name}.{ext}")
+        ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", out_path]
     else:
         try:
             probe_cmd = ["ffprobe", "-v", "error"] + headers_arg + ["-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
             codec = subprocess.check_output(probe_cmd, text=True).strip()
             
-            if codec == "aac":
-                ext = "aac"
-                fmt = "adts"
-            elif codec == "mp3":
-                ext = "mp3"
-                fmt = "mp3"
-            elif codec == "opus":
-                ext = "opus"
-                fmt = "opus"
+            if codec in ["aac", "mp3", "opus"]:
+                ext = codec
             else:
                 ext = "m4a"
-                ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", "pipe:1"]
-                codec = "unknown"
-                
-            if codec != "unknown":
-                ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "copy", "-f", fmt, "pipe:1"]
-        except Exception as e:
+            out_path = os.path.join(out_dir, f"{base_name}.{ext}")
+            ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "copy" if codec in ["aac", "mp3", "opus"] else "aac", "-b:a", "192k", out_path]
+        except Exception:
             st.warning(f"⚠️ `{base_name}` 無法解析原始音訊格式，將預設轉換為 MP3。")
             ext = "mp3"
-            ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
+            out_path = os.path.join(out_dir, f"{base_name}.{ext}")
+            ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out_path]
 
-    out_path = os.path.join(out_dir, f"{base_name}.{ext}")
-    
     if os.path.exists(out_path):
         st.success(f"⏭️ 檔案已存在: `{out_path}`")
         return
-        
+
     try:
         total_dur = get_media_duration(video_path, headers=headers)
-        returncode, stdout_data, stderr_log = run_ffmpeg_with_progress(
+        returncode, stderr_log = run_ffmpeg_with_progress(
             ffmpeg_cmd, total_duration=total_dur, label="音訊提取"
         )
         if returncode == 0:
-            with open(out_path, "wb") as f:
-                f.write(stdout_data)
             st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
         else:
             st.error(f"❌ 提取 `{base_name}` 失敗！")
             with st.expander("錯誤日誌"):
                 st.text(stderr_log)
         
-        # 立即手動釋放大 bytes 快取並進行 GC
-        del stdout_data
         gc.collect()
     except Exception as e:
         st.error(f"❌ 發生例外錯誤: {e}")
