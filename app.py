@@ -431,6 +431,8 @@ def get_media_items(url):
         ydl_opts = {
             'quiet': True,
             'extract_flat': False,
+            'nocheckcertificate': True,
+            'legacy_server_connect': True,
             'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
         }
         if temp_cookie_path:
@@ -448,9 +450,9 @@ def get_media_items(url):
                         title = entry.get('title') or info.get('title') or f"media_{i}"
                         title = re.sub(r'[\\/:*?"<>|]', '_', title)
                         
-                        # 取得副檔名與媒體類型
+                        # 取得副檔名與媒體類型 (DASH 1080p 格式下 entry.get('url') 可能為 None，需 fallback 至網頁網址)
                         ext = entry.get('ext')
-                        media_url = entry.get('url')
+                        media_url = entry.get('url') or entry.get('webpage_url') or entry.get('original_url') or url
                         
                         if not media_url:
                             continue
@@ -919,6 +921,8 @@ def download_media(media_item, force_audio=False):
                     'outtmpl': f"{out_base}.%(ext)s",
                     'quiet': True,
                     'overwrites': True,
+                    'nocheckcertificate': True,
+                    'legacy_server_connect': True,
                     'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
                     'merge_output_format': 'mp4',
                 }
@@ -987,7 +991,10 @@ def download_media(media_item, force_audio=False):
                     'outtmpl': f"{out_base}.%(ext)s",
                     'quiet': True,
                     'overwrites': True,
-                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'nocheckcertificate': True,
+                    'legacy_server_connect': True,
+                    'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+                    'merge_output_format': 'mp4',
                 }
                 with st.spinner("⏳ 正在透過 yt-dlp 下載中..."):
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1239,6 +1246,8 @@ with tab2:
             ydl_opts = {
                 'quiet': True,
                 'extract_flat': 'in_playlist',
+                'nocheckcertificate': True,
+                'legacy_server_connect': True,
             }
             
             try:
