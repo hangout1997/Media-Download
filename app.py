@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import gc
 import traceback
+import urllib.parse
 import streamlit as st
 
 def create_temp_cookiefile(fb_cookie_str):
@@ -600,7 +601,7 @@ def get_media_items(url):
     title = re.sub(r'[\\/:*?"<>|]', '_', title)
     
     items = [{
-        'url': m3u8_url,
+        'url': urllib.parse.urljoin(url, m3u8_url) if m3u8_url else m3u8_url,
         'title': title,
         'ext': 'mp4',
         'type': 'video',
