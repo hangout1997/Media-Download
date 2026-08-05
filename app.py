@@ -416,8 +416,9 @@ def get_media_items(url):
             # 錯誤時紀錄日誌，並降級使用原有的 yt-dlp 解析
             print(f"Facebook custom photo scrape failed: {e}, falling back to yt-dlp...")
 
-    # 支援各大平台 (YouTube, X, Facebook, Instagram, TikTok 等)
-    if any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "tiktok.com"]):
+    # 支援各大平台 (YouTube, X, Facebook, Instagram, TikTok 等與通用線上網址)
+    is_missav_or_gimy = any(k in url.lower() for k in ["missav", "gimymax", "gimyplus", "gimy"])
+    if not is_missav_or_gimy or any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "tiktok.com"]):
         # yt-dlp 的 threads extractor 綁定 threads.net，若是 .com 則先替換
         url = url.replace("threads.com", "threads.net")
         
@@ -447,22 +448,30 @@ def get_media_items(url):
                     entries = info.get('entries', [info])
                     
                     for i, entry in enumerate(entries):
+                        if not entry:
+                            continue
                         title = entry.get('title') or info.get('title') or f"media_{i}"
                         title = re.sub(r'[\\/:*?"<>|]', '_', title)
                         
-                        # 取得副檔名與媒體類型 (DASH 1080p 格式下 entry.get('url') 可能為 None，需 fallback 至網頁網址)
                         ext = entry.get('ext')
-                        media_url = entry.get('url') or entry.get('webpage_url') or entry.get('original_url') or url
+                        raw_url = entry.get('url')
+                        webpage_url = entry.get('webpage_url') or info.get('webpage_url') or url
                         
-                        if not media_url:
+                        # 嚴格驗證媒體網址：必須為 HTTP/HTTPS 協議，防止將 ID 或相對路徑傳給 FFmpeg
+                        if raw_url and (raw_url.startswith('http://') or raw_url.startswith('https://')):
+                            media_url = raw_url
+                        elif webpage_url and (webpage_url.startswith('http://') or webpage_url.startswith('https://')):
+                            media_url = webpage_url
+                        elif url.startswith('http://') or url.startswith('https://'):
+                            media_url = url
+                        else:
                             continue
                         
                         # 判斷是否為圖片 (有些平台會回傳 thumbnail 作為 entry)
-                        is_image = ext in ['jpg', 'jpeg', 'png', 'webp'] or entry.get('protocol') == 'https' and '.jpg' in media_url
+                        is_image = ext in ['jpg', 'jpeg', 'png', 'webp'] or (isinstance(media_url, str) and '.jpg' in media_url)
                         
                         # 取得 http_headers (包含 User-Agent 等) 以避免 FFmpeg 連線 403 Forbidden
                         http_headers = entry.get('http_headers') or info.get('http_headers') or {}
-                        webpage_url = entry.get('webpage_url') or info.get('webpage_url') or url
 
                         items.append({
                             'url': media_url,
@@ -477,14 +486,18 @@ def get_media_items(url):
                 if any(kw in err_msg for kw in ["No video formats found", "Unsupported URL", "Cannot parse data", "Private video", "login"]):
                     if "facebook.com" in url or "fb.com" in url or "fb.watch" in url:
                         raise ValueError("此 Facebook 連結可能為「純相片貼文」、「非影片內容」或「私密/限制級內容」。\n\n💡 **下載建議**：請確認您已在下方填入有效的 **Facebook Cookie**。私密社團、好友限閱、相片貼文或部分特定影片必須有 Cookie 授權才能進行下載。")
-                raise e
+                if is_missav_or_gimy:
+                    pass
+                else:
+                    raise e
         finally:
             try:
                 if temp_cookie_path and os.path.exists(temp_cookie_path):
                     os.remove(temp_cookie_path)
             except Exception:
                 pass
-        return items
+        if items:
+            return items
             
     # 原有的 Gimymax 網頁解析邏輯
     headers = {
@@ -947,6 +960,18 @@ def download_media(media_item, force_audio=False):
                 show_error_log_box(f"❌ YouTube 下載失敗: {yt_err}", traceback.format_exc(), title="YouTube 下載詳細錯誤日誌", url=target_url)
                 return
 
+        # 驗證 media_url 是否為合法的 HTTP/HTTPS 網址或本機檔案
+        is_valid_url = isinstance(media_url, str) and (media_url.startswith("http://") or media_url.startswith("https://"))
+        is_valid_file = isinstance(media_url, str) and os.path.exists(media_url)
+
+        if not is_valid_url and not is_valid_file:
+            show_error_log_box(
+                "❌ 無法開始下載！媒體網址或檔案路徑無效。",
+                f"錯誤傳入的 Input: '{media_url}'\n說明: 該輸入非有效的 HTTP/HTTPS 網址，且本機找不到此檔案。請確認輸入的網址格式（需包含 http:// 或 https://）或本機檔案是否存在。",
+                url=media_url
+            )
+            return
+
         # Determine if we need to add custom headers (like Referer for MissAV)
         headers_arg = []
         if extra_headers:
@@ -1006,9 +1031,21 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
     out_dir = "/Users/ericcheng/Google Drive/我的雲端硬碟/美劇/New"
     os.makedirs(out_dir, exist_ok=True)
     
-    # 優先處置：針對 YouTube 平台線上網址提取音訊 (防止將 HTML 網頁傳給 FFmpeg 引發 Invalid data found 錯誤)
-    is_youtube = any(k in video_path for k in ["youtube.com", "youtu.be", "googlevideo.com"])
-    if is_youtube:
+    # 驗證 video_path 是否為合法網址或本機檔案
+    is_valid_url = isinstance(video_path, str) and (video_path.startswith("http://") or video_path.startswith("https://"))
+    is_valid_file = isinstance(video_path, str) and os.path.exists(video_path)
+
+    if not is_valid_url and not is_valid_file:
+        show_error_log_box(
+            f"❌ 無法提取音訊！檔案或網址格式無效",
+            f"傳入的路徑或網址: '{video_path}'\n說明: 該輸入非有效的 HTTP/HTTPS 網址，且本機找不到此檔案。請確認網址是否包含 http:// 或 https://，或確認本地檔案路徑正確。",
+            url=video_path
+        )
+        return
+
+    # 優先處置：針對線上網址 (YouTube 或其他線上影音平台) 使用 yt-dlp 提取音訊 (防止將 HTML 網頁傳給 FFmpeg 引發 Invalid data found 錯誤)
+    is_youtube_or_online = is_valid_url and ("m3u8" not in video_path.lower())
+    if is_youtube_or_online:
         target_ext = "mp3" if audio_format == "MP3" else ("m4a" if audio_format == "M4A" else "mp3")
         expected_out_path = os.path.join(out_dir, f"{base_name}.{target_ext}")
         if os.path.exists(expected_out_path):
@@ -1041,7 +1078,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 'format': 'bestaudio/best',
                 'postprocessors': postprocessors
             }
-            with st.spinner("⏳ 正在透過 yt-dlp 從 YouTube 提取高品質音訊..."):
+            with st.spinner("⏳ 正在透過 yt-dlp 從線上網址提取高品質音訊..."):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([video_path])
             
@@ -1060,10 +1097,10 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 gc.collect()
                 return
             else:
-                show_error_log_box(f"❌ 提取 `{base_name}` 失敗！無法產出音訊檔。", f"Expected Output Path: {expected_out_path}", title="YouTube 音訊提取失敗", url=video_path)
+                show_error_log_box(f"❌ 提取 `{base_name}` 失敗！無法產出音訊檔。", f"Expected Output Path: {expected_out_path}", title="線上網址音訊提取失敗", url=video_path)
                 return
         except Exception as yt_err:
-            show_error_log_box(f"❌ YouTube 音訊提取失敗: {yt_err}", traceback.format_exc(), title="YouTube 音訊提取詳細錯誤日誌", url=video_path)
+            show_error_log_box(f"❌ 線上網址音訊提取失敗: {yt_err}", traceback.format_exc(), title="線上網址音訊提取詳細錯誤日誌", url=video_path)
             return
 
     ext = ""
@@ -1301,7 +1338,14 @@ with tab2:
                         info = ydl.extract_info(input_path, download=False)
                         if 'entries' in info:
                             for entry in info['entries']:
-                                urls_to_process.append(entry.get('url'))
+                                if not entry:
+                                    continue
+                                u = entry.get('webpage_url') or entry.get('url') or entry.get('original_url')
+                                if u and not u.startswith(('http://', 'https://')):
+                                    if entry.get('id'):
+                                        u = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                                if u:
+                                    urls_to_process.append(u)
                         else:
                             urls_to_process.append(input_path)
             except Exception as e:
@@ -1321,7 +1365,8 @@ with tab2:
                             
                         if media_items:
                             for item in media_items:
-                                extract_local_audio(item['url'], audio_format, title=item['title'], headers=item.get('headers'))
+                                target_media = item['url'] if (item['url'].startswith('http://') or item['url'].startswith('https://')) else item.get('webpage_url', item['url'])
+                                extract_local_audio(target_media, audio_format, title=item['title'], headers=item.get('headers'))
                         else:
                             st.error(f"❌ 無法取得串流: {url}")
                     except Exception as e:
