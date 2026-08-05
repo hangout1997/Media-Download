@@ -137,6 +137,37 @@ def normalize_input_url(url_str):
         return f"https://missav.ai/{url_str}"
     return "https://" + url_str
 
+def resolve_gimy_stream(player_url, page_url=''):
+    if not player_url:
+        return ''
+    if player_url.startswith('http://') or player_url.startswith('https://'):
+        return player_url
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': 'https://play.gimy.bot/jd/'
+    }
+    
+    # 解析 Gimymax / Gimyplus 的 play.gimy.bot 串流 API
+    if player_url.startswith('JD-') or player_url.startswith('JDQM-') or player_url.startswith('JDHG-'):
+        api_url = f'https://play.gimy.bot/jd/api.php?url={player_url}'
+    elif player_url.startswith('NS4K-') or player_url.startswith('NSYS-'):
+        api_url = f'https://play.gimy.bot/ns/api.php?url={player_url}'
+    elif player_url.startswith('qsvip-'):
+        api_url = f'https://play.gimy.bot/qsvip/api.php?url={player_url}'
+    else:
+        api_url = f'https://play.gimy.bot/a/api.php?url={player_url}'
+        
+    try:
+        r = requests.get(api_url, headers=headers, timeout=10)
+        data = r.json()
+        if data.get('code') == 200 and data.get('url'):
+            return data.get('url')
+    except Exception:
+        pass
+        
+    return urllib.parse.urljoin(page_url, player_url)
+
 def get_media_items(url):
     url = normalize_input_url(url)
     items = []
@@ -249,7 +280,6 @@ def get_media_items(url):
     # Facebook 貼文特殊圖片下載邏輯
     if any(domain in url for domain in ["facebook.com", "fb.com", "fb.watch"]):
         try:
-            import urllib.parse
             import html as html_lib
             
             # 讀取 Streamlit Session State 中的 Facebook Cookie
@@ -522,8 +552,6 @@ def get_media_items(url):
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/122.0.0.0"
     }
     response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    
     # 找尋 player_data 變數中的 JSON 資料
     match = re.search(r'var player_data=(.*?)</script>', response.text)
     if not match:
@@ -534,7 +562,8 @@ def get_media_items(url):
     except json.JSONDecodeError:
         raise ValueError("Failed to parse player_data JSON.")
         
-    m3u8_url = data.get("url")
+    raw_m3u8 = data.get("url")
+    m3u8_url = resolve_gimy_stream(raw_m3u8, page_url=url)
     title = data.get("vod_data", {}).get("vod_name", "downloaded_media")
     
     # 將「第X季」替換為 S1, S2...
@@ -601,7 +630,7 @@ def get_media_items(url):
     title = re.sub(r'[\\/:*?"<>|]', '_', title)
     
     items = [{
-        'url': urllib.parse.urljoin(url, m3u8_url) if m3u8_url else m3u8_url,
+        'url': m3u8_url,
         'title': title,
         'ext': 'mp4',
         'type': 'video',
@@ -726,7 +755,6 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     return process.returncode, stderr_log
 
 def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_workers=16, label="影片"):
-    import urllib.parse
     import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from curl_cffi import requests as curl_requests
