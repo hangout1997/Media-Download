@@ -120,7 +120,24 @@ def unpack_dean_packer(packed_js):
             
     return packed_code
 
+def normalize_input_url(url_str):
+    url_str = url_str.strip()
+    if not url_str:
+        return url_str
+    if url_str.startswith("http://") or url_str.startswith("https://"):
+        return url_str
+    if os.path.exists(url_str):
+        return url_str
+    # 若包含常見影音平台網域但漏填 https:// (例如 missav.ai/..., youtube.com/...)
+    if any(domain in url_str.lower() for domain in [".com", ".ai", ".tv", ".ws", ".net", ".org", ".me", ".co", "youtube", "facebook", "instagram", "tiktok", "twitter", "missav"]):
+        return "https://" + url_str.lstrip('/')
+    # 若輸入的是 MissAV / 平台番號與代碼 (例如 JD-054791cdbc62ac51e7c79c59f86b72960)
+    if re.match(r'^[a-zA-Z0-9\-_]{5,}$', url_str):
+        return f"https://missav.ai/{url_str}"
+    return "https://" + url_str
+
 def get_media_items(url):
+    url = normalize_input_url(url)
     items = []
     
     if "missav" in url.lower():
@@ -1262,7 +1279,8 @@ with tab1:
     btn_video = st.button("⬇️ 開始批次下載影片", type="primary", use_container_width=True)
     
     if btn_video:
-        urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
+        raw_urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
+        urls = [normalize_input_url(u) for u in raw_urls]
         
         if not urls:
             st.warning("⚠️ 請先輸入網址！")
@@ -1318,7 +1336,8 @@ with tab2:
     audio_format = st.selectbox("🎵 請選擇輸出音訊格式:", ["預設 (原始格式)", "M4A", "MP3"])
     
     if st.button("▶️ 開始提取音訊", type="primary", use_container_width=True):
-        input_path = local_video_path.strip()
+        raw_input_path = local_video_path.strip()
+        input_path = normalize_input_url(raw_input_path)
         if not input_path:
             st.warning("⚠️ 請先輸入路徑！")
         elif input_path.startswith("http://") or input_path.startswith("https://"):
