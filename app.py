@@ -1333,34 +1333,9 @@ st.set_page_config(page_title="Gimymax Media Downloader", page_icon="🎬", layo
 if "download_dir" not in st.session_state:
     st.session_state.download_dir = load_download_dir()
 
-with st.sidebar:
-    st.title("⚙️ 系統控制")
-    st.markdown("管理下載儲存位置與系統資源維護。")
-    st.divider()
-    
-    st.subheader("📂 儲存資料夾設定")
-    sidebar_dir_input = st.text_input(
-        "儲存資料夾路徑:",
-        value=st.session_state.download_dir,
-        key="sidebar_dir_input",
-        help="選擇或輸入下載檔案與提取音訊時的儲存資料夾路徑"
-    )
-    if sidebar_dir_input and sidebar_dir_input != st.session_state.download_dir:
-        st.session_state.download_dir = save_download_dir(sidebar_dir_input)
-    
-    if st.button("📂 點此選擇資料夾", use_container_width=True, help="點擊開啟 Mac 檔案選擇器挑選資料夾"):
-        chosen = choose_folder_dialog(st.session_state.download_dir)
-        if chosen:
-            st.session_state.download_dir = save_download_dir(chosen)
-            st.success(f"已選擇: `{chosen}`")
-            st.rerun()
-            
-    st.caption(f"目前儲存位置：`{st.session_state.download_dir}`")
-    st.divider()
-
 st.title("🎬 媒體下載與音訊提取器")
 
-# 儲存資料夾控制列 (主要區域)
+# 1. 儲存資料夾控制列 (主要區域)
 col_dir1, col_dir2 = st.columns([3, 1])
 with col_dir1:
     main_dir_val = st.text_input(
@@ -1379,17 +1354,19 @@ with col_dir2:
         if chosen:
             st.session_state.download_dir = save_download_dir(chosen)
             st.rerun()
-    
+
+# 2. 系統資源清理控制列 (並排按鈕)
+col_res1, col_res2 = st.columns(2)
+with col_res1:
     if st.button("🧹 僅釋放記憶體快取 (不關閉服務)", use_container_width=True, help="清空下載快取、暫存 Cookie 與釋放垃圾回收 RAM"):
         with st.spinner("正在釋放系統快取與垃圾回收中..."):
             info = release_resources()
             st.success("🧹 記憶體與快取清理完畢！")
             for msg in info:
-                # 過濾掉會關閉程式的文字，僅呈現清理資訊
                 if "關閉" not in msg and "終止" not in msg:
                     st.toast(msg, icon="ℹ️")
-    st.write("")
-    
+
+with col_res2:
     if st.button("♻️ 釋放所有資源並關閉", type="primary", use_container_width=True):
         with st.spinner("正在釋放系統資源與關閉程式中..."):
             info = release_resources()
@@ -1402,7 +1379,7 @@ with col_dir2:
             import os
             os._exit(0)
 
-st.title("🎬 媒體下載與音訊提取器")
+st.divider()
 
 tab1, tab2 = st.tabs(["🌐 線上影片下載", "📁 影片音訊提取"])
 
