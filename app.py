@@ -12,76 +12,6 @@ import traceback
 import urllib.parse
 import streamlit as st
 
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
-DEFAULT_DOWNLOAD_DIR = "/Users/ericcheng/Downloads"
-
-def load_download_dir():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                d = data.get("download_dir", "").strip()
-                if d:
-                    return d
-        except Exception:
-            pass
-    return DEFAULT_DOWNLOAD_DIR
-
-def save_download_dir(path):
-    if not path or not path.strip():
-        path = DEFAULT_DOWNLOAD_DIR
-    path = os.path.abspath(os.path.expanduser(path.strip()))
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"download_dir": path}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-    return path
-
-def choose_folder_dialog(current_dir):
-    if not current_dir or not os.path.exists(current_dir):
-        current_dir = DEFAULT_DOWNLOAD_DIR
-    try:
-        os.makedirs(current_dir, exist_ok=True)
-    except Exception:
-        current_dir = DEFAULT_DOWNLOAD_DIR
-        
-    # 1. macOS native Finder folder chooser via osascript
-    try:
-        script = f'''
-        tell application "Finder" to activate
-        set selectedFolder to choose folder with prompt "請選擇下載儲存資料夾" default location POSIX file "{current_dir}"
-        return POSIX path of selectedFolder
-        '''
-        cmd = ["osascript", "-e", script]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode == 0:
-            res_path = result.stdout.strip()
-            if res_path and os.path.exists(res_path):
-                return res_path
-    except Exception:
-        pass
-
-    # 2. Fallback to tkinter
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        folder = filedialog.askdirectory(initialdir=current_dir, title="請選擇下載儲存資料夾")
-        root.destroy()
-        if folder and os.path.exists(folder):
-            return folder
-    except Exception:
-        pass
-
-    return None
-
 def create_temp_cookiefile(fb_cookie_str):
     if not fb_cookie_str:
         return None
@@ -1010,7 +940,7 @@ def download_media(media_item, force_audio=False):
     else:
         ext = media_item['ext']
     
-    downloads_dir = st.session_state.get('download_dir', load_download_dir())
+    downloads_dir = "/Users/ericcheng/Google Drive/我的雲端硬碟/美劇/New"
     os.makedirs(downloads_dir, exist_ok=True)
     out_path = os.path.join(downloads_dir, f"{title}.{ext}")
     
@@ -1037,7 +967,7 @@ def download_media(media_item, force_audio=False):
         if "m3u8" in media_url and not force_audio:
             try:
                 download_fast_parallel_hls(media_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
-                st.success(f"✅ 極速下載完成！檔案已儲存至: `{out_path}`")
+                st.success(f"✅ 極速下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
                 gc.collect()
                 return
             except Exception as hls_err:
@@ -1066,7 +996,7 @@ def download_media(media_item, force_audio=False):
                         ydl.download([target_url])
                 
                 if os.path.exists(out_path) or any(os.path.exists(f"{out_base}.{e}") for e in ["mp4", "mkv", "webm"]):
-                    st.success(f"✅ 下載完成！1080p 影片已儲存至: `{out_path}`")
+                    st.success(f"✅ 下載完成！1080p 影片已寫入 Google Drive: `{title}.{ext}`")
                     gc.collect()
                     return
                 else:
@@ -1130,7 +1060,7 @@ def download_media(media_item, force_audio=False):
         )
 
         if returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            st.success(f"✅ 下載完成！檔案已儲存至: `{out_path}`")
+            st.success(f"✅ 下載完成！檔案已寫入 Google Drive: `{title}.{ext}`")
         else:
             show_error_log_box("❌ FFmpeg 下載失敗！", stderr_log, url=media_url)
         
@@ -1144,7 +1074,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         base_name = title
     else:
         base_name = os.path.splitext(os.path.basename(video_path))[0]
-    out_dir = st.session_state.get('download_dir', load_download_dir())
+    out_dir = "/Users/ericcheng/Google Drive/我的雲端硬碟/美劇/New"
     os.makedirs(out_dir, exist_ok=True)
     
     # 驗證 video_path 是否為合法網址或本機檔案
@@ -1209,7 +1139,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                     matched_file = candidates[0]
 
             if matched_file:
-                st.success(f"✅ 提取完成！音訊已儲存至: `{matched_file}`")
+                st.success(f"✅ 提取完成！音訊已儲存至 Google Drive: `{os.path.basename(matched_file)}`")
                 gc.collect()
                 return
             else:
@@ -1329,56 +1259,10 @@ def release_resources():
 # ========================================================
 st.set_page_config(page_title="Gimymax Media Downloader", page_icon="🎬", layout="centered")
 
-# 初始化 session_state download_dir
-if "download_dir" not in st.session_state:
-    st.session_state.download_dir = load_download_dir()
-
 with st.sidebar:
     st.title("⚙️ 系統控制")
-    st.markdown("管理下載儲存位置與系統資源維護。")
+    st.markdown("管理系統資源與進行手動清理維護。")
     st.divider()
-    
-    st.subheader("📂 儲存資料夾設定")
-    sidebar_dir_input = st.text_input(
-        "儲存資料夾路徑:",
-        value=st.session_state.download_dir,
-        key="sidebar_dir_input",
-        help="選擇或輸入下載檔案與提取音訊時的儲存資料夾路徑"
-    )
-    if sidebar_dir_input and sidebar_dir_input != st.session_state.download_dir:
-        st.session_state.download_dir = save_download_dir(sidebar_dir_input)
-    
-    if st.button("📂 點此選擇資料夾", use_container_width=True, help="點擊開啟 Mac 檔案選擇器挑選資料夾"):
-        chosen = choose_folder_dialog(st.session_state.download_dir)
-        if chosen:
-            st.session_state.download_dir = save_download_dir(chosen)
-            st.success(f"已選擇: `{chosen}`")
-            st.rerun()
-            
-    st.caption(f"目前儲存位置：`{st.session_state.download_dir}`")
-    st.divider()
-
-st.title("🎬 媒體下載與音訊提取器")
-
-# 儲存資料夾控制列 (主要區域)
-col_dir1, col_dir2 = st.columns([3, 1])
-with col_dir1:
-    main_dir_val = st.text_input(
-        "📁 下載儲存資料夾:",
-        value=st.session_state.download_dir,
-        key="main_dir_input",
-        help="所有下載與音訊檔都會儲存至此資料夾"
-    )
-    if main_dir_val and main_dir_val != st.session_state.download_dir:
-        st.session_state.download_dir = save_download_dir(main_dir_val)
-
-with col_dir2:
-    st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-    if st.button("📂 選擇資料夾", key="main_browse_btn", use_container_width=True):
-        chosen = choose_folder_dialog(st.session_state.download_dir)
-        if chosen:
-            st.session_state.download_dir = save_download_dir(chosen)
-            st.rerun()
     
     if st.button("🧹 僅釋放記憶體快取 (不關閉服務)", use_container_width=True, help="清空下載快取、暫存 Cookie 與釋放垃圾回收 RAM"):
         with st.spinner("正在釋放系統快取與垃圾回收中..."):
