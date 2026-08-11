@@ -31,7 +31,17 @@ def get_stream_info(url):
     return m3u8_url, title
 
 def download_audio(m3u8_url, title):
-    downloads_dir = os.path.expanduser("~/Downloads")
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    downloads_dir = "/Users/ericcheng/Downloads"
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data.get("download_dir"):
+                    downloads_dir = data["download_dir"]
+        except Exception:
+            pass
+    os.makedirs(downloads_dir, exist_ok=True)
     # 設定最終輸出名稱，會帶入副檔名 (.mp3)
     outtmpl = os.path.join(downloads_dir, f"{title}.%(ext)s")
     
