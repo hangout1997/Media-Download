@@ -1370,38 +1370,54 @@ def release_resources():
 # ========================================================
 st.set_page_config(page_title="Gimymax Media Downloader", page_icon="🎬", layout="centered")
 
-# 初始化 session_state download_dir
+# 初始化 session_state download_dir 與 main_dir_input
 if "download_dir" not in st.session_state:
     st.session_state.download_dir = load_download_dir()
+if "main_dir_input" not in st.session_state:
+    st.session_state.main_dir_input = st.session_state.download_dir
+
+# 回呼函數 (Callbacks: 於 Widget 實例化前優先執行，允許修改 session_state)
+def _cb_choose_folder():
+    chosen = choose_folder_dialog(st.session_state.download_dir)
+    if chosen:
+        saved = save_download_dir(chosen)
+        st.session_state.download_dir = saved
+        st.session_state.main_dir_input = saved
+        st.session_state.pending_toast = (f"✅ 已成功將儲存位置更改為：\n{saved}", "📁")
+    else:
+        st.session_state.pending_toast = ("ℹ️ 未選擇新資料夾或取消選擇", "💡")
+
+def _cb_set_folder(target_path, name):
+    saved = save_download_dir(target_path)
+    st.session_state.download_dir = saved
+    st.session_state.main_dir_input = saved
+    st.session_state.pending_toast = (f"✅ 已切換至 {name}", "📁")
+
+def _cb_dir_input_change():
+    val = st.session_state.main_dir_input
+    if val:
+        st.session_state.download_dir = save_download_dir(val)
+
+# 顯示對應提示訊息
+if "pending_toast" in st.session_state:
+    t_msg, t_icon = st.session_state.pop("pending_toast")
+    st.toast(t_msg, icon=t_icon)
 
 st.title("🎬 媒體下載與音訊提取器")
 
 # 1. 儲存資料夾控制列 (主要區域)
-if "main_dir_input" not in st.session_state:
-    st.session_state.main_dir_input = st.session_state.download_dir
-
 col_dir1, col_dir2 = st.columns([3, 1])
 with col_dir1:
-    main_dir_val = st.text_input(
+    st.text_input(
         "📁 下載儲存資料夾:",
-        value=st.session_state.download_dir,
         key="main_dir_input",
+        on_change=_cb_dir_input_change,
         help="所有下載與音訊檔都會儲存至此資料夾"
     )
-    if main_dir_val and main_dir_val != st.session_state.download_dir:
-        st.session_state.download_dir = save_download_dir(main_dir_val)
 
 with col_dir2:
     st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-    if st.button("📂 選擇資料夾", key="main_browse_btn", use_container_width=True):
-        chosen = choose_folder_dialog(st.session_state.download_dir)
-        if chosen:
-            st.session_state.download_dir = save_download_dir(chosen)
-            st.session_state.main_dir_input = chosen
-            st.toast(f"✅ 已成功將儲存位置更改為：\n{chosen}", icon="📁")
-            st.rerun()
-        else:
-            st.toast("ℹ️ 未選擇新資料夾或取消選擇", icon="💡")
+    st.button("📂 選擇資料夾", key="main_browse_btn", use_container_width=True, on_click=_cb_choose_folder)
 
 # 快捷資料夾選區 (常用捷徑)
 with st.expander("⚡ 常用儲存位置快捷切換", expanded=False):
@@ -1410,32 +1426,16 @@ with st.expander("⚡ 常用儲存位置快捷切換", expanded=False):
     downloads_path = os.path.join(home_dir, "Downloads")
     desktop_path = os.path.join(home_dir, "Desktop")
     documents_path = os.path.join(home_dir, "Documents")
+    proj_downloads = os.path.join(os.path.dirname(__file__), "downloads")
     
     with q_cols[0]:
-        if st.button("📥 下載 (Downloads)", use_container_width=True):
-            st.session_state.download_dir = save_download_dir(downloads_path)
-            st.session_state.main_dir_input = downloads_path
-            st.toast(f"✅ 已切換至 Downloads", icon="📥")
-            st.rerun()
+        st.button("📥 下載 (Downloads)", use_container_width=True, on_click=_cb_set_folder, args=(downloads_path, "Downloads"))
     with q_cols[1]:
-        if st.button("🖥️ 桌面 (Desktop)", use_container_width=True):
-            st.session_state.download_dir = save_download_dir(desktop_path)
-            st.session_state.main_dir_input = desktop_path
-            st.toast(f"✅ 已切換至 Desktop", icon="🖥️")
-            st.rerun()
+        st.button("🖥️ 桌面 (Desktop)", use_container_width=True, on_click=_cb_set_folder, args=(desktop_path, "Desktop"))
     with q_cols[2]:
-        if st.button("📁 文件 (Documents)", use_container_width=True):
-            st.session_state.download_dir = save_download_dir(documents_path)
-            st.session_state.main_dir_input = documents_path
-            st.toast(f"✅ 已切換至 Documents", icon="📁")
-            st.rerun()
+        st.button("📁 文件 (Documents)", use_container_width=True, on_click=_cb_set_folder, args=(documents_path, "Documents"))
     with q_cols[3]:
-        proj_downloads = os.path.join(os.path.dirname(__file__), "downloads")
-        if st.button("📂 專案內 downloads", use_container_width=True):
-            st.session_state.download_dir = save_download_dir(proj_downloads)
-            st.session_state.main_dir_input = proj_downloads
-            st.toast(f"✅ 已切換至專案內部資料夾", icon="📂")
-            st.rerun()
+        st.button("📂 專案內 downloads", use_container_width=True, on_click=_cb_set_folder, args=(proj_downloads, "專案內部 downloads"))
 
 # 2. 系統資源清理控制列 (並排按鈕)
 col_res1, col_res2 = st.columns(2)
