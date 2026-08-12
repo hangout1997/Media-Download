@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import json
 import time
@@ -50,23 +51,63 @@ def choose_folder_dialog(current_dir):
     except Exception:
         current_dir = DEFAULT_DOWNLOAD_DIR
         
-    # 1. macOS native Finder folder chooser via osascript
-    try:
-        script = f'''
-        tell application "Finder" to activate
-        set selectedFolder to choose folder with prompt "請選擇下載儲存資料夾" default location POSIX file "{current_dir}"
-        return POSIX path of selectedFolder
-        '''
-        cmd = ["osascript", "-e", script]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode == 0:
-            res_path = result.stdout.strip()
-            if res_path and os.path.exists(res_path):
-                return res_path
-    except Exception:
-        pass
+    current_dir = os.path.abspath(current_dir)
 
-    # 2. Fallback to tkinter
+    # 1. macOS native Finder folder chooser via osascript
+    # (註：勿在 tell application "Finder" 內呼叫，以免觸發 macOS TCC 隱私與 Access -54 錯誤)
+    if sys.platform == "darwin":
+        # 1a. 帶預設資料夾
+        try:
+            safe_dir = current_dir.replace('"', '\\"')
+            script = f'POSIX path of (choose folder with prompt "請選擇下載儲存資料夾" default location POSIX file "{safe_dir}")'
+            cmd = ["osascript", "-e", script]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                res_path = result.stdout.strip()
+                if res_path and os.path.exists(res_path):
+                    return res_path
+        except Exception:
+            pass
+
+        # 1b. 若 1a 失敗，退回無預設位置的原生彈窗
+        try:
+            script = 'POSIX path of (choose folder with prompt "請選擇下載儲存資料夾")'
+            cmd = ["osascript", "-e", script]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                res_path = result.stdout.strip()
+                if res_path and os.path.exists(res_path):
+                    return res_path
+        except Exception:
+            pass
+
+    # 2. Linux zenity
+    if sys.platform.startswith("linux"):
+        try:
+            cmd = ["zenity", "--file-selection", "--directory", f"--filename={current_dir}"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                res_path = result.stdout.strip()
+                if res_path and os.path.exists(res_path):
+                    return res_path
+        except Exception:
+            pass
+
+    # 3. PyQt5 / PyQt6 / PySide6 / PySide2 Fallback
+    for qt_mod in ["PyQt6.QtWidgets", "PyQt5.QtWidgets", "PySide6.QtWidgets", "PySide2.QtWidgets"]:
+        try:
+            mod = __import__(qt_mod, fromlist=["QApplication", "QFileDialog"])
+            QApplication = getattr(mod, "QApplication")
+            QFileDialog = getattr(mod, "QFileDialog")
+            app = QApplication.instance() or QApplication([])
+            folder = QFileDialog.getExistingDirectory(None, "請選擇下載儲存資料夾", current_dir)
+            if folder and os.path.exists(folder):
+                return folder
+            break
+        except Exception:
+            pass
+
+    # 4. Fallback to tkinter
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -1336,6 +1377,9 @@ if "download_dir" not in st.session_state:
 st.title("🎬 媒體下載與音訊提取器")
 
 # 1. 儲存資料夾控制列 (主要區域)
+if "main_dir_input" not in st.session_state:
+    st.session_state.main_dir_input = st.session_state.download_dir
+
 col_dir1, col_dir2 = st.columns([3, 1])
 with col_dir1:
     main_dir_val = st.text_input(
@@ -1353,6 +1397,44 @@ with col_dir2:
         chosen = choose_folder_dialog(st.session_state.download_dir)
         if chosen:
             st.session_state.download_dir = save_download_dir(chosen)
+            st.session_state.main_dir_input = chosen
+            st.toast(f"✅ 已成功將儲存位置更改為：\n{chosen}", icon="📁")
+            st.rerun()
+        else:
+            st.toast("ℹ️ 未選擇新資料夾或取消選擇", icon="💡")
+
+# 快捷資料夾選區 (常用捷徑)
+with st.expander("⚡ 常用儲存位置快捷切換", expanded=False):
+    q_cols = st.columns(4)
+    home_dir = os.path.expanduser("~")
+    downloads_path = os.path.join(home_dir, "Downloads")
+    desktop_path = os.path.join(home_dir, "Desktop")
+    documents_path = os.path.join(home_dir, "Documents")
+    
+    with q_cols[0]:
+        if st.button("📥 下載 (Downloads)", use_container_width=True):
+            st.session_state.download_dir = save_download_dir(downloads_path)
+            st.session_state.main_dir_input = downloads_path
+            st.toast(f"✅ 已切換至 Downloads", icon="📥")
+            st.rerun()
+    with q_cols[1]:
+        if st.button("🖥️ 桌面 (Desktop)", use_container_width=True):
+            st.session_state.download_dir = save_download_dir(desktop_path)
+            st.session_state.main_dir_input = desktop_path
+            st.toast(f"✅ 已切換至 Desktop", icon="🖥️")
+            st.rerun()
+    with q_cols[2]:
+        if st.button("📁 文件 (Documents)", use_container_width=True):
+            st.session_state.download_dir = save_download_dir(documents_path)
+            st.session_state.main_dir_input = documents_path
+            st.toast(f"✅ 已切換至 Documents", icon="📁")
+            st.rerun()
+    with q_cols[3]:
+        proj_downloads = os.path.join(os.path.dirname(__file__), "downloads")
+        if st.button("📂 專案內 downloads", use_container_width=True):
+            st.session_state.download_dir = save_download_dir(proj_downloads)
+            st.session_state.main_dir_input = proj_downloads
+            st.toast(f"✅ 已切換至專案內部資料夾", icon="📂")
             st.rerun()
 
 # 2. 系統資源清理控制列 (並排按鈕)
