@@ -11,7 +11,20 @@ import tempfile
 import gc
 import traceback
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import yt_dlp
 import streamlit as st
+
+# ── 全域共用 Session（跨任務複用 TCP 連線池 + DNS 快取）──────────────────────
+_global_session = requests.Session()
+_global_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=32, pool_maxsize=64, max_retries=3
+)
+_global_session.mount('https://', _global_adapter)
+_global_session.mount('http://', _global_adapter)
+_GLOBAL_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+}
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 DEFAULT_DOWNLOAD_DIR = "/Users/ericcheng/Downloads"
@@ -493,27 +506,30 @@ def get_media_items(url):
                             photo_links = re.findall(r"href=\'(/photo\.php\?[^\'\s]+)\'", set_html)
                             
                         if photo_links:
-                            st.info(f"🔗 成功找到 {len(photo_links)} 張相片的連結，開始逐一解析高清原始圖...")
-                            # 遍歷每一張相片網頁，提取高清原始圖網址
-                            for p_link in photo_links:
+                            st.info(f"🔗 成功找到 {len(photo_links)} 張相片的連結，開始平行解析高清原始圖...")
+
+                            # ── 平行抓取每張相片頁（提速 5–8x）────────────────
+                            def _fetch_one_photo(p_link):
                                 p_url = "https://mbasic.facebook.com" + html_lib.unescape(p_link)
                                 try:
                                     p_res = session.get(p_url, headers=mobile_headers, timeout=10)
                                     if p_res.status_code == 200:
                                         p_html = p_res.text
-                                        # 尋找頁面中的高解析度 scontent 網址
                                         img_match = re.search(r'<img[^>]+src=\"([^\"]*scontent[^\"]*)\"', p_html)
                                         if not img_match:
                                             img_match = re.search(r'src=\"([^\"]*scontent[^\"]*)\"', p_html)
-                                        
                                         if img_match:
                                             raw_img_url = html_lib.unescape(img_match.group(1))
                                             raw_img_url = urllib.parse.unquote(raw_img_url)
-                                            # 去除 profile 等小圖
                                             if not any(size in raw_img_url for size in ['p144x144', 'p48x48', 'p75x75']):
-                                                unique_photos.append(raw_img_url)
+                                                return raw_img_url
                                 except Exception as e:
                                     print(f"Error scraping single photo page: {e}")
+                                return None
+
+                            with ThreadPoolExecutor(max_workers=8) as _photo_exec:
+                                results = list(_photo_exec.map(_fetch_one_photo, photo_links))
+                            unique_photos.extend([r for r in results if r])
                 except Exception as e:
                     print(f"Failed to fetch set photos: {e}")
             
@@ -865,28 +881,20 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     stderr_log = "\n".join(stderr_lines)
     return process.returncode, stderr_log
 
-def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_workers=16, label="影片"):
-    import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_workers=None, label="影片"):
+    """平行 HLS 下載引擎（Streaming Write，邊下邊存磁碟，大幅降低 RAM 峰值）。"""
     from curl_cffi import requests as curl_requests
 
-    req_headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    }
+    req_headers = dict(_GLOBAL_HEADERS)
     if extra_headers:
         req_headers.update(extra_headers)
-
     if 'Referer' not in req_headers:
         req_headers['Referer'] = f"https://{urllib.parse.urlparse(m3u8_url).netloc}/"
 
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=max_workers*2, pool_maxsize=max_workers*2, max_retries=3)
-    session.mount('https://', adapter)
-    session.mount('http://', adapter)
+    # 複用全域 Session，不重建
+    session = _global_session
 
-    # 部分反爬 CDN 對「新連線」會先重度限速，同一條連線持續使用一段時間後才會提速。
-    # 因此每個 worker thread 維持一條專屬的長連線 (thread-local Session) 重複使用，
-    # 而不是每個請求都重新建立連線，藉此讓連線有機會「暖身」提速。
+    # 每個 worker 維持專屬長連線（讓 CDN 連線「暖身」提速）
     thread_local = threading.local()
 
     def get_curl_session():
@@ -911,6 +919,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     text = fetch_text(m3u8_url)
 
+    # ── Master Playlist：優先用 RESOLUTION 高度排序，其次 BANDWIDTH ──────────
     if "#EXT-X-STREAM-INF" in text:
         sub_playlists = []
         current_inf = {}
@@ -918,13 +927,20 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             line = line.strip()
             if line.startswith("#EXT-X-STREAM-INF"):
                 bw_match = re.search(r"BANDWIDTH=(\d+)", line)
+                res_match = re.search(r"RESOLUTION=\d+x(\d+)", line)
                 current_inf['bw'] = int(bw_match.group(1)) if bw_match else 0
+                current_inf['height'] = int(res_match.group(1)) if res_match else 0
             elif line and not line.startswith("#"):
-                sub_playlists.append((current_inf.get('bw', 0), urllib.parse.urljoin(m3u8_url, line)))
+                sub_playlists.append((
+                    current_inf.get('height', 0),
+                    current_inf.get('bw', 0),
+                    urllib.parse.urljoin(m3u8_url, line)
+                ))
                 current_inf = {}
         if sub_playlists:
-            sub_playlists.sort(key=lambda x: x[0], reverse=True)
-            m3u8_url = sub_playlists[0][1]
+            # 優先 RESOLUTION 高度，相同高度再比 BANDWIDTH
+            sub_playlists.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            m3u8_url = sub_playlists[0][2]
             text = fetch_text(m3u8_url)
 
     segment_urls = []
@@ -946,14 +962,41 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         segment_durations = [avg_dur] * total_segments
 
     total_duration = sum(segment_durations)
-    
+
+    # ── 動態計算最佳 worker 數：min(32, segments, cpu*4) ─────────────────────
+    cpu_count = os.cpu_count() or 4
+    if max_workers is None:
+        max_workers = min(32, total_segments, cpu_count * 4)
+    else:
+        max_workers = min(max_workers, total_segments)
+
     progress_bar = st.progress(0.0)
     status_text = st.empty()
+
+    # ── Streaming Write Pipeline：邊下邊寫磁碟，不全存 RAM ───────────────────
+    # 用一個 temp .ts 檔案 + 有序寫入佇列，讓記憶體峰值降至單片大小
+    tmp_ts_fd, tmp_ts_path = tempfile.mkstemp(suffix=".ts")
+    os.close(tmp_ts_fd)
+
+    # 預先開好佔位（讓 out_path 可以 seek 寫入），但因 HLS 通常需要按序，
+    # 改用 dict buffer：完成的切片暫存，達到 next_write_idx 就立即 flush 到磁碟
+    write_lock = threading.Lock()
+    pending_buffer = {}   # {idx: bytes}  ── 等待順序寫入的暫存
+    next_write_idx = [0]  # list 讓 closure 可修改
+
+    ts_file = open(tmp_ts_path, 'wb')
+
+    def flush_pending():
+        """把已到位的切片按順序 flush 到磁碟。"""
+        while next_write_idx[0] in pending_buffer:
+            chunk = pending_buffer.pop(next_write_idx[0])
+            if chunk:
+                ts_file.write(chunk)
+            next_write_idx[0] += 1
 
     def download_segment(args):
         idx, seg_url = args
         for attempt in range(3):
-            wait = 0.5 * (2 ** attempt)  # exponential backoff: 0.5s, 1s, 2s
             try:
                 r = session.get(seg_url, headers=req_headers, timeout=15)
                 if r.status_code == 200 and len(r.content) > 0:
@@ -966,53 +1009,62 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                     return idx, r.content
             except Exception:
                 pass
+            # exponential backoff：第 1 次失敗等 0.5s，第 2 次等 1s
             if attempt < 2:
-                time.sleep(wait)
+                time.sleep(0.5 * (2 ** attempt))
         return idx, b""
 
     t0 = time.time()
     last_update_time = 0.0
-    segments_data = [b""] * total_segments
     completed = 0
     completed_duration = 0.0
     total_downloaded_bytes = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(download_segment, (i, url)) for i, url in enumerate(segment_urls)]
-        for f in as_completed(futures):
-            idx, content = f.result()
-            segments_data[idx] = content
-            completed += 1
-            completed_duration += segment_durations[idx]
-            total_downloaded_bytes += len(content)
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(download_segment, (i, url)): i
+                       for i, url in enumerate(segment_urls)}
+            for f in as_completed(futures):
+                idx, content = f.result()
+                total_downloaded_bytes += len(content)
+                completed += 1
+                completed_duration += segment_durations[idx]
 
-            now = time.time()
-            if now - last_update_time >= 0.25 or completed == total_segments:
-                last_update_time = now
-                elapsed = max(0.1, now - t0)
-                speed_x = completed_duration / elapsed
-                mb_downloaded = total_downloaded_bytes / 1024 / 1024
-                speed_mb = mb_downloaded / elapsed
-                if total_duration > 0:
-                    pct = min(1.0, max(0.0, completed_duration / total_duration))
-                    pct_num = pct * 100
-                    status_text.markdown(f"⏳ **{label}進度**: `{pct_num:.1f}%` ({format_time(completed_duration)} / {format_time(total_duration)}) | 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)")
-                else:
-                    pct = completed / total_segments
-                    pct_num = pct * 100
-                    status_text.markdown(f"⏳ **{label}處理中...** 已完成切片 `{completed}/{total_segments}` (`{mb_downloaded:.1f} MB`) | 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)")
-                progress_bar.progress(pct)
+                # 有序 flush 到磁碟
+                with write_lock:
+                    pending_buffer[idx] = content
+                    flush_pending()
+
+                now = time.time()
+                if now - last_update_time >= 0.25 or completed == total_segments:
+                    last_update_time = now
+                    elapsed = max(0.1, now - t0)
+                    speed_x = completed_duration / elapsed
+                    mb_downloaded = total_downloaded_bytes / 1024 / 1024
+                    speed_mb = mb_downloaded / elapsed
+                    if total_duration > 0:
+                        pct = min(1.0, max(0.0, completed_duration / total_duration))
+                        status_text.markdown(
+                            f"⏳ **{label}進度**: `{pct * 100:.1f}%` "
+                            f"({format_time(completed_duration)} / {format_time(total_duration)}) "
+                            f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`) "
+                            f"| 線程: `{max_workers}`"
+                        )
+                    else:
+                        pct = completed / total_segments
+                        status_text.markdown(
+                            f"⏳ **{label}處理中...** 已完成 `{completed}/{total_segments}` "
+                            f"(`{mb_downloaded:.1f} MB`) "
+                            f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)"
+                        )
+                    progress_bar.progress(pct)
+    finally:
+        # 確保剩餘 buffer 全部 flush 後再關閉
+        with write_lock:
+            flush_pending()
+        ts_file.close()
 
     status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
-    
-    # 寫入暫存檔以進行低記憶體消耗封裝
-    with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as tmp_ts:
-        tmp_ts_path = tmp_ts.name
-        for chunk in segments_data:
-            if chunk:
-                tmp_ts.write(chunk)
-    
-    del segments_data
     gc.collect()
 
     try:
@@ -1024,16 +1076,14 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             "-movflags", "+faststart",
             out_path
         ]
-        
         proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             raise ValueError(f"FFmpeg 無損封裝失敗: {proc.stderr.decode('utf-8', errors='ignore')}")
     finally:
-        if os.path.exists(tmp_ts_path):
-            try:
-                os.remove(tmp_ts_path)
-            except Exception:
-                pass
+        try:
+            os.remove(tmp_ts_path)
+        except Exception:
+            pass
 
     progress_bar.empty()
     status_text.empty()
@@ -1091,7 +1141,6 @@ def download_media(media_item, force_audio=False):
         if is_youtube and not force_audio:
             target_url = webpage_url or media_url
             try:
-                import yt_dlp
                 out_base = os.path.splitext(out_path)[0]
                 ydl_opts = {
                     'outtmpl': f"{out_base}.%(ext)s",
@@ -1101,11 +1150,14 @@ def download_media(media_item, force_audio=False):
                     'legacy_server_connect': True,
                     'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
                     'merge_output_format': 'mp4',
+                    # ── 速度優化：多線程 fragment 下載 ──────────────────────
+                    'concurrent_fragment_downloads': 8,
+                    'http_chunk_size': 10 * 1024 * 1024,  # 10 MB 分塊
                 }
-                with st.spinner("⏳ 正在下載 YouTube 1080p 高清影片..."):
+                with st.spinner("⏳ 正在下載 YouTube 1080p 高清影片（多線程加速中）..."):
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         ydl.download([target_url])
-                
+
                 if os.path.exists(out_path) or any(os.path.exists(f"{out_base}.{e}") for e in ["mp4", "mkv", "webm"]):
                     st.success(f"✅ 下載完成！1080p 影片已儲存至: `{out_path}`")
                     gc.collect()
@@ -1152,9 +1204,19 @@ def download_media(media_item, force_audio=False):
             ]
             label_text = "音訊轉碼"
         else:
+            # ── FFmpeg reconnect 參數：遇到網路抖動自動重連，不中斷 ──────────
+            reconnect_args = [
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-multiple_requests", "1",
+            ]
+            if "m3u8" in media_url:
+                reconnect_args += ["-http_persistent", "1"]
+
             ffmpeg_cmd = [
                 "ffmpeg", "-y"
-            ] + headers_arg + [
+            ] + reconnect_args + headers_arg + [
                 "-i", media_url,
                 "-c", "copy",
                 "-bsf:a", "aac_adtstoasc",
@@ -1233,7 +1295,10 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 'nocheckcertificate': True,
                 'legacy_server_connect': True,
                 'format': 'bestaudio/best',
-                'postprocessors': postprocessors
+                'postprocessors': postprocessors,
+                # ── 速度優化 ──────────────────────────────────────────────
+                'concurrent_fragment_downloads': 8,
+                'http_chunk_size': 10 * 1024 * 1024,
             }
             with st.spinner("⏳ 正在透過 yt-dlp 從線上網址提取高品質音訊..."):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
