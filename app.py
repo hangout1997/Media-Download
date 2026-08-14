@@ -882,7 +882,7 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     return process.returncode, stderr_log
 
 def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_workers=None, label="影片"):
-    """平行 HLS 下載引擎（Streaming Write，邊下邊存磁碟，大幅降低 RAM 峰值）。"""
+    """平行 HLS 下載引擎（全量 RAM 模式：24G RAM，最大化速度，零磁碟 I/O）。"""
     from curl_cffi import requests as curl_requests
 
     req_headers = dict(_GLOBAL_HEADERS)
@@ -973,26 +973,9 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     progress_bar = st.progress(0.0)
     status_text = st.empty()
 
-    # ── Streaming Write Pipeline：邊下邊寫磁碟，不全存 RAM ───────────────────
-    # 用一個 temp .ts 檔案 + 有序寫入佇列，讓記憶體峰值降至單片大小
-    tmp_ts_fd, tmp_ts_path = tempfile.mkstemp(suffix=".ts")
-    os.close(tmp_ts_fd)
-
-    # 預先開好佔位（讓 out_path 可以 seek 寫入），但因 HLS 通常需要按序，
-    # 改用 dict buffer：完成的切片暫存，達到 next_write_idx 就立即 flush 到磁碟
-    write_lock = threading.Lock()
-    pending_buffer = {}   # {idx: bytes}  ── 等待順序寫入的暫存
-    next_write_idx = [0]  # list 讓 closure 可修改
-
-    ts_file = open(tmp_ts_path, 'wb')
-
-    def flush_pending():
-        """把已到位的切片按順序 flush 到磁碟。"""
-        while next_write_idx[0] in pending_buffer:
-            chunk = pending_buffer.pop(next_write_idx[0])
-            if chunk:
-                ts_file.write(chunk)
-            next_write_idx[0] += 1
+    # ── 全量 RAM 模式：切片全部存入記憶體，封裝時一次性寫入，零磁碟 I/O ──────
+    # 24G RAM 環境下，2h 影片約佔 2–4 GB，完全在記憶體範圍內
+    segments_data = [b""] * total_segments
 
     def download_segment(args):
         idx, seg_url = args
@@ -1020,51 +1003,50 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     completed_duration = 0.0
     total_downloaded_bytes = 0
 
-    try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(download_segment, (i, url)): i
-                       for i, url in enumerate(segment_urls)}
-            for f in as_completed(futures):
-                idx, content = f.result()
-                total_downloaded_bytes += len(content)
-                completed += 1
-                completed_duration += segment_durations[idx]
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(download_segment, (i, url)): i
+                   for i, url in enumerate(segment_urls)}
+        for f in as_completed(futures):
+            idx, content = f.result()
+            segments_data[idx] = content
+            completed += 1
+            completed_duration += segment_durations[idx]
+            total_downloaded_bytes += len(content)
 
-                # 有序 flush 到磁碟
-                with write_lock:
-                    pending_buffer[idx] = content
-                    flush_pending()
-
-                now = time.time()
-                if now - last_update_time >= 0.25 or completed == total_segments:
-                    last_update_time = now
-                    elapsed = max(0.1, now - t0)
-                    speed_x = completed_duration / elapsed
-                    mb_downloaded = total_downloaded_bytes / 1024 / 1024
-                    speed_mb = mb_downloaded / elapsed
-                    if total_duration > 0:
-                        pct = min(1.0, max(0.0, completed_duration / total_duration))
-                        status_text.markdown(
-                            f"⏳ **{label}進度**: `{pct * 100:.1f}%` "
-                            f"({format_time(completed_duration)} / {format_time(total_duration)}) "
-                            f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`) "
-                            f"| 線程: `{max_workers}`"
-                        )
-                    else:
-                        pct = completed / total_segments
-                        status_text.markdown(
-                            f"⏳ **{label}處理中...** 已完成 `{completed}/{total_segments}` "
-                            f"(`{mb_downloaded:.1f} MB`) "
-                            f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)"
-                        )
-                    progress_bar.progress(pct)
-    finally:
-        # 確保剩餘 buffer 全部 flush 後再關閉
-        with write_lock:
-            flush_pending()
-        ts_file.close()
+            now = time.time()
+            if now - last_update_time >= 0.25 or completed == total_segments:
+                last_update_time = now
+                elapsed = max(0.1, now - t0)
+                speed_x = completed_duration / elapsed
+                mb_downloaded = total_downloaded_bytes / 1024 / 1024
+                speed_mb = mb_downloaded / elapsed
+                if total_duration > 0:
+                    pct = min(1.0, max(0.0, completed_duration / total_duration))
+                    status_text.markdown(
+                        f"⏳ **{label}進度**: `{pct * 100:.1f}%` "
+                        f"({format_time(completed_duration)} / {format_time(total_duration)}) "
+                        f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`) "
+                        f"| 線程: `{max_workers}`"
+                    )
+                else:
+                    pct = completed / total_segments
+                    status_text.markdown(
+                        f"⏳ **{label}處理中...** 已完成 `{completed}/{total_segments}` "
+                        f"(`{mb_downloaded:.1f} MB`) "
+                        f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)"
+                    )
+                progress_bar.progress(pct)
 
     status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
+
+    # RAM 中的資料一次性寫入暫存 .ts，再交給 FFmpeg 封裝（單次磁碟寫入）
+    with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as tmp_ts:
+        tmp_ts_path = tmp_ts.name
+        for chunk in segments_data:
+            if chunk:
+                tmp_ts.write(chunk)
+
+    del segments_data
     gc.collect()
 
     try:
@@ -1085,10 +1067,13 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         except Exception:
             pass
 
+
     progress_bar.empty()
     status_text.empty()
 
+
 def download_media(media_item, force_audio=False):
+
     title = media_item['title']
     media_url = media_item['url']
     media_type = media_item['type']
