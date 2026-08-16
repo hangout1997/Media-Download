@@ -1434,6 +1434,36 @@ if "download_dir" not in st.session_state:
 if "main_dir_input" not in st.session_state:
     st.session_state.main_dir_input = st.session_state.download_dir
 
+def find_google_drive_path():
+    """自動偵測系統中的 Google Drive 雲端硬碟掛載路徑。"""
+    # 1. 檢查 macOS CloudStorage
+    cloud_storage = os.path.expanduser("~/Library/CloudStorage")
+    if os.path.exists(cloud_storage):
+        import glob
+        gd_dirs = sorted(glob.glob(os.path.join(cloud_storage, "GoogleDrive*")), reverse=True)
+        for gd in gd_dirs:
+            for sub in ["我的雲端硬碟", "My Drive", ""]:
+                p = os.path.join(gd, sub) if sub else gd
+                if os.path.exists(p) and os.path.isdir(p):
+                    return p
+                    
+    # 2. 檢查常用掛載點或家目錄
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Google Drive"),
+        os.path.join(home, "GoogleDrive"),
+        os.path.join(home, "Google 雲端硬碟"),
+        "/Volumes/GoogleDrive",
+        "/Volumes/Google Drive",
+    ]
+    for c in candidates:
+        if os.path.exists(c) and os.path.isdir(c):
+            for sub in ["我的雲端硬碟", "My Drive", ""]:
+                p = os.path.join(c, sub) if sub else c
+                if os.path.exists(p) and os.path.isdir(p):
+                    return p
+    return None
+
 # 回呼函數 (Callbacks: 於 Widget 實例化前優先執行，允許修改 session_state)
 def _cb_choose_folder():
     chosen = choose_folder_dialog(st.session_state.download_dir)
@@ -1450,6 +1480,16 @@ def _cb_set_folder(target_path, name):
     st.session_state.download_dir = saved
     st.session_state.main_dir_input = saved
     st.session_state.pending_toast = (f"✅ 已切換至 {name}", "📁")
+
+def _cb_set_gdrive():
+    gd_path = find_google_drive_path()
+    if gd_path and os.path.exists(gd_path):
+        saved = save_download_dir(gd_path)
+        st.session_state.download_dir = saved
+        st.session_state.main_dir_input = saved
+        st.session_state.pending_toast = (f"✅ 已切換至 Google Drive 雲端硬碟：\n{saved}", "☁️")
+    else:
+        st.session_state.pending_toast = ("⚠️ 未偵測到本機 Google Drive 掛載路徑，請確認 Google Drive 桌面版已開啟", "⚠️")
 
 def _cb_dir_input_change():
     val = st.session_state.main_dir_input
@@ -1479,7 +1519,7 @@ with col_dir2:
 
 # 快捷資料夾選區 (常用捷徑)
 with st.expander("⚡ 常用儲存位置快捷切換", expanded=False):
-    q_cols = st.columns(4)
+    q_cols = st.columns(5)
     home_dir = os.path.expanduser("~")
     downloads_path = os.path.join(home_dir, "Downloads")
     desktop_path = os.path.join(home_dir, "Desktop")
@@ -1489,10 +1529,12 @@ with st.expander("⚡ 常用儲存位置快捷切換", expanded=False):
     with q_cols[0]:
         st.button("📥 下載 (Downloads)", use_container_width=True, on_click=_cb_set_folder, args=(downloads_path, "Downloads"))
     with q_cols[1]:
-        st.button("🖥️ 桌面 (Desktop)", use_container_width=True, on_click=_cb_set_folder, args=(desktop_path, "Desktop"))
+        st.button("☁️ Google Drive", use_container_width=True, on_click=_cb_set_gdrive, help="直接將下載檔案儲存至 Google Drive 雲端硬碟")
     with q_cols[2]:
-        st.button("📁 文件 (Documents)", use_container_width=True, on_click=_cb_set_folder, args=(documents_path, "Documents"))
+        st.button("🖥️ 桌面 (Desktop)", use_container_width=True, on_click=_cb_set_folder, args=(desktop_path, "Desktop"))
     with q_cols[3]:
+        st.button("📁 文件 (Documents)", use_container_width=True, on_click=_cb_set_folder, args=(documents_path, "Documents"))
+    with q_cols[4]:
         st.button("📂 專案內 downloads", use_container_width=True, on_click=_cb_set_folder, args=(proj_downloads, "專案內部 downloads"))
 
 # 2. 系統資源清理控制列 (並排按鈕)
