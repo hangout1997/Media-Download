@@ -1039,13 +1039,14 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
 
-    # RAM 中的資料一次性寫入暫存 .ts，再交給 FFmpeg 封裝（單次磁碟寫入）
+    # RAM 中的資料一次性寫入暫存 .ts，再交給 FFmpeg 封裝
     with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as tmp_ts:
         tmp_ts_path = tmp_ts.name
         for chunk in segments_data:
             if chunk:
                 tmp_ts.write(chunk)
 
+    # 暫存 .ts 寫完即可釋放切片 RAM（FFmpeg 從磁碟讀 .ts，不再需要 segments_data）
     del segments_data
     gc.collect()
 
@@ -1061,15 +1062,22 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             raise ValueError(f"FFmpeg 無損封裝失敗: {proc.stderr.decode('utf-8', errors='ignore')}")
+
+        # MP4 已確實寫入硬碟，立即釋放 subprocess 的 stdout/stderr buffer 佔用的記憶體
+        proc.stdout = None
+        proc.stderr = None
+        del proc
+        gc.collect()
+
     finally:
         try:
             os.remove(tmp_ts_path)
         except Exception:
             pass
 
-
     progress_bar.empty()
     status_text.empty()
+
 
 
 def download_media(media_item, force_audio=False):
