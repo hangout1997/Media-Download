@@ -342,42 +342,84 @@ def get_media_items(url):
         if not title:
             title = "Movieffm_Video"
 
-        # 2. 提取 m3u8 串流網址
-        m3u8_url = None
+        # 2. 提取 m3u8 串流網址 (支援單部電影 1D 陣列與連續劇/動漫 2D 多集陣列)
+        items = []
         
         # 策略 A: 解析 videourls JSON 陣列
-        match = re.search(r'videourls\s*:\s*(\[\s*\{.*?\}\s*\])', html_content, re.DOTALL)
+        match = re.search(r'videourls\s*:\s*(\[\s*(?:\[.*?\]|\{.*?\})\s*\])', html_content, re.DOTALL)
         if match:
             try:
                 clean_json = match.group(1).replace(r'\/', '/')
                 data = json.loads(clean_json)
-                for item in data:
-                    u = item.get('url')
-                    if u and (u.startswith('http://') or u.startswith('https://')) and '.m3u8' in u:
-                        m3u8_url = u
-                        break
-            except Exception:
-                pass
+                
+                # 情況 1: 2D 陣列 (電視劇 / 連續劇，外層是 source 線路，內層是該線路下的各集)
+                if len(data) > 0 and isinstance(data[0], list):
+                    # 預設提取主要播放源 (第 1 個 source) 的所有集數
+                    primary_source = data[0]
+                    for idx, ep_item in enumerate(primary_source):
+                        ep_url = ep_item.get('url')
+                        if not ep_url or not ep_url.startswith('http'):
+                            continue
+                        
+                        raw_name = str(ep_item.get('name', '')).strip()
+                        if raw_name:
+                            if raw_name.isdigit():
+                                ep_title = f"{title} - 第{int(raw_name):02d}集"
+                            elif "集" in raw_name or "EP" in raw_name.upper():
+                                ep_title = f"{title} - {raw_name}"
+                            else:
+                                ep_title = f"{title} - 第{raw_name}集"
+                        else:
+                            ep_title = f"{title} - 第{idx+1:02d}集"
+                            
+                        items.append({
+                            'url': ep_url,
+                            'title': ep_title,
+                            'ext': 'mp4',
+                            'type': 'video',
+                            'headers': {
+                                'Referer': url,
+                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                            }
+                        })
 
-        # 策略 B: 正規表達式全局搜尋 m3u8
-        if not m3u8_url:
+                # 情況 2: 1D 陣列 (單部電影多來源，取第 1 個有效來源)
+                elif len(data) > 0 and isinstance(data[0], dict):
+                    for item in data:
+                        u = item.get('url')
+                        if u and (u.startswith('http://') or u.startswith('https://')) and '.m3u8' in u:
+                            items.append({
+                                'url': u,
+                                'title': title,
+                                'ext': 'mp4',
+                                'type': 'video',
+                                'headers': {
+                                    'Referer': url,
+                                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                                }
+                            })
+                            break
+            except Exception as e:
+                print(f"Error parsing Movieffm videourls: {e}")
+
+        # 策略 B: 正規表達式全局搜尋 m3u8 作為備援
+        if not items:
             m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html_content)
             if m3u8_matches:
-                m3u8_url = m3u8_matches[0].replace(r'\/', '/')
+                items.append({
+                    'url': m3u8_matches[0].replace(r'\/', '/'),
+                    'title': title,
+                    'ext': 'mp4',
+                    'type': 'video',
+                    'headers': {
+                        'Referer': url,
+                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                    }
+                })
 
-        if not m3u8_url:
+        if not items:
             raise ValueError("無法從 Movieffm 頁面中解析出有效的影片串流網址 (m3u8)。")
 
-        items.append({
-            'url': m3u8_url,
-            'title': title,
-            'ext': 'mp4',
-            'type': 'video',
-            'headers': {
-                'Referer': url,
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-            }
-        })
         return items
 
     if "missav" in url.lower():
