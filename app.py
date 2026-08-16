@@ -255,7 +255,7 @@ def normalize_input_url(url_str):
     if os.path.exists(url_str):
         return url_str
     # 若包含常見影音平台網域但漏填 https:// (例如 missav.ai/..., youtube.com/...)
-    if any(domain in url_str.lower() for domain in [".com", ".ai", ".tv", ".ws", ".net", ".org", ".me", ".co", "youtube", "facebook", "instagram", "tiktok", "twitter", "missav"]):
+    if any(domain in url_str.lower() for domain in [".com", ".ai", ".tv", ".ws", ".net", ".org", ".me", ".co", "youtube", "facebook", "instagram", "tiktok", "twitter", "missav", "movieffm"]):
         return "https://" + url_str.lstrip('/')
     # 若輸入的是 MissAV / 平台番號與代碼 (例如 JD-054791cdbc62ac51e7c79c59f86b72960)
     if re.match(r'^[a-zA-Z0-9\-_]{5,}$', url_str):
@@ -297,6 +297,89 @@ def get_media_items(url):
     url = normalize_input_url(url)
     items = []
     
+    # 支援 Movieffm.net 電影與戲劇串流解析
+    if "movieffm" in url.lower():
+        import html as html_lib
+        from curl_cffi import requests as curl_requests
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Referer": "https://www.movieffm.net/",
+        }
+        res = None
+        last_err = None
+        for imp in ["chrome124", "chrome120", "safari15_5"]:
+            try:
+                r = curl_requests.get(url, headers=headers, impersonate=imp, timeout=15)
+                if r.status_code == 200:
+                    res = r
+                    break
+                else:
+                    last_err = f"HTTP Error {r.status_code}"
+            except Exception as e:
+                last_err = str(e)
+
+        if not res:
+            raise ValueError(f"Movieffm 解析失敗: {last_err}")
+
+        html_content = res.text
+
+        # 1. 提取影片標題
+        title = "Movieffm_Video"
+        t_match = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html_content)
+        if not t_match:
+            t_match = re.search(r'<title>(.*?)</title>', html_content)
+        
+        if t_match:
+            title = html_lib.unescape(t_match.group(1)).strip()
+            title = re.sub(r'\s*-\s*Movieffm.*$', '', title, flags=re.IGNORECASE).strip()
+        else:
+            t_js = re.search(r'title\s*:\s*["\']([^"\']+)["\']', html_content)
+            if t_js:
+                title = html_lib.unescape(t_js.group(1)).strip()
+
+        title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()
+        if not title:
+            title = "Movieffm_Video"
+
+        # 2. 提取 m3u8 串流網址
+        m3u8_url = None
+        
+        # 策略 A: 解析 videourls JSON 陣列
+        match = re.search(r'videourls\s*:\s*(\[\s*\{.*?\}\s*\])', html_content, re.DOTALL)
+        if match:
+            try:
+                clean_json = match.group(1).replace(r'\/', '/')
+                data = json.loads(clean_json)
+                for item in data:
+                    u = item.get('url')
+                    if u and (u.startswith('http://') or u.startswith('https://')) and '.m3u8' in u:
+                        m3u8_url = u
+                        break
+            except Exception:
+                pass
+
+        # 策略 B: 正規表達式全局搜尋 m3u8
+        if not m3u8_url:
+            m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html_content)
+            if m3u8_matches:
+                m3u8_url = m3u8_matches[0].replace(r'\/', '/')
+
+        if not m3u8_url:
+            raise ValueError("無法從 Movieffm 頁面中解析出有效的影片串流網址 (m3u8)。")
+
+        items.append({
+            'url': m3u8_url,
+            'title': title,
+            'ext': 'mp4',
+            'type': 'video',
+            'headers': {
+                'Referer': url,
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            }
+        })
+        return items
+
     if "missav" in url.lower():
         import html as html_lib
         from curl_cffi import requests as curl_requests
@@ -592,9 +675,9 @@ def get_media_items(url):
             # 錯誤時紀錄日誌，並降級使用原有的 yt-dlp 解析
             print(f"Facebook custom photo scrape failed: {e}, falling back to yt-dlp...")
 
-    # 支援各大平台 (YouTube, X, Facebook, Instagram, TikTok 等與通用線上網址)
-    is_missav_or_gimy = any(k in url.lower() for k in ["missav", "gimymax", "gimyplus", "gimy"])
-    if not is_missav_or_gimy or any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "tiktok.com"]):
+    # 支援各大平台 (Movieffm, MissAV, Gimy, YouTube, X, Facebook, Instagram, TikTok 等與通用線上網址)
+    is_custom_hls = any(k in url.lower() for k in ["missav", "movieffm", "gimymax", "gimyplus", "gimy"])
+    if not is_custom_hls or any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "tiktok.com"]):
         # yt-dlp 的 threads extractor 綁定 threads.net，若是 .com 則先替換
         url = url.replace("threads.com", "threads.net")
         
@@ -1641,9 +1724,9 @@ st.divider()
 tab1, tab2 = st.tabs(["🌐 線上影片下載", "📁 影片音訊提取"])
 
 with tab1:
-    st.markdown("將 Gimymax, X, YouTube, Facebook, IG, TikTok 等影片網址直接下載。")
+    st.markdown("將 Movieffm, Gimymax, MissAV, X, YouTube, Facebook, IG, TikTok 等影片網址直接下載。")
     
-    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個):", placeholder="https://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
+    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個):", placeholder="https://www.movieffm.net/movies/your-name/ \nhttps://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
     
     fb_cookie_str = st.text_input("🔑 Facebook Cookie (選填，用於下載私密社團或好友貼文圖片):", type="password", placeholder="c_user=xxxx; xs=xxxx; ...", help="若要下載私密社團、好友貼文或無法下載時，請在 Chrome 開啟 Facebook -> 按 F12 -> 於 Application (應用程式) -> Cookies 中複製 c_user 與 xs 拼接（或直接複製整段 Cookie 值）並在此貼上。下載公開內容免填。")
     st.session_state.fb_cookie = fb_cookie_str
