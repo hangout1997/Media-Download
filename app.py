@@ -14,6 +14,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yt_dlp
 import streamlit as st
+import gdrive_service
 
 # ── 全域共用 Session（跨任務複用 TCP 連線池 + DNS 快取）──────────────────────
 _global_session = requests.Session()
@@ -1044,14 +1045,12 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
 
-    # RAM 中的資料一次性寫入暫存 .ts，再交給 FFmpeg 封裝
     with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as tmp_ts:
         tmp_ts_path = tmp_ts.name
         for chunk in segments_data:
             if chunk:
                 tmp_ts.write(chunk)
 
-    # 暫存 .ts 寫完即可釋放切片 RAM（FFmpeg 從磁碟讀 .ts，不再需要 segments_data）
     del segments_data
     gc.collect()
 
@@ -1068,7 +1067,6 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         if proc.returncode != 0:
             raise ValueError(f"FFmpeg 無損封裝失敗: {proc.stderr.decode('utf-8', errors='ignore')}")
 
-        # MP4 已確實寫入硬碟，立即釋放 subprocess 的 stdout/stderr buffer 佔用的記憶體
         proc.stdout = None
         proc.stderr = None
         del proc
@@ -1076,39 +1074,97 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     finally:
         try:
-            os.remove(tmp_ts_path)
+            if os.path.exists(tmp_ts_path):
+                os.remove(tmp_ts_path)
         except Exception:
             pass
 
     progress_bar.empty()
     status_text.empty()
 
+def finish_output_file(local_temp_or_final_path, filename):
+    """
+    完成檔案處理並依據儲存模式分發：
+    - 若選擇 '☁️ Google Drive 雲端直送 (Cloud API)'：
+      直接透過 Google Drive REST API 將串流上傳至 Google Drive 雲端的 'Download' 資料夾，
+      上傳完成後立刻刪除本機暫存檔並回收記憶體，確保本機硬碟 100% 零殘留！
+    - 若選擇 '📁 本地硬碟資料夾'：
+      檔案保留於使用者指定的本機資料夾中。
+    """
+    is_gdrive_mode = st.session_state.get('storage_destination') == "gdrive_cloud"
+    if is_gdrive_mode:
+        try:
+            if not gdrive_service.is_authenticated():
+                st.error("❌ 尚未完成 Google Drive 授權！請先至上方儲存設定區點擊「授權連接 Google Drive」完成登入。")
+                return False
 
+            prog_bar = st.progress(0.0)
+            status_text = st.empty()
+
+            def _upload_cb(pct, cur_bytes, tot_bytes, speed_mb):
+                pct_val = min(1.0, max(0.0, pct))
+                prog_bar.progress(pct_val)
+                cur_mb = cur_bytes / 1024 / 1024
+                tot_mb = tot_bytes / 1024 / 1024
+                status_text.markdown(f"☁️ **Google Drive 雲端直送中**: `{pct_val*100:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB) | 上傳速度: `{speed_mb:.2f} MB/s`")
+
+            with st.spinner(f"☁️ 正在直送至 Google Drive 雲端 /Download/{filename}..."):
+                res = gdrive_service.upload_file_directly_to_gdrive(
+                    local_temp_or_final_path,
+                    original_filename=filename,
+                    progress_callback=_upload_cb
+                )
+
+            prog_bar.empty()
+            status_text.empty()
+
+            link = res.get('webViewLink') if res else None
+            link_md = f" [🔗 點此在 Google Drive 中查看]({link})" if link else ""
+            st.success(f"🎉 **雲端直送成功！** 檔案已直接存放於 Google Drive 雲端 `/Download/{filename}`{link_md}（本機無殘留任何檔案）")
+            return True
+        except Exception as e:
+            show_error_log_box(f"❌ Google Drive 雲端直送失敗: {e}", traceback.format_exc(), title="Google Drive API 上傳錯誤")
+            return False
+        finally:
+            if os.path.exists(local_temp_or_final_path):
+                try:
+                    os.remove(local_temp_or_final_path)
+                except Exception:
+                    pass
+            gc.collect()
+    else:
+        st.success(f"✅ 下載完成！檔案已儲存至本機: `{local_temp_or_final_path}`")
+        gc.collect()
+        return True
 
 def download_media(media_item, force_audio=False):
-
     title = media_item['title']
     media_url = media_item['url']
     media_type = media_item['type']
     
     st.info(f"📍 正在處理媒體: **{title}** ({media_type})")
     
-    # 決定最終副檔名
     if force_audio:
         ext = "mp3"
     else:
         ext = media_item['ext']
     
-    downloads_dir = st.session_state.get('download_dir', load_download_dir())
-    os.makedirs(downloads_dir, exist_ok=True)
-    out_path = os.path.join(downloads_dir, f"{title}.{ext}")
-    
-    # 優化 1：下載前檢查，避免重複下載覆寫
-    if os.path.exists(out_path):
-        st.success(f"⏭️ 檔案已存在，自動跳過: `{title}.{ext}`")
-        return
+    filename = f"{title}.{ext}"
+    is_gdrive = st.session_state.get('storage_destination') == "gdrive_cloud"
+
+    if is_gdrive:
+        temp_dir = tempfile.gettempdir()
+        out_path = os.path.join(temp_dir, f"gdrive_tmp_{int(time.time()*1000)}_{filename}")
+        st.info(f"☁️ 檔案將在 RAM/暫存封裝後，**直接直送至 Google Drive 雲端 `/Download/{filename}`**（不保留於本機）")
+    else:
+        downloads_dir = st.session_state.get('download_dir', load_download_dir())
+        os.makedirs(downloads_dir, exist_ok=True)
+        out_path = os.path.join(downloads_dir, filename)
         
-    st.info(f"📍 檔案將以 {ext.upper()} 格式儲存至: `{out_path}`")
+        if os.path.exists(out_path):
+            st.success(f"⏭️ 檔案已存在，自動跳過: `{filename}`")
+            return
+        st.info(f"📍 檔案將以 {ext.upper()} 格式儲存至本機: `{out_path}`")
     
     try:
         if media_type == 'image':
@@ -1117,22 +1173,18 @@ def download_media(media_item, force_audio=False):
                 response.raise_for_status()
                 with open(out_path, "wb") as f:
                     f.write(response.content)
-            st.success(f"✅ 圖片下載完成！`{title}.{ext}`")
+            finish_output_file(out_path, filename)
             return
 
         extra_headers = media_item.get('headers', {})
 
-        # 優先嘗試 16 線程平行極速 HLS 下載
         if "m3u8" in media_url and not force_audio:
             try:
                 download_fast_parallel_hls(media_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
-                st.success(f"✅ 極速下載完成！檔案已儲存至: `{out_path}`")
-                gc.collect()
                 return
             except Exception as hls_err:
                 st.warning(f"⚠️ 多線程下載失敗 ({hls_err})，降級使用標準 FFmpeg 串流處理...")
 
-        # 針對 YouTube 平台預設鎖定 1080p 高清畫質與音訊自動無損合併
         webpage_url = media_item.get('webpage_url', '')
         is_youtube = any(k in media_url or k in webpage_url for k in ["youtube.com", "youtu.be", "googlevideo.com"])
 
@@ -1158,9 +1210,18 @@ def download_media(media_item, force_audio=False):
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         ydl.download([target_url])
 
-                if os.path.exists(out_path) or any(os.path.exists(f"{out_base}.{e}") for e in ["mp4", "mkv", "webm"]):
-                    st.success(f"✅ 下載完成！1080p 影片已儲存至: `{out_path}`")
-                    gc.collect()
+                actual_out = None
+                if os.path.exists(out_path):
+                    actual_out = out_path
+                else:
+                    for e in ["mp4", "mkv", "webm"]:
+                        candidate = f"{out_base}.{e}"
+                        if os.path.exists(candidate):
+                            actual_out = candidate
+                            break
+
+                if actual_out:
+                    finish_output_file(actual_out, filename)
                     return
                 else:
                     show_error_log_box("❌ 下載失敗！無法產生影片檔案。", f"Target Output Path: {out_path}", title="YouTube 下載失敗", url=target_url)
@@ -1169,7 +1230,6 @@ def download_media(media_item, force_audio=False):
                 show_error_log_box(f"❌ YouTube 下載失敗: {yt_err}", traceback.format_exc(), title="YouTube 下載詳細錯誤日誌", url=target_url)
                 return
 
-        # 驗證 media_url 是否為合法的 HTTP/HTTPS 網址或本機檔案
         is_valid_url = isinstance(media_url, str) and (media_url.startswith("http://") or media_url.startswith("https://"))
         is_valid_file = isinstance(media_url, str) and os.path.exists(media_url)
 
@@ -1181,17 +1241,14 @@ def download_media(media_item, force_audio=False):
             )
             return
 
-        # Determine if we need to add custom headers (like Referer for MissAV)
         headers_arg = []
         if extra_headers:
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in extra_headers.items())
             headers_arg = ["-headers", headers_str]
         
-        # Add allowed_segment_extensions ALL and extension_picky 0 for HLS urls to support .jpeg segment files (like MissAV)
         if "m3u8" in media_url:
             headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
 
-        # 影片處理 (含轉音訊)
         if force_audio:
             ffmpeg_cmd = [
                 "ffmpeg", "-y"
@@ -1204,7 +1261,6 @@ def download_media(media_item, force_audio=False):
             ]
             label_text = "音訊轉碼"
         else:
-            # ── FFmpeg reconnect 參數：遇到網路抖動自動重連，不中斷 ──────────
             reconnect_args = [
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
@@ -1225,7 +1281,6 @@ def download_media(media_item, force_audio=False):
             ]
             label_text = "影片下載"
         
-        # 先獲取媒體總時長 (用於進度百分比計算)
         total_dur = get_media_duration(media_url, headers=extra_headers)
 
         returncode, stderr_log = run_ffmpeg_with_progress(
@@ -1233,7 +1288,7 @@ def download_media(media_item, force_audio=False):
         )
 
         if returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            st.success(f"✅ 下載完成！檔案已儲存至: `{out_path}`")
+            finish_output_file(out_path, filename)
         else:
             show_error_log_box("❌ FFmpeg 下載失敗！", stderr_log, url=media_url)
         
@@ -1247,10 +1302,14 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         base_name = title
     else:
         base_name = os.path.splitext(os.path.basename(video_path))[0]
-    out_dir = st.session_state.get('download_dir', load_download_dir())
-    os.makedirs(out_dir, exist_ok=True)
+        
+    is_gdrive = st.session_state.get('storage_destination') == "gdrive_cloud"
+    if is_gdrive:
+        out_dir = tempfile.gettempdir()
+    else:
+        out_dir = st.session_state.get('download_dir', load_download_dir())
+        os.makedirs(out_dir, exist_ok=True)
     
-    # 驗證 video_path 是否為合法網址或本機檔案
     is_valid_url = isinstance(video_path, str) and (video_path.startswith("http://") or video_path.startswith("https://"))
     is_valid_file = isinstance(video_path, str) and os.path.exists(video_path)
 
@@ -1262,12 +1321,12 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         )
         return
 
-    # 優先處置：針對線上網址 (YouTube 或其他線上影音平台) 使用 yt-dlp 提取音訊 (防止將 HTML 網頁傳給 FFmpeg 引發 Invalid data found 錯誤)
     is_youtube_or_online = is_valid_url and ("m3u8" not in video_path.lower())
     if is_youtube_or_online:
         target_ext = "mp3" if audio_format == "MP3" else ("m4a" if audio_format == "M4A" else "mp3")
-        expected_out_path = os.path.join(out_dir, f"{base_name}.{target_ext}")
-        if os.path.exists(expected_out_path):
+        filename = f"{base_name}.{target_ext}"
+        expected_out_path = os.path.join(out_dir, filename)
+        if not is_gdrive and os.path.exists(expected_out_path):
             st.success(f"⏭️ 檔案已存在: `{expected_out_path}`")
             return
 
@@ -1306,7 +1365,6 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([video_path])
             
-            # 檢查產出檔 (比對精確檔名或去除引號差檔名)
             matched_file = None
             if os.path.exists(expected_out_path):
                 matched_file = expected_out_path
@@ -1442,56 +1500,8 @@ if "download_dir" not in st.session_state:
     st.session_state.download_dir = load_download_dir()
 if "main_dir_input" not in st.session_state:
     st.session_state.main_dir_input = st.session_state.download_dir
-
-def find_google_drive_path(target_subfolder="Download"):
-    """自動偵測系統中的 Google Drive 雲端硬碟掛載路徑，並預設指向 target_subfolder (Download)。"""
-    base_gd_path = None
-    
-    # 1. 檢查 macOS CloudStorage
-    cloud_storage = os.path.expanduser("~/Library/CloudStorage")
-    if os.path.exists(cloud_storage):
-        import glob
-        gd_dirs = sorted(glob.glob(os.path.join(cloud_storage, "GoogleDrive*")), reverse=True)
-        for gd in gd_dirs:
-            for sub in ["我的雲端硬碟", "My Drive", ""]:
-                p = os.path.join(gd, sub) if sub else gd
-                if os.path.exists(p) and os.path.isdir(p):
-                    base_gd_path = p
-                    break
-            if base_gd_path:
-                break
-                    
-    # 2. 檢查常用掛載點或家目錄
-    if not base_gd_path:
-        home = os.path.expanduser("~")
-        candidates = [
-            os.path.join(home, "Google Drive"),
-            os.path.join(home, "GoogleDrive"),
-            os.path.join(home, "Google 雲端硬碟"),
-            "/Volumes/GoogleDrive",
-            "/Volumes/Google Drive",
-        ]
-        for c in candidates:
-            if os.path.exists(c) and os.path.isdir(c):
-                for sub in ["我的雲端硬碟", "My Drive", ""]:
-                    p = os.path.join(c, sub) if sub else c
-                    if os.path.exists(p) and os.path.isdir(p):
-                        base_gd_path = p
-                        break
-            if base_gd_path:
-                break
-                
-    if base_gd_path:
-        if target_subfolder:
-            target_path = os.path.join(base_gd_path, target_subfolder)
-            try:
-                os.makedirs(target_path, exist_ok=True)
-            except Exception:
-                pass
-            return target_path
-        return base_gd_path
-
-    return None
+if "storage_destination" not in st.session_state:
+    st.session_state.storage_destination = "local"
 
 # 回呼函數 (Callbacks: 於 Widget 實例化前優先執行，允許修改 session_state)
 def _cb_choose_folder():
@@ -1510,16 +1520,6 @@ def _cb_set_folder(target_path, name):
     st.session_state.main_dir_input = saved
     st.session_state.pending_toast = (f"✅ 已切換至 {name}", "📁")
 
-def _cb_set_gdrive():
-    gd_path = find_google_drive_path()
-    if gd_path and os.path.exists(gd_path):
-        saved = save_download_dir(gd_path)
-        st.session_state.download_dir = saved
-        st.session_state.main_dir_input = saved
-        st.session_state.pending_toast = (f"✅ 已切換至 Google Drive 雲端硬碟：\n{saved}", "☁️")
-    else:
-        st.session_state.pending_toast = ("⚠️ 未偵測到本機 Google Drive 掛載路徑，請確認 Google Drive 桌面版已開啟", "⚠️")
-
 def _cb_dir_input_change():
     val = st.session_state.main_dir_input
     if val:
@@ -1532,39 +1532,85 @@ if "pending_toast" in st.session_state:
 
 st.title("🎬 媒體下載與音訊提取器")
 
-# 1. 儲存資料夾控制列 (主要區域)
-col_dir1, col_dir2 = st.columns([3, 1])
-with col_dir1:
-    st.text_input(
-        "📁 下載儲存資料夾:",
-        key="main_dir_input",
-        on_change=_cb_dir_input_change,
-        help="所有下載與音訊檔都會儲存至此資料夾"
-    )
+# 1. 儲存目標選擇區
+dest_option = st.radio(
+    "📦 **儲存目標模式**:",
+    options=["📁 本機硬碟資料夾 (Local Disk)", "☁️ Google Drive 雲端直送 (Cloud API - 不存本地硬碟)"],
+    index=0 if st.session_state.storage_destination == "local" else 1,
+    horizontal=True,
+    help="選擇是否直接透過 Google Drive 官方 REST API 將檔案直接上傳至雲端 /Download/ 資料夾，完全不保留於本機硬碟。"
+)
 
-with col_dir2:
-    st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
-    st.button("📂 選擇資料夾", key="main_browse_btn", use_container_width=True, on_click=_cb_choose_folder)
+if "Google Drive" in dest_option:
+    st.session_state.storage_destination = "gdrive_cloud"
+else:
+    st.session_state.storage_destination = "local"
 
-# 快捷資料夾選區 (常用捷徑)
-with st.expander("⚡ 常用儲存位置快捷切換", expanded=False):
-    q_cols = st.columns(5)
-    home_dir = os.path.expanduser("~")
-    downloads_path = os.path.join(home_dir, "Downloads")
-    desktop_path = os.path.join(home_dir, "Desktop")
-    documents_path = os.path.join(home_dir, "Documents")
-    proj_downloads = os.path.join(os.path.dirname(__file__), "downloads")
-    
-    with q_cols[0]:
-        st.button("📥 下載 (Downloads)", use_container_width=True, on_click=_cb_set_folder, args=(downloads_path, "Downloads"))
-    with q_cols[1]:
-        st.button("☁️ Google Drive", use_container_width=True, on_click=_cb_set_gdrive, help="直接將下載檔案儲存至 Google Drive 雲端硬碟")
-    with q_cols[2]:
-        st.button("🖥️ 桌面 (Desktop)", use_container_width=True, on_click=_cb_set_folder, args=(desktop_path, "Desktop"))
-    with q_cols[3]:
-        st.button("📁 文件 (Documents)", use_container_width=True, on_click=_cb_set_folder, args=(documents_path, "Documents"))
-    with q_cols[4]:
-        st.button("📂 專案內 downloads", use_container_width=True, on_click=_cb_set_folder, args=(proj_downloads, "專案內部 downloads"))
+if st.session_state.storage_destination == "gdrive_cloud":
+    # 檢查 Google Drive 授權狀態
+    is_auth = gdrive_service.is_authenticated()
+    if is_auth:
+        user_email = gdrive_service.get_connected_account_email()
+        col_g1, col_g2 = st.columns([4, 1])
+        with col_g1:
+            st.success(f"🟢 **Google Drive 雲端已連接**：`{user_email}` ｜ 預設目標：`Google Drive 雲端 /Download/`")
+        with col_g2:
+            if st.button("🚪 登出帳號", use_container_width=True):
+                gdrive_service.revoke_gdrive_auth()
+                st.rerun()
+    else:
+        st.warning("⚠️ 尚未連接 Google Drive 帳號。請先完成 OAuth 授權以啟用雲端直送功能：")
+        cred_path = gdrive_service.get_credentials_path()
+        if cred_path:
+            if st.button("🔑 點此授權連接 Google Drive (開啟瀏覽器授權登入)", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("正在開啟 Google 授權頁面..."):
+                        gdrive_service.get_gdrive_service()
+                    st.success("✅ Google Drive 授權成功！")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 授權失敗: {e}")
+        else:
+            st.info("💡 **首次連接設定**：請將從 Google Cloud Console 下載的 `credentials.json` 放入專案資料夾，或透過下方直接上傳：")
+            uploaded_cred = st.file_uploader("上傳 Google OAuth credentials.json:", type=["json"])
+            if uploaded_cred:
+                target_cred = os.path.join(os.path.dirname(__file__), "credentials.json")
+                with open(target_cred, "wb") as f:
+                    f.write(uploaded_cred.getbuffer())
+                st.success("✅ `credentials.json` 已成功儲存！請點擊按鈕進行授權：")
+                st.rerun()
+else:
+    # 本地硬碟模式控制列
+    col_dir1, col_dir2 = st.columns([3, 1])
+    with col_dir1:
+        st.text_input(
+            "📁 下載儲存資料夾:",
+            key="main_dir_input",
+            on_change=_cb_dir_input_change,
+            help="所有下載與音訊檔都會儲存至此資料夾"
+        )
+
+    with col_dir2:
+        st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+        st.button("📂 選擇資料夾", key="main_browse_btn", use_container_width=True, on_click=_cb_choose_folder)
+
+    # 快捷資料夾選區 (常用捷徑)
+    with st.expander("⚡ 常用儲存位置快捷切換", expanded=False):
+        q_cols = st.columns(4)
+        home_dir = os.path.expanduser("~")
+        downloads_path = os.path.join(home_dir, "Downloads")
+        desktop_path = os.path.join(home_dir, "Desktop")
+        documents_path = os.path.join(home_dir, "Documents")
+        proj_downloads = os.path.join(os.path.dirname(__file__), "downloads")
+        
+        with q_cols[0]:
+            st.button("📥 下載 (Downloads)", use_container_width=True, on_click=_cb_set_folder, args=(downloads_path, "Downloads"))
+        with q_cols[1]:
+            st.button("🖥️ 桌面 (Desktop)", use_container_width=True, on_click=_cb_set_folder, args=(desktop_path, "Desktop"))
+        with q_cols[2]:
+            st.button("📁 文件 (Documents)", use_container_width=True, on_click=_cb_set_folder, args=(documents_path, "Documents"))
+        with q_cols[3]:
+            st.button("📂 專案內 downloads", use_container_width=True, on_click=_cb_set_folder, args=(proj_downloads, "專案內部 downloads"))
 
 # 2. 系統資源清理控制列 (並排按鈕)
 col_res1, col_res2 = st.columns(2)
