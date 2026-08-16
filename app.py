@@ -1143,11 +1143,8 @@ def download_media(media_item, force_audio=False):
                     'legacy_server_connect': True,
                     'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
                     'merge_output_format': 'mp4',
-                    # ── 速度優化：多線程 fragment 下載 ──────────────────────
-                    'concurrent_fragment_downloads': 8,
-                    'http_chunk_size': 10 * 1024 * 1024,  # 10 MB 分塊
                 }
-                with st.spinner("⏳ 正在下載 YouTube 1080p 高清影片（多線程加速中）..."):
+                with st.spinner("⏳ 正在下載 YouTube 1080p 高清影片..."):
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         ydl.download([target_url])
 
@@ -1289,9 +1286,6 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 'legacy_server_connect': True,
                 'format': 'bestaudio/best',
                 'postprocessors': postprocessors,
-                # ── 速度優化 ──────────────────────────────────────────────
-                'concurrent_fragment_downloads': 8,
-                'http_chunk_size': 10 * 1024 * 1024,
             }
             with st.spinner("⏳ 正在透過 yt-dlp 從線上網址提取高品質音訊..."):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
