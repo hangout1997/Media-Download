@@ -1443,8 +1443,10 @@ if "download_dir" not in st.session_state:
 if "main_dir_input" not in st.session_state:
     st.session_state.main_dir_input = st.session_state.download_dir
 
-def find_google_drive_path():
-    """自動偵測系統中的 Google Drive 雲端硬碟掛載路徑。"""
+def find_google_drive_path(target_subfolder="Download"):
+    """自動偵測系統中的 Google Drive 雲端硬碟掛載路徑，並預設指向 target_subfolder (Download)。"""
+    base_gd_path = None
+    
     # 1. 檢查 macOS CloudStorage
     cloud_storage = os.path.expanduser("~/Library/CloudStorage")
     if os.path.exists(cloud_storage):
@@ -1454,23 +1456,41 @@ def find_google_drive_path():
             for sub in ["我的雲端硬碟", "My Drive", ""]:
                 p = os.path.join(gd, sub) if sub else gd
                 if os.path.exists(p) and os.path.isdir(p):
-                    return p
+                    base_gd_path = p
+                    break
+            if base_gd_path:
+                break
                     
     # 2. 檢查常用掛載點或家目錄
-    home = os.path.expanduser("~")
-    candidates = [
-        os.path.join(home, "Google Drive"),
-        os.path.join(home, "GoogleDrive"),
-        os.path.join(home, "Google 雲端硬碟"),
-        "/Volumes/GoogleDrive",
-        "/Volumes/Google Drive",
-    ]
-    for c in candidates:
-        if os.path.exists(c) and os.path.isdir(c):
-            for sub in ["我的雲端硬碟", "My Drive", ""]:
-                p = os.path.join(c, sub) if sub else c
-                if os.path.exists(p) and os.path.isdir(p):
-                    return p
+    if not base_gd_path:
+        home = os.path.expanduser("~")
+        candidates = [
+            os.path.join(home, "Google Drive"),
+            os.path.join(home, "GoogleDrive"),
+            os.path.join(home, "Google 雲端硬碟"),
+            "/Volumes/GoogleDrive",
+            "/Volumes/Google Drive",
+        ]
+        for c in candidates:
+            if os.path.exists(c) and os.path.isdir(c):
+                for sub in ["我的雲端硬碟", "My Drive", ""]:
+                    p = os.path.join(c, sub) if sub else c
+                    if os.path.exists(p) and os.path.isdir(p):
+                        base_gd_path = p
+                        break
+            if base_gd_path:
+                break
+                
+    if base_gd_path:
+        if target_subfolder:
+            target_path = os.path.join(base_gd_path, target_subfolder)
+            try:
+                os.makedirs(target_path, exist_ok=True)
+            except Exception:
+                pass
+            return target_path
+        return base_gd_path
+
     return None
 
 # 回呼函數 (Callbacks: 於 Widget 實例化前優先執行，允許修改 session_state)
