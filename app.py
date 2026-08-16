@@ -610,6 +610,11 @@ def get_media_items(url):
             'nocheckcertificate': True,
             'legacy_server_connect': True,
             'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web', 'ios'],
+                }
+            },
         }
         if temp_cookie_path:
             ydl_opts['cookiefile'] = temp_cookie_path
@@ -1143,6 +1148,11 @@ def download_media(media_item, force_audio=False):
                     'legacy_server_connect': True,
                     'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
                     'merge_output_format': 'mp4',
+                    'extractor_args': {
+                        'youtube': {
+                            'player_client': ['android', 'web', 'ios'],
+                        }
+                    },
                 }
                 with st.spinner("⏳ 正在下載 YouTube 1080p 高清影片..."):
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1286,6 +1296,11 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 'legacy_server_connect': True,
                 'format': 'bestaudio/best',
                 'postprocessors': postprocessors,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android', 'web', 'ios'],
+                    }
+                },
             }
             with st.spinner("⏳ 正在透過 yt-dlp 從線上網址提取高品質音訊..."):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
