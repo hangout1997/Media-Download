@@ -363,14 +363,14 @@ def get_media_items(url):
                         
                         raw_name = str(ep_item.get('name', '')).strip()
                         if raw_name:
-                            if raw_name.isdigit():
-                                ep_title = f"{title} - 第{int(raw_name):02d}集"
-                            elif "集" in raw_name or "EP" in raw_name.upper():
-                                ep_title = f"{title} - {raw_name}"
+                            num_match = re.search(r'\d+', raw_name)
+                            if num_match:
+                                ep_num = int(num_match.group())
+                                ep_title = f"{title} - EP{ep_num:02d}"
                             else:
-                                ep_title = f"{title} - 第{raw_name}集"
+                                ep_title = f"{title} - {raw_name}"
                         else:
-                            ep_title = f"{title} - 第{idx+1:02d}集"
+                            ep_title = f"{title} - EP{idx+1:02d}"
                             
                         items.append({
                             'url': ep_url,
