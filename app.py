@@ -356,21 +356,26 @@ def get_media_items(url):
                 if len(data) > 0 and isinstance(data[0], list):
                     # 預設提取主要播放源 (第 1 個 source) 的所有集數
                     primary_source = data[0]
+                    total_eps = len(primary_source)
                     for idx, ep_item in enumerate(primary_source):
                         ep_url = ep_item.get('url')
                         if not ep_url or not ep_url.startswith('http'):
                             continue
                         
-                        raw_name = str(ep_item.get('name', '')).strip()
-                        if raw_name:
-                            num_match = re.search(r'\d+', raw_name)
-                            if num_match:
-                                ep_num = int(num_match.group())
-                                ep_title = f"{title} - EP{ep_num:02d}"
-                            else:
-                                ep_title = f"{title} - {raw_name}"
+                        # 若只有單一集，直接使用原標題，不附加 - EP01
+                        if total_eps == 1:
+                            ep_title = title
                         else:
-                            ep_title = f"{title} - EP{idx+1:02d}"
+                            raw_name = str(ep_item.get('name', '')).strip()
+                            if raw_name:
+                                num_match = re.search(r'\d+', raw_name)
+                                if num_match:
+                                    ep_num = int(num_match.group())
+                                    ep_title = f"{title} - EP{ep_num:02d}"
+                                else:
+                                    ep_title = f"{title} - {raw_name}"
+                            else:
+                                ep_title = f"{title} - EP{idx+1:02d}"
                             
                         items.append({
                             'url': ep_url,
