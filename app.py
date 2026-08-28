@@ -1453,7 +1453,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
 
     is_youtube_or_online = is_valid_url and ("m3u8" not in video_path.lower())
     if is_youtube_or_online:
-        target_ext = "mp3" if audio_format == "MP3" else ("m4a" if audio_format == "M4A" else "mp3")
+        target_ext = "mp3" if audio_format == "MP3" else ("m4a" if audio_format == "M4A" else "mp4")
         filename = f"{base_name}.{target_ext}"
         expected_out_path = os.path.join(out_dir, filename)
         if not is_gdrive and os.path.exists(expected_out_path):
@@ -1464,13 +1464,20 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
             import yt_dlp
             out_base = os.path.splitext(expected_out_path)[0]
             postprocessors = []
-            if audio_format == "MP3" or audio_format == "預設 (原始格式)":
+            if audio_format == "MP3":
                 postprocessors.append({
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 })
             elif audio_format == "M4A":
+                postprocessors.append({
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'm4a',
+                    'preferredquality': '192',
+                })
+            else:
+                # 預設或 MP4: 提取最佳音訊後以 MP4 容器封裝 (相容 AI 轉錄)
                 postprocessors.append({
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'm4a',
@@ -1505,7 +1512,25 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                     matched_file = candidates[0]
 
             if matched_file:
-                st.success(f"✅ 提取完成！音訊已儲存至: `{matched_file}`")
+                actual_ext = os.path.splitext(matched_file)[1].lower().lstrip('.')
+                if target_ext == "mp4" and actual_ext in ["m4a", "aac"]:
+                    final_mp4_path = os.path.join(out_dir, f"{base_name}.mp4")
+                    if matched_file != final_mp4_path:
+                        try:
+                            subprocess.run(["ffmpeg", "-y", "-i", matched_file, "-vn", "-c:a", "copy", "-bsf:a", "aac_adtstoasc", final_mp4_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                            if os.path.exists(matched_file) and matched_file != final_mp4_path:
+                                os.remove(matched_file)
+                            matched_file = final_mp4_path
+                        except Exception:
+                            if os.path.exists(matched_file):
+                                os.rename(matched_file, final_mp4_path)
+                                matched_file = final_mp4_path
+                    filename = f"{base_name}.mp4"
+
+                if is_gdrive:
+                    finish_output_file(matched_file, os.path.basename(matched_file))
+                else:
+                    st.success(f"✅ 提取完成！音訊已儲存至: `{matched_file}`")
                 gc.collect()
                 return
             else:
@@ -1535,27 +1560,35 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         ext = "m4a"
         out_path = os.path.join(out_dir, f"{base_name}.{ext}")
         ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", out_path]
+    elif audio_format == "MP4" or "MP4" in audio_format:
+        ext = "mp4"
+        out_path = os.path.join(out_dir, f"{base_name}.{ext}")
+        ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", out_path]
     else:
+        # 預設 (原始格式)：AAC 音訊一律儲存為相容性最高之 MP4 容器，避免 AI 轉錄失敗
         try:
             probe_cmd = ["ffprobe", "-v", "error"] + headers_arg + ["-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
-            codec = subprocess.check_output(probe_cmd, text=True, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).strip()
+            codec = subprocess.check_output(probe_cmd, text=True, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).strip().lower()
             
-            if codec in ["aac", "mp3", "opus"]:
+            if codec == "aac":
+                ext = "mp4"
+                out_path = os.path.join(out_dir, f"{base_name}.{ext}")
+                ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "copy", "-bsf:a", "aac_adtstoasc", out_path]
+            elif codec in ["mp3", "opus"]:
                 ext = codec
-            else:
-                ext = "m4a"
-            out_path = os.path.join(out_dir, f"{base_name}.{ext}")
-            if codec in ["aac", "mp3", "opus"]:
+                out_path = os.path.join(out_dir, f"{base_name}.{ext}")
                 ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "copy", out_path]
             else:
+                ext = "mp4"
+                out_path = os.path.join(out_dir, f"{base_name}.{ext}")
                 ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", out_path]
         except Exception:
-            st.warning(f"⚠️ `{base_name}` 無法解析原始音訊格式，將預設轉換為 MP3。")
-            ext = "mp3"
+            st.warning(f"⚠️ `{base_name}` 無法解析原始音訊格式，將預設轉換為 MP4 (AAC 音訊)。")
+            ext = "mp4"
             out_path = os.path.join(out_dir, f"{base_name}.{ext}")
-            ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out_path]
+            ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", out_path]
 
-    if os.path.exists(out_path):
+    if not is_gdrive and os.path.exists(out_path):
         st.success(f"⏭️ 檔案已存在: `{out_path}`")
         return
 
@@ -1564,8 +1597,11 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         returncode, stderr_log = run_ffmpeg_with_progress(
             ffmpeg_cmd, total_duration=total_dur, label="音訊提取"
         )
-        if returncode == 0:
-            st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
+        if returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            if is_gdrive:
+                finish_output_file(out_path, f"{base_name}.{ext}")
+            else:
+                st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
         else:
             show_error_log_box(f"❌ 提取 `{base_name}` 失敗！", stderr_log)
         
@@ -1842,7 +1878,7 @@ with tab1:
 with tab2:
     st.markdown("從本地檔案或線上播放清單提取出純音訊，完全在記憶體內處理，避免硬碟損耗。")
     local_video_path = st.text_input("📁 請輸入路徑 (本地影片/資料夾，或 YouTube, FB, IG 等網址/播放清單):", placeholder="/Users/ericcheng/Movies/ 或 https://youtube.com/playlist?list=... 或 https://www.facebook.com/watch/?v=...")
-    audio_format = st.selectbox("🎵 請選擇輸出音訊格式:", ["預設 (原始格式)", "M4A", "MP3"])
+    audio_format = st.selectbox("🎵 請選擇輸出音訊格式:", ["預設 (原始格式 - AAC一律存為MP4)", "MP4 (AAC音訊 - 相容AI轉錄)", "MP3", "M4A"])
     
     if st.button("▶️ 開始提取音訊", type="primary", use_container_width=True):
         raw_input_path = local_video_path.strip()
