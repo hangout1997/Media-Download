@@ -293,6 +293,41 @@ def resolve_gimy_stream(player_url, page_url=''):
         
     return urllib.parse.urljoin(page_url, player_url)
 
+def check_m3u8_accessible(m3u8_url, headers=None, timeout=2.5):
+    """快速探測 m3u8 串流是否可用 (排除 DNS 失敗、404 等失效伺服器)。"""
+    try:
+        parsed = urllib.parse.urlparse(m3u8_url)
+        host = parsed.hostname
+        if host:
+            socket.getaddrinfo(host, 443 if parsed.scheme == 'https' else 80, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return False
+
+    req_headers = dict(_GLOBAL_HEADERS)
+    if headers:
+        req_headers.update(headers)
+    if 'Referer' not in req_headers:
+        req_headers['Referer'] = f"https://{urllib.parse.urlparse(m3u8_url).netloc}/"
+
+    try:
+        r = requests.get(m3u8_url, headers=req_headers, timeout=timeout, stream=True)
+        if r.status_code in [200, 206]:
+            chunk = next(r.iter_content(512), b"")
+            if b"#EXT" in chunk or len(chunk) > 0:
+                return True
+    except Exception:
+        pass
+
+    try:
+        from curl_cffi import requests as curl_requests
+        r = curl_requests.get(m3u8_url, headers=req_headers, impersonate="chrome124", timeout=timeout, stream=True)
+        if r.status_code in [200, 206]:
+            return True
+    except Exception:
+        pass
+
+    return False
+
 def get_media_items(url):
     url = normalize_input_url(url)
     items = []
@@ -342,7 +377,7 @@ def get_media_items(url):
         if not title:
             title = "Movieffm_Video"
 
-        # 2. 提取 m3u8 串流網址 (支援單部電影 1D 陣列與連續劇/動漫 2D 多集陣列)
+        # 2. 提取 m3u8 串流網址 (支援多線路自動探測備援、單部電影與連續劇多集)
         items = []
         
         # 策略 A: 解析 videourls JSON 陣列
@@ -352,33 +387,55 @@ def get_media_items(url):
                 clean_json = match.group(1).replace(r'\/', '/')
                 data = json.loads(clean_json)
                 
-                # 情況 1: 2D 陣列 (電視劇 / 連續劇，外層是 source 線路，內層是該線路下的各集)
+                # 情況 1: 2D 陣列 (電視劇 / 連續劇，外層是多條播放來源線路 FLV 1, FLV 2..., 內層是該線路下的各集)
                 if len(data) > 0 and isinstance(data[0], list):
-                    # 預設提取主要播放源 (第 1 個 source) 的所有集數
-                    primary_source = data[0]
-                    total_eps = len(primary_source)
-                    for idx, ep_item in enumerate(primary_source):
-                        ep_url = ep_item.get('url')
-                        if not ep_url or not ep_url.startswith('http'):
-                            continue
+                    max_len_source = max(data, key=lambda s: len(s) if isinstance(s, list) else 0)
+                    total_eps = len(max_len_source)
+                    
+                    for idx in range(total_eps):
+                        chosen_ep_url = None
+                        chosen_raw_name = ""
                         
-                        # 若只有單一集，直接使用原標題，不附加 - EP01
+                        # 依序探測各個線路 (source 0, 1, 2...) 尋找該集的有效存活串流
+                        for source_list in data:
+                            if isinstance(source_list, list) and idx < len(source_list):
+                                ep_item = source_list[idx]
+                                ep_url = ep_item.get('url')
+                                if ep_url and ep_url.startswith('http'):
+                                    if not chosen_raw_name:
+                                        chosen_raw_name = str(ep_item.get('name', '')).strip()
+                                    if check_m3u8_accessible(ep_url, headers=headers):
+                                        chosen_ep_url = ep_url
+                                        break
+                        
+                        # 若所有來源探測皆未回應，退回第一個提供該集的線路網址
+                        if not chosen_ep_url:
+                            for source_list in data:
+                                if isinstance(source_list, list) and idx < len(source_list):
+                                    ep_url = source_list[idx].get('url')
+                                    if ep_url and ep_url.startswith('http'):
+                                        chosen_ep_url = ep_url
+                                        break
+                                        
+                        if not chosen_ep_url:
+                            continue
+
+                        # 命名處理
                         if total_eps == 1:
                             ep_title = title
                         else:
-                            raw_name = str(ep_item.get('name', '')).strip()
-                            if raw_name:
-                                num_match = re.search(r'\d+', raw_name)
+                            if chosen_raw_name:
+                                num_match = re.search(r'\d+', chosen_raw_name)
                                 if num_match:
                                     ep_num = int(num_match.group())
                                     ep_title = f"{title} - EP{ep_num:02d}"
                                 else:
-                                    ep_title = f"{title} - {raw_name}"
+                                    ep_title = f"{title} - {chosen_raw_name}"
                             else:
                                 ep_title = f"{title} - EP{idx+1:02d}"
-                            
+                                
                         items.append({
-                            'url': ep_url,
+                            'url': chosen_ep_url,
                             'title': ep_title,
                             'ext': 'mp4',
                             'type': 'video',
@@ -388,29 +445,56 @@ def get_media_items(url):
                             }
                         })
 
-                # 情況 2: 1D 陣列 (單部電影多來源，取第 1 個有效來源)
+                # 情況 2: 1D 陣列 (單部電影多來源)
                 elif len(data) > 0 and isinstance(data[0], dict):
+                    valid_candidates = []
                     for item in data:
                         u = item.get('url')
                         if u and (u.startswith('http://') or u.startswith('https://')) and '.m3u8' in u:
-                            items.append({
-                                'url': u,
-                                'title': title,
-                                'ext': 'mp4',
-                                'type': 'video',
-                                'headers': {
-                                    'Referer': url,
-                                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-                                }
-                            })
+                            valid_candidates.append(u)
+                    
+                    chosen_movie_url = None
+                    for cand_url in valid_candidates:
+                        if check_m3u8_accessible(cand_url, headers=headers):
+                            chosen_movie_url = cand_url
                             break
+                            
+                    if not chosen_movie_url and valid_candidates:
+                        chosen_movie_url = valid_candidates[0]
+
+                    if chosen_movie_url:
+                        items.append({
+                            'url': chosen_movie_url,
+                            'title': title,
+                            'ext': 'mp4',
+                            'type': 'video',
+                            'headers': {
+                                'Referer': url,
+                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                            }
+                        })
             except Exception as e:
                 print(f"Error parsing Movieffm videourls: {e}")
 
         # 策略 B: 正規表達式全局搜尋 m3u8 作為備援
         if not items:
             m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html_content)
-            if m3u8_matches:
+            for m_url in m3u8_matches:
+                clean_url = m_url.replace(r'\/', '/')
+                if check_m3u8_accessible(clean_url, headers=headers):
+                    items.append({
+                        'url': clean_url,
+                        'title': title,
+                        'ext': 'mp4',
+                        'type': 'video',
+                        'headers': {
+                            'Referer': url,
+                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                        }
+                    })
+                    break
+            
+            if not items and m3u8_matches:
                 items.append({
                     'url': m3u8_matches[0].replace(r'\/', '/'),
                     'title': title,
@@ -1420,11 +1504,22 @@ def download_media(media_item, force_audio=False):
         if returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             finish_output_file(out_path, filename)
         else:
-            show_error_log_box("❌ FFmpeg 下載失敗！", stderr_log, url=media_url)
+            if any(k in stderr_log for k in ["Failed to resolve hostname", "nodename nor servname provided", "Name or service not known", "Could not resolve host", "Temporary failure in name resolution"]):
+                parsed_host = urllib.parse.urlparse(media_url).hostname or "串流伺服器"
+                friendly_msg = f"❌ 影片伺服器連線失敗：串流主機網域 `{parsed_host}` 無法解析或已失效。\n\n💡 **原因與建議**：該影片來源伺服器已下線或 CDN 網址已過期。若是在 Movieffm / Gimy 等影音網站觀看，請嘗試切換至其他播放線路 (如 FLV 2, FLV 3...)。"
+                show_error_log_box(friendly_msg, stderr_log, title="伺服器連線與 DNS 錯誤日誌", url=media_url)
+            else:
+                show_error_log_box("❌ FFmpeg 下載失敗！", stderr_log, url=media_url)
         
         gc.collect()
     except Exception as e:
-        show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=media_url)
+        err_str = str(e)
+        if any(k in err_str for k in ["Failed to resolve hostname", "nodename nor servname provided", "Name or service not known", "Could not resolve host"]):
+            parsed_host = urllib.parse.urlparse(media_url).hostname or "串流伺服器"
+            friendly_msg = f"❌ 影片伺服器連線失敗：串流主機網域 `{parsed_host}` 無法解析或已失效。\n\n💡 **原因與建議**：該影片來源伺服器已下線或 CDN 網址已過期。請嘗試切換其他播放線路。"
+            show_error_log_box(friendly_msg, traceback.format_exc(), title="DNS 解析與連線錯誤日誌", url=media_url)
+        else:
+            show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=media_url)
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
 
 def extract_local_audio(video_path, audio_format, title=None, headers=None):
