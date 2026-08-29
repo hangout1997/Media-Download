@@ -1455,6 +1455,16 @@ def download_media(media_item, force_audio=False):
             )
             return
 
+        if is_valid_url:
+            parsed_host = urllib.parse.urlparse(media_url).hostname
+            if parsed_host:
+                try:
+                    socket.getaddrinfo(parsed_host, 443 if media_url.startswith("https") else 80, proto=socket.IPPROTO_TCP)
+                except Exception:
+                    friendly_msg = f"❌ 影片伺服器網域失效：主機名稱 `{parsed_host}` 在網際網路上不存在 (DNS 解析失敗)。\n\n💡 **原因與建議**：該影片來源伺服器已被官方下線或 CDN 網域已過期失效。\n若您是在 Movieffm / Gimy 等影音網站觀看，請回到該網頁**切換其他播放線路**（如 FLV 2、FLV 3、線路 B、海外線路等）再進行下載。"
+                    show_error_log_box(friendly_msg, f"Target Host: {parsed_host}\nTarget URL: {media_url}\nError: [Errno 8] nodename nor servname provided, or not known", title="DNS 無效與伺服器已下線診斷", url=media_url)
+                    return
+
         headers_arg = []
         if extra_headers:
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in extra_headers.items())
@@ -1545,6 +1555,16 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
             url=video_path
         )
         return
+
+    if is_valid_url:
+        parsed_host = urllib.parse.urlparse(video_path).hostname
+        if parsed_host:
+            try:
+                socket.getaddrinfo(parsed_host, 443 if video_path.startswith("https") else 80, proto=socket.IPPROTO_TCP)
+            except Exception:
+                friendly_msg = f"❌ 影片伺服器網域失效：主機名稱 `{parsed_host}` 在網際網路上不存在 (DNS 解析失敗)。\n\n💡 **原因與建議**：該影片來源伺服器已被官方下線或 CDN 網域已過期失效。\n若您是在 Movieffm / Gimy 等影音網站觀看，請回到該網頁**切換其他播放線路**（如 FLV 2、FLV 3、線路 B、海外線路等）再進行音訊提取。"
+                show_error_log_box(friendly_msg, f"Target Host: {parsed_host}\nTarget URL: {video_path}\nError: [Errno 8] nodename nor servname provided, or not known", title="DNS 無效與伺服器已下線診斷", url=video_path)
+                return
 
     is_youtube_or_online = is_valid_url and ("m3u8" not in video_path.lower())
     if is_youtube_or_online:
@@ -1698,11 +1718,22 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
             else:
                 st.success(f"✅ 提取完成！音訊已儲存至: `{out_path}`")
         else:
-            show_error_log_box(f"❌ 提取 `{base_name}` 失敗！", stderr_log)
+            if any(k in stderr_log for k in ["Failed to resolve hostname", "nodename nor servname provided", "Name or service not known", "Could not resolve host", "Temporary failure in name resolution"]):
+                parsed_host = urllib.parse.urlparse(video_path).hostname or "串流伺服器"
+                friendly_msg = f"❌ 影片伺服器連線失敗：主機網域 `{parsed_host}` 無法解析或已失效。\n\n💡 **原因與建議**：該影片來源伺服器已下線或 CDN 網址已過期。若是在 Movieffm / Gimy 等影音網站，請嘗試切換至其他播放線路 (如 FLV 2, FLV 3...)。"
+                show_error_log_box(friendly_msg, stderr_log, title="伺服器連線與 DNS 錯誤日誌", url=video_path)
+            else:
+                show_error_log_box(f"❌ 提取 `{base_name}` 失敗！", stderr_log, url=video_path)
         
         gc.collect()
     except Exception as e:
-        show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊")
+        err_str = str(e)
+        if any(k in err_str for k in ["Failed to resolve hostname", "nodename nor servname provided", "Name or service not known", "Could not resolve host"]):
+            parsed_host = urllib.parse.urlparse(video_path).hostname or "串流伺服器"
+            friendly_msg = f"❌ 影片伺服器連線失敗：主機網域 `{parsed_host}` 無法解析或已失效。\n\n💡 **原因與建議**：該影片來源伺服器已下線或 CDN 網址已過期。請嘗試切換其他播放線路。"
+            show_error_log_box(friendly_msg, traceback.format_exc(), title="DNS 解析與連線錯誤日誌", url=video_path)
+        else:
+            show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=video_path)
 
 def release_resources():
     released_info = []
