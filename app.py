@@ -293,7 +293,7 @@ def resolve_gimy_stream(player_url, page_url=''):
         
     return urllib.parse.urljoin(page_url, player_url)
 
-def check_m3u8_accessible(m3u8_url, headers=None, timeout=2.5):
+def check_m3u8_accessible(m3u8_url, headers=None, timeout=3.5):
     """快速探測 m3u8 串流是否可用 (排除 DNS 失敗、404 等失效伺服器)。"""
     try:
         parsed = urllib.parse.urlparse(m3u8_url)
@@ -306,9 +306,8 @@ def check_m3u8_accessible(m3u8_url, headers=None, timeout=2.5):
     req_headers = dict(_GLOBAL_HEADERS)
     if headers:
         req_headers.update(headers)
-    if 'Referer' not in req_headers:
-        req_headers['Referer'] = f"https://{urllib.parse.urlparse(m3u8_url).netloc}/"
 
+    # 1. requests 快速探測
     try:
         r = requests.get(m3u8_url, headers=req_headers, timeout=timeout, stream=True)
         if r.status_code in [200, 206]:
@@ -318,10 +317,21 @@ def check_m3u8_accessible(m3u8_url, headers=None, timeout=2.5):
     except Exception:
         pass
 
+    # 2. 備援：Referer https://www.movieffm.net/
+    try:
+        h2 = dict(req_headers)
+        h2['Referer'] = 'https://www.movieffm.net/'
+        r = requests.get(m3u8_url, headers=h2, timeout=timeout, stream=True)
+        if r.status_code in [200, 206]:
+            return True
+    except Exception:
+        pass
+
+    # 3. 備援：curl_cffi 模擬瀏覽器
     try:
         from curl_cffi import requests as curl_requests
-        r = curl_requests.get(m3u8_url, headers=req_headers, impersonate="chrome124", timeout=timeout, stream=True)
-        if r.status_code in [200, 206]:
+        r = curl_requests.get(m3u8_url, headers=req_headers, impersonate="chrome124", timeout=timeout)
+        if r.status_code in [200, 206] and len(r.content) > 0:
             return True
     except Exception:
         pass
@@ -389,16 +399,29 @@ def get_media_items(url):
                 
                 # 情況 1: 2D 陣列 (電視劇 / 連續劇，外層是多條播放來源線路 FLV 1, FLV 2..., 內層是該線路下的各集)
                 if len(data) > 0 and isinstance(data[0], list):
-                    max_len_source = max(data, key=lambda s: len(s) if isinstance(s, list) else 0)
-                    total_eps = len(max_len_source)
+                    # 找出所有可用存活的線路
+                    valid_sources = []
+                    for s_idx, src in enumerate(data):
+                        if isinstance(src, list) and len(src) > 0:
+                            ep1_url = src[0].get("url")
+                            if ep1_url and check_m3u8_accessible(ep1_url, headers=headers):
+                                valid_sources.append((s_idx, src, len(src)))
+
+                    # 決定標準集數：取第一條可用主線路的集數，或有效線路的眾數集數
+                    if valid_sources:
+                        primary_source = valid_sources[0][1]
+                        total_eps = len(primary_source)
+                    else:
+                        primary_source = data[0] if len(data) > 0 and isinstance(data[0], list) else []
+                        total_eps = len(primary_source)
                     
                     for idx in range(total_eps):
                         chosen_ep_url = None
                         chosen_raw_name = ""
                         
-                        # 依序探測各個線路 (source 0, 1, 2...) 尋找該集的有效存活串流
-                        for source_list in data:
-                            if isinstance(source_list, list) and idx < len(source_list):
+                        # 優先從存活線路中探測該集的有效存活串流
+                        for _, source_list, _ in valid_sources:
+                            if idx < len(source_list):
                                 ep_item = source_list[idx]
                                 ep_url = ep_item.get('url')
                                 if ep_url and ep_url.startswith('http'):
@@ -408,15 +431,25 @@ def get_media_items(url):
                                         chosen_ep_url = ep_url
                                         break
                         
-                        # 若所有來源探測皆未回應，退回第一個提供該集的線路網址
+                        # 若存活線路探測不到，再從所有線路中探測
                         if not chosen_ep_url:
                             for source_list in data:
                                 if isinstance(source_list, list) and idx < len(source_list):
-                                    ep_url = source_list[idx].get('url')
+                                    ep_item = source_list[idx]
+                                    ep_url = ep_item.get('url')
                                     if ep_url and ep_url.startswith('http'):
-                                        chosen_ep_url = ep_url
-                                        break
+                                        if not chosen_raw_name:
+                                            chosen_raw_name = str(ep_item.get('name', '')).strip()
+                                        if check_m3u8_accessible(ep_url, headers=headers):
+                                            chosen_ep_url = ep_url
+                                            break
                                         
+                        # 退回主線路
+                        if not chosen_ep_url and idx < len(primary_source):
+                            chosen_ep_url = primary_source[idx].get('url')
+                            if not chosen_raw_name:
+                                chosen_raw_name = str(primary_source[idx].get('name', '')).strip()
+
                         if not chosen_ep_url:
                             continue
 
