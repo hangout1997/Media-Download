@@ -1101,8 +1101,111 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     stderr_log = "\n".join(stderr_lines)
     return process.returncode, stderr_log
 
+def filter_and_clean_m3u8_ads(m3u8_text, base_url):
+    """
+    智慧過濾 m3u8 中的賭博與插播廣告切片 (片頭貼片廣告、中插短廣告、第三方廣告 CDN 切片)。
+    回傳: (clean_segment_urls, clean_segment_durations, clean_m3u8_text, filtered_ad_count, filtered_ad_duration)
+    """
+    lines = m3u8_text.splitlines()
+    raw_segments = []
+    current_dur = 2.0
+    disc_flag = False
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-DISCONTINUITY"):
+            disc_flag = True
+        elif line.startswith("#EXTINF:"):
+            dur_match = re.search(r"#EXTINF:([\d\.]+)", line)
+            if dur_match:
+                current_dur = float(dur_match.group(1))
+        elif not line.startswith("#"):
+            full_url = urllib.parse.urljoin(base_url, line)
+            raw_segments.append({
+                'url': full_url,
+                'raw_line': line,
+                'dur': current_dur,
+                'disc': disc_flag
+            })
+            disc_flag = False
+            current_dur = 2.0
+
+    if not raw_segments:
+        return [], [], m3u8_text, 0, 0.0
+
+    from collections import Counter
+    hosts = [urllib.parse.urlparse(s['url']).netloc for s in raw_segments]
+    host_counts = Counter(hosts)
+    main_host, main_host_count = host_counts.most_common(1)[0]
+    is_mostly_main_host = (main_host_count / len(raw_segments)) > 0.7
+
+    # 識別 sections (由 discontinuity 分割的區塊)
+    sections = []
+    cur_sec = []
+    for s in raw_segments:
+        if s['disc'] and cur_sec:
+            sections.append(cur_sec)
+            cur_sec = []
+        cur_sec.append(s)
+    if cur_sec:
+        sections.append(cur_sec)
+
+    clean_segments = []
+    filtered_ads = []
+    ad_keywords = ["/ad/", "/ads/", "/adv/", "guanggao", "advertisement", "notice.ts", "banner", "ad_"]
+
+    for sec_idx, sec in enumerate(sections):
+        sec_dur = sum(s['dur'] for s in sec)
+        sec_len = len(sec)
+        is_ad_section = False
+
+        # 規則 A: 片頭貼片廣告判定
+        # 第一個 section 在第一個 discontinuity 之前，時長在 3s ~ 25s 之間，且後續總長度 > 300s (5分鐘以上正片)
+        total_remaining_dur = sum(sum(s['dur'] for s in other_sec) for other_sec in sections[sec_idx+1:])
+        if sec_idx == 0 and len(sections) > 1:
+            if 3.0 <= sec_dur <= 25.0 and total_remaining_dur > 300.0:
+                is_ad_section = True
+
+        # 規則 B: 中插短廣告判定 (前後皆有 discontinuity，時長極短 <= 15s，且切片數少 <= 8)
+        elif 0 < sec_idx < len(sections) - 1:
+            if 2.0 <= sec_dur <= 15.0 and sec_len <= 8:
+                sec_hosts = set(urllib.parse.urlparse(s['url']).netloc for s in sec)
+                if is_mostly_main_host and any(h != main_host for h in sec_hosts):
+                    is_ad_section = True
+                elif any(any(kw in s['url'].lower() for kw in ad_keywords) for s in sec):
+                    is_ad_section = True
+
+        if is_ad_section:
+            filtered_ads.extend(sec)
+        else:
+            for s in sec:
+                url_lower = s['url'].lower()
+                h = urllib.parse.urlparse(s['url']).netloc
+                if any(kw in url_lower for kw in ad_keywords):
+                    filtered_ads.append(s)
+                elif is_mostly_main_host and h != main_host and len(raw_segments) > 20:
+                    filtered_ads.append(s)
+                else:
+                    clean_segments.append(s)
+
+    clean_urls = [s['url'] for s in clean_segments]
+    clean_durs = [s['dur'] for s in clean_segments]
+    total_ad_dur = sum(s['dur'] for s in filtered_ads)
+
+    # 構建乾淨的 m3u8 文本
+    clean_m3u8_lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:10", "#EXT-X-PLAYLIST-TYPE:VOD"]
+    for s in clean_segments:
+        clean_m3u8_lines.append(f"#EXTINF:{s['dur']:.6f},")
+        clean_m3u8_lines.append(s['url'])
+    clean_m3u8_lines.append("#EXT-X-ENDLIST")
+    clean_m3u8_text = "\n".join(clean_m3u8_lines)
+
+    return clean_urls, clean_durs, clean_m3u8_text, len(filtered_ads), total_ad_dur
+
 def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_workers=None, label="影片"):
-    """平行 HLS 下載引擎（全量 RAM 模式：24G RAM，最大化速度，零磁碟 I/O）。"""
+    """平行 HLS 下載引擎（全量 RAM 模式：24G RAM，最大化速度，零磁碟 I/O，自動過濾賭博貼片廣告）。"""
     from curl_cffi import requests as curl_requests
 
     req_headers = dict(_GLOBAL_HEADERS)
@@ -1163,23 +1266,14 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             m3u8_url = sub_playlists[0][2]
             text = fetch_text(m3u8_url)
 
-    segment_urls = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            segment_urls.append(urllib.parse.urljoin(m3u8_url, line))
+    # ── 智慧廣告切片過濾 (片頭賭博貼片、中插廣告與第三方廣告 CDN) ───────────
+    segment_urls, segment_durations, clean_m3u8_text, ad_count, ad_dur = filter_and_clean_m3u8_ads(text, m3u8_url)
+    if ad_count > 0:
+        st.toast(f"🛡️ 已自動過濾 {ad_count} 個廣告切片 ({ad_dur:.1f} 秒賭博/貼片廣告)，為您保留純淨正片！", icon="🛡️")
 
     total_segments = len(segment_urls)
     if total_segments == 0:
         raise ValueError("m3u8 播放列表中找不到任何影片切片 (segments)。")
-
-    extinfs = [float(x) for x in re.findall(r'#EXTINF:([\d\.]+)', text)]
-    if len(extinfs) == total_segments:
-        segment_durations = extinfs
-    else:
-        total_dur = sum(extinfs) if extinfs else 0.0
-        avg_dur = total_dur / total_segments if (total_dur > 0 and total_segments > 0) else 1.0
-        segment_durations = [avg_dur] * total_segments
 
     total_duration = sum(segment_durations)
 
