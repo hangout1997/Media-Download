@@ -1103,7 +1103,7 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
 
 def filter_and_clean_m3u8_ads(m3u8_text, base_url):
     """
-    智慧過濾 m3u8 中的賭博與插播廣告切片 (片頭貼片廣告、中插短廣告、第三方廣告 CDN 切片)。
+    智慧過濾 m3u8 中的賭博與插播廣告切片 (片頭貼片廣告、中插短廣告、片尾貼片廣告、第三方廣告 CDN 切片)。
     回傳: (clean_segment_urls, clean_segment_durations, clean_m3u8_text, filtered_ad_count, filtered_ad_duration)
     """
     lines = m3u8_text.splitlines()
@@ -1135,11 +1135,7 @@ def filter_and_clean_m3u8_ads(m3u8_text, base_url):
     if not raw_segments:
         return [], [], m3u8_text, 0, 0.0
 
-    from collections import Counter
-    hosts = [urllib.parse.urlparse(s['url']).netloc for s in raw_segments]
-    host_counts = Counter(hosts)
-    main_host, main_host_count = host_counts.most_common(1)[0]
-    is_mostly_main_host = (main_host_count / len(raw_segments)) > 0.7
+    total_stream_dur = sum(s['dur'] for s in raw_segments)
 
     # 識別 sections (由 discontinuity 分割的區塊)
     sections = []
@@ -1156,36 +1152,33 @@ def filter_and_clean_m3u8_ads(m3u8_text, base_url):
     filtered_ads = []
     ad_keywords = ["/ad/", "/ads/", "/adv/", "guanggao", "advertisement", "notice.ts", "banner", "ad_"]
 
+    AD_MAX_DURATION = 35.0  # 賭博/插播廣告區塊時長通常在 3~35 秒內
+
     for sec_idx, sec in enumerate(sections):
         sec_dur = sum(s['dur'] for s in sec)
         sec_len = len(sec)
         is_ad_section = False
 
-        # 規則 A: 片頭貼片廣告判定
-        # 第一個 section 在第一個 discontinuity 之前，時長在 3s ~ 25s 之間，且後續總長度 > 300s (5分鐘以上正片)
-        total_remaining_dur = sum(sum(s['dur'] for s in other_sec) for other_sec in sections[sec_idx+1:])
-        if sec_idx == 0 and len(sections) > 1:
-            if 3.0 <= sec_dur <= 25.0 and total_remaining_dur > 300.0:
+        # 若總片長大於 3 分鐘 (180s)，且被 discontinuity 分割為多個區塊
+        if total_stream_dur > 180.0 and len(sections) > 1:
+            # 規則 A: 片頭貼片廣告判定 (第 1 個 section，時長 <= 35s)
+            if sec_idx == 0 and sec_dur <= AD_MAX_DURATION:
                 is_ad_section = True
 
-        # 規則 B: 中插短廣告判定 (前後皆有 discontinuity，時長極短 <= 15s，且切片數少 <= 8)
-        elif 0 < sec_idx < len(sections) - 1:
-            if 2.0 <= sec_dur <= 15.0 and sec_len <= 8:
-                sec_hosts = set(urllib.parse.urlparse(s['url']).netloc for s in sec)
-                if is_mostly_main_host and any(h != main_host for h in sec_hosts):
-                    is_ad_section = True
-                elif any(any(kw in s['url'].lower() for kw in ad_keywords) for s in sec):
-                    is_ad_section = True
+            # 規則 B: 片尾貼片廣告判定 (最後 1 個 section，時長 <= 35s)
+            elif sec_idx == len(sections) - 1 and sec_dur <= AD_MAX_DURATION:
+                is_ad_section = True
+
+            # 規則 C: 中插短廣告判定 (中間短區塊，時長 <= 35s 且切片數 <= 15)
+            elif 0 < sec_idx < len(sections) - 1 and sec_dur <= AD_MAX_DURATION and sec_len <= 15:
+                is_ad_section = True
 
         if is_ad_section:
             filtered_ads.extend(sec)
         else:
             for s in sec:
                 url_lower = s['url'].lower()
-                h = urllib.parse.urlparse(s['url']).netloc
                 if any(kw in url_lower for kw in ad_keywords):
-                    filtered_ads.append(s)
-                elif is_mostly_main_host and h != main_host and len(raw_segments) > 20:
                     filtered_ads.append(s)
                 else:
                     clean_segments.append(s)
