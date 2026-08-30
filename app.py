@@ -1532,6 +1532,46 @@ def download_media(media_item, force_audio=False):
             show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=media_url)
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
 
+def get_audio_stream_info(media_path, headers=None):
+    """透過 ffprobe 探測音訊串流資訊：(codec_name, bitrate_kbps, channels)。"""
+    headers_arg = []
+    if headers:
+        headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        headers_arg = ["-headers", headers_str]
+    if "m3u8" in media_path:
+        headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+
+    probe_cmd = [
+        "ffprobe", "-v", "error"
+    ] + headers_arg + [
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name,bit_rate,channels:format=bit_rate",
+        "-of", "json",
+        media_path
+    ]
+    try:
+        raw = subprocess.check_output(probe_cmd, text=True, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+        data = json.loads(raw)
+        streams = data.get("streams", [])
+        codec = ""
+        bitrate_kbps = None
+        channels = 2
+        if streams:
+            s = streams[0]
+            codec = s.get("codec_name", "").lower()
+            channels = int(s.get("channels", 2))
+            br = s.get("bit_rate")
+            if br and str(br).isdigit():
+                bitrate_kbps = int(br) // 1000
+        if not bitrate_kbps:
+            fmt_br = data.get("format", {}).get("bit_rate")
+            if fmt_br and str(fmt_br).isdigit():
+                if not streams or len(data.get("streams", [])) == 1:
+                    bitrate_kbps = int(fmt_br) // 1000
+        return codec, bitrate_kbps, channels
+    except Exception:
+        return "", None, 2
+
 def extract_local_audio(video_path, audio_format, title=None, headers=None):
     if title:
         base_name = title
@@ -1633,9 +1673,18 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 if target_ext == "mp4":
                     final_mp4_path = os.path.join(out_dir, f"{base_name}.mp4")
                     if is_mono_96k:
-                        # 轉為 96kbps 單聲道 MP4
+                        orig_codec, orig_br_kbps, orig_channels = get_audio_stream_info(matched_file)
+                        # 若原檔位元率低於 96kbps，不強制拉高至 96k
+                        if orig_br_kbps and orig_br_kbps < 96:
+                            if orig_codec == "aac" and orig_channels <= 1:
+                                mono_cmd = ["ffmpeg", "-y", "-i", matched_file, "-vn", "-c:a", "copy", "-bsf:a", "aac_adtstoasc", final_mp4_path]
+                            else:
+                                mono_cmd = ["ffmpeg", "-y", "-i", matched_file, "-vn", "-c:a", "aac", "-ac", "1", "-b:a", f"{orig_br_kbps}k", final_mp4_path]
+                        else:
+                            mono_cmd = ["ffmpeg", "-y", "-i", matched_file, "-vn", "-c:a", "aac", "-ac", "1", "-b:a", "96k", final_mp4_path]
+
                         try:
-                            subprocess.run(["ffmpeg", "-y", "-i", matched_file, "-vn", "-c:a", "aac", "-ac", "1", "-b:a", "96k", final_mp4_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                            subprocess.run(mono_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                             if os.path.exists(matched_file) and matched_file != final_mp4_path:
                                 os.remove(matched_file)
                             matched_file = final_mp4_path
@@ -1680,10 +1729,17 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
     
     if is_mono_96k:
-        # 96kbps, 單聲道格式 (MP4 容器)
+        # 96kbps, 單聲道格式 (智慧上限：若原音訊低於 96k 則不膨脹)
+        orig_codec, orig_br_kbps, orig_channels = get_audio_stream_info(video_path, headers=headers)
         ext = "mp4"
         out_path = os.path.join(out_dir, f"{base_name}.{ext}")
-        ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-ac", "1", "-b:a", "96k", out_path]
+        if orig_br_kbps and orig_br_kbps < 96:
+            if orig_codec == "aac" and orig_channels <= 1:
+                ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "copy", "-bsf:a", "aac_adtstoasc", out_path]
+            else:
+                ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-ac", "1", "-b:a", f"{orig_br_kbps}k", out_path]
+        else:
+            ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-ac", "1", "-b:a", "96k", out_path]
     elif audio_format == "MP3":
         ext = "mp3"
         out_path = os.path.join(out_dir, f"{base_name}.{ext}")
