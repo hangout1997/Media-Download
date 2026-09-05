@@ -1758,12 +1758,23 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                     'preferredcodec': 'm4a',
                     'preferredquality': '192',
                 })
-            else:
-                # 預設、MP4 或 96kbps 單聲道: 提取音訊後封裝至 MP4
+            elif is_mono_96k:
                 postprocessors.append({
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'm4a',
-                    'preferredquality': '96' if is_mono_96k else '192',
+                    'preferredquality': '96',
+                })
+            elif audio_format == "MP4 (AAC音訊 - 相容AI轉錄)" or audio_format == "MP4":
+                postprocessors.append({
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'm4a',
+                    'preferredquality': '192',
+                })
+            else:
+                # 預設 (原始格式)：保留原始最佳串流封裝為 m4a，不強制位元率重編碼
+                postprocessors.append({
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'm4a',
                 })
 
             ydl_opts = {
@@ -1873,7 +1884,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         ext = "m4a"
         out_path = os.path.join(out_dir, f"{base_name}.{ext}")
         ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", out_path]
-    elif audio_format == "MP4" or "MP4" in audio_format:
+    elif audio_format == "MP4 (AAC音訊 - 相容AI轉錄)" or audio_format == "MP4":
         ext = "mp4"
         out_path = os.path.join(out_dir, f"{base_name}.{ext}")
         ffmpeg_cmd = ["ffmpeg", "-y"] + headers_arg + ["-i", video_path, "-vn", "-c:a", "aac", "-b:a", "192k", out_path]
