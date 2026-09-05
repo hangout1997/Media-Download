@@ -58,6 +58,44 @@ def save_download_dir(path):
         pass
     return path
 
+def check_dir_writable(path):
+    """
+    檢查資料夾是否具備寫入權限 (含偵測 macOS 對 Windows NTFS 等唯讀掛載磁碟)
+    回傳 (is_writable: bool, reason: str)
+    """
+    if not path or not str(path).strip():
+        return False, "未指定資料夾路徑"
+    abs_path = os.path.abspath(os.path.expanduser(str(path).strip()))
+    
+    # 檢查或建立目錄
+    if not os.path.exists(abs_path):
+        try:
+            os.makedirs(abs_path, exist_ok=True)
+        except OSError as e:
+            if getattr(e, "errno", None) == 30 or "read-only" in str(e).lower():
+                return False, "此磁碟為唯讀檔案系統 (Read-only file system，如 Windows NTFS 外接硬碟在 macOS 預設無法寫入)。"
+            if getattr(e, "errno", None) == 13 or "permission denied" in str(e).lower():
+                return False, "權限不足，無法在此路徑建立目錄 (Permission denied)。"
+            return False, f"無法建立目錄: {e}"
+            
+    # 建立臨時檔案測試真實寫入能力
+    test_file = os.path.join(abs_path, f".write_test_{os.getpid()}_{int(time.time()*1000)}.tmp")
+    try:
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("test")
+        try:
+            os.remove(test_file)
+        except Exception:
+            pass
+        return True, ""
+    except OSError as e:
+        if getattr(e, "errno", None) == 30 or "read-only" in str(e).lower():
+            return False, "此磁碟為唯讀檔案系統 (Read-only file system，如 Windows NTFS 格式外接硬碟在 macOS 預設僅供讀取)。"
+        if getattr(e, "errno", None) == 13 or "permission denied" in str(e).lower():
+            return False, "權限不足，無法在此目錄建立或寫入檔案 (Permission denied)。"
+        return False, f"無法寫入此目錄: {e}"
+
+
 def choose_folder_dialog(current_dir):
     if not current_dir or not os.path.exists(current_dir):
         current_dir = DEFAULT_DOWNLOAD_DIR
@@ -1497,6 +1535,14 @@ def download_media(media_item, force_audio=False):
         st.info(f"☁️ 檔案將在 RAM/暫存封裝後，**直接直送至 Google Drive 雲端 `/Download/{filename}`**（不保留於本機）")
     else:
         downloads_dir = st.session_state.get('download_dir', load_download_dir())
+        is_writable, write_err = check_dir_writable(downloads_dir)
+        if not is_writable:
+            show_error_log_box(
+                "❌ 無法下載：目標儲存目錄為唯讀或無寫入權限！",
+                f"目標路徑: {downloads_dir}\n原因: {write_err}\n\n💡 建議：若為外接硬碟 (如 Windows NTFS)，macOS 預設為唯讀模式無法直接寫入。\n請至上方將儲存路徑切換為 Mac 本機資料夾 (如 Downloads)，或使用支援 macOS 寫入的磁碟格式 (如 APFS、exFAT)。",
+                title="目錄寫入權限錯誤 (Read-only)"
+            )
+            return
         os.makedirs(downloads_dir, exist_ok=True)
         out_path = os.path.join(downloads_dir, filename)
         
@@ -1643,6 +1689,9 @@ def download_media(media_item, force_audio=False):
                 parsed_host = urllib.parse.urlparse(media_url).hostname or "串流伺服器"
                 friendly_msg = f"❌ 影片伺服器連線失敗：串流主機網域 `{parsed_host}` 無法解析或已失效。\n\n💡 **原因與建議**：該影片來源伺服器已下線或 CDN 網址已過期。若是在 Movieffm / Gimy 等影音網站觀看，請嘗試切換至其他播放線路 (如 FLV 2, FLV 3...)。"
                 show_error_log_box(friendly_msg, stderr_log, title="伺服器連線與 DNS 錯誤日誌", url=media_url)
+            elif "Read-only file system" in stderr_log or "read-only" in stderr_log.lower():
+                friendly_msg = "❌ 下載失敗：儲存目標目錄為「唯讀 (Read-only)」！\n\n💡 **原因與建議**：您的儲存目錄位於唯讀磁碟（例如 Windows NTFS 格式外接硬碟在 macOS 預設無法寫入）。請更換儲存位置至 Mac 本機硬碟（如「下載」資料夾）或使用支援寫入的磁碟格式 (如 APFS、exFAT)。"
+                show_error_log_box(friendly_msg, stderr_log, title="唯讀磁碟寫入錯誤 (Read-only file system)", url=media_url)
             else:
                 show_error_log_box("❌ FFmpeg 下載失敗！", stderr_log, url=media_url)
         
@@ -1708,6 +1757,14 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         out_dir = tempfile.gettempdir()
     else:
         out_dir = st.session_state.get('download_dir', load_download_dir())
+        is_writable, write_err = check_dir_writable(out_dir)
+        if not is_writable:
+            show_error_log_box(
+                "❌ 無法提取音訊：目標儲存目錄為唯讀或無寫入權限！",
+                f"目標路徑: {out_dir}\n原因: {write_err}\n\n💡 建議：若為外接硬碟 (如 Windows NTFS)，macOS 預設為唯讀模式無法直接寫入。\n請至上方將儲存路徑切換為 Mac 本機資料夾 (如 Downloads)，或使用支援 macOS 寫入的磁碟格式 (如 APFS、exFAT)。",
+                title="目錄寫入權限錯誤 (Read-only)"
+            )
+            return
         os.makedirs(out_dir, exist_ok=True)
     
     is_valid_url = isinstance(video_path, str) and (video_path.startswith("http://") or video_path.startswith("https://"))
@@ -1931,6 +1988,9 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 parsed_host = urllib.parse.urlparse(video_path).hostname or "串流伺服器"
                 friendly_msg = f"❌ 影片伺服器連線失敗：主機網域 `{parsed_host}` 無法解析或已失效。\n\n💡 **原因與建議**：該影片來源伺服器已下線或 CDN 網址已過期。若是在 Movieffm / Gimy 等影音網站，請嘗試切換至其他播放線路 (如 FLV 2, FLV 3...)。"
                 show_error_log_box(friendly_msg, stderr_log, title="伺服器連線與 DNS 錯誤日誌", url=video_path)
+            elif "Read-only file system" in stderr_log or "read-only" in stderr_log.lower():
+                friendly_msg = f"❌ 提取音訊失敗：儲存目標目錄為「唯讀 (Read-only)」！\n\n💡 **原因與建議**：您的儲存目錄位於唯讀磁碟（例如 Windows NTFS 格式外接硬碟在 macOS 預設無法寫入）。請更換儲存位置至 Mac 本機硬碟（如「下載」資料夾）或使用支援寫入的磁碟格式 (如 APFS、exFAT)。"
+                show_error_log_box(friendly_msg, stderr_log, title="唯讀磁碟寫入錯誤 (Read-only file system)", url=video_path)
             else:
                 show_error_log_box(f"❌ 提取 `{base_name}` 失敗！", stderr_log, url=video_path)
         
@@ -2095,6 +2155,19 @@ else:
         st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
         st.button("📂 選擇資料夾", key="main_browse_btn", use_container_width=True, on_click=_cb_choose_folder)
 
+    # 即時檢測當前儲存路徑是否具備寫入權限
+    current_target_dir = st.session_state.get('download_dir', load_download_dir())
+    is_writable, write_err = check_dir_writable(current_target_dir)
+    if not is_writable:
+        st.error(
+            f"🚫 **警告：目前下載儲存資料夾無法寫入 (唯讀 / Read-only)！**\n\n"
+            f"📍 路徑：`{current_target_dir}`\n\n"
+            f"⚠️ **原因**：{write_err}\n\n"
+            f"💡 **建議解決方式**：\n"
+            f"- 若為外接硬碟（如 Windows NTFS 格式），macOS 預設僅允許讀取、無法寫入。\n"
+            f"- 請點擊上方「📂 選擇資料夾」或下方「常用儲存位置」切換至本機資料夾（如 Downloads），或將外接硬碟格式化/掛載為支援寫入之格式 (如 exFAT、APFS)。"
+        )
+
     # 快捷資料夾選區 (常用捷徑)
     with st.expander("⚡ 常用儲存位置快捷切換", expanded=False):
         q_cols = st.columns(4)
@@ -2164,6 +2237,10 @@ with tab1:
         
         if not urls:
             st.warning("⚠️ 請先輸入網址！")
+        elif st.session_state.get('storage_destination') == "local" and not check_dir_writable(st.session_state.get('download_dir', load_download_dir()))[0]:
+            target_check_dir = st.session_state.get('download_dir', load_download_dir())
+            _, reason = check_dir_writable(target_check_dir)
+            st.error(f"❌ **無法開始下載：目標儲存目錄為唯讀或無寫入權限！**\n\n📍 路徑：`{target_check_dir}`\n⚠️ 原因：{reason}\n\n💡 請切換至本機可寫入的資料夾（如 Downloads）後再下載。")
         else:
             st.info(f"📥 準備下載 {len(urls)} 個影片檔案...")
             
@@ -2220,6 +2297,10 @@ with tab2:
         input_path = normalize_input_url(raw_input_path)
         if not input_path:
             st.warning("⚠️ 請先輸入路徑！")
+        elif st.session_state.get('storage_destination') == "local" and not check_dir_writable(st.session_state.get('download_dir', load_download_dir()))[0]:
+            target_check_dir = st.session_state.get('download_dir', load_download_dir())
+            _, reason = check_dir_writable(target_check_dir)
+            st.error(f"❌ **無法開始提取：目標儲存目錄為唯讀或無寫入權限！**\n\n📍 路徑：`{target_check_dir}`\n⚠️ 原因：{reason}\n\n💡 請切換至本機可寫入的資料夾（如 Downloads）後再試。")
         elif input_path.startswith("http://") or input_path.startswith("https://"):
             import yt_dlp
             urls_to_process = []
