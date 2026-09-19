@@ -938,9 +938,12 @@ def get_media_items(url):
         import yt_dlp
         
         fb_cookie_str = st.session_state.get('fb_cookie')
+        bili_cookie_str = st.session_state.get('bili_cookie')
         temp_cookie_path = None
         if "facebook.com" in url or "fb.com" in url or "fb.watch" in url:
             temp_cookie_path = create_temp_cookiefile(fb_cookie_str)
+        elif "bilibili.com" in url or "b23.tv" in url:
+            temp_cookie_path = create_temp_cookiefile(bili_cookie_str)
             
         ydl_opts = {
             'quiet': True,
@@ -997,13 +1000,17 @@ def get_media_items(url):
                             'ext': ext or ('jpg' if is_image else 'mp4'),
                             'type': 'image' if is_image else 'video',
                             'headers': http_headers,
-                            'webpage_url': webpage_url
+                            'webpage_url': webpage_url,
+                            'is_ytdlp': True
                         })
             except Exception as e:
                 err_msg = str(e)
                 if any(kw in err_msg for kw in ["No video formats found", "Unsupported URL", "Cannot parse data", "Private video", "login"]):
                     if "facebook.com" in url or "fb.com" in url or "fb.watch" in url:
                         raise ValueError("此 Facebook 連結可能為「純相片貼文」、「非影片內容」或「私密/限制級內容」。\n\n💡 **下載建議**：請確認您已在下方填入有效的 **Facebook Cookie**。私密社團、好友限閱、相片貼文或部分特定影片必須有 Cookie 授權才能進行下載。")
+                if any(kw in err_msg for kw in ["412", "Precondition Failed", "啥都木有", "KeyError('result')"]):
+                    if "bilibili.com" in url or "b23.tv" in url:
+                        raise ValueError("Bilibili 伺服器存取被拒 (HTTP 412 風控限制或該影片/番劇已下架)。\n\n💡 **原因與建議**：\n1. 該番劇可能為大會員專屬、版權地區限制，或已被官方下架 (API 回傳「啥都木有」)。\n2. 若影片在瀏覽器可觀看，請在下方「🔑 Bilibili Cookie」填入您的登入 Cookie (`SESSDATA`) 以通過安全風控策略。")
                 if is_custom_hls:
                     pass
                 else:
@@ -1649,12 +1656,29 @@ def download_media(media_item, force_audio=False):
                 st.warning(f"⚠️ 多線程下載失敗 ({hls_err})，降級使用標準 FFmpeg 串流處理...")
 
         webpage_url = media_item.get('webpage_url', '')
-        is_youtube = any(k in media_url or k in webpage_url for k in ["youtube.com", "youtu.be", "googlevideo.com"])
+        is_direct_stream = "m3u8" in media_url or any(media_url.lower().split('?')[0].endswith(ext) for ext in ['.mp4', '.m4a', '.mp3', '.flv', '.ts', '.webm', '.mkv'])
+        is_ytdlp_site = media_item.get('is_ytdlp') or any(k in media_url or k in webpage_url for k in ["youtube.com", "youtu.be", "googlevideo.com", "bilibili.com", "b23.tv", "twitter.com", "x.com", "instagram.com", "tiktok.com", "facebook.com", "fb.com", "fb.watch"])
 
-        if is_youtube and not force_audio:
+        # 若非純串流檔案（為網頁連結）或為 yt-dlp 原生支援平台（如 YouTube, Bilibili 等），由 yt-dlp 完整負責音訊與視訊下載與合併
+        if (is_ytdlp_site or not is_direct_stream) and not force_audio:
             target_url = webpage_url or media_url
+            temp_cookie = None
+            platform_name = "Bilibili" if any(d in target_url for d in ["bilibili", "b23.tv"]) else ("YouTube" if "youtu" in target_url else "線上")
             try:
                 out_base = os.path.splitext(out_path)[0]
+                
+                # Cookie 設定 (Bilibili / Facebook)
+                bili_cookie_str = st.session_state.get('bili_cookie')
+                fb_cookie_str = st.session_state.get('fb_cookie')
+                cookie_to_use = None
+                if any(d in target_url for d in ["bilibili.com", "b23.tv"]) and bili_cookie_str:
+                    cookie_to_use = bili_cookie_str
+                elif any(d in target_url for d in ["facebook.com", "fb.com", "fb.watch"]) and fb_cookie_str:
+                    cookie_to_use = fb_cookie_str
+                
+                if cookie_to_use:
+                    temp_cookie = create_temp_cookiefile(cookie_to_use)
+
                 ydl_opts = {
                     'outtmpl': f"{out_base}.%(ext)s",
                     'quiet': True,
@@ -1663,13 +1687,22 @@ def download_media(media_item, force_audio=False):
                     'legacy_server_connect': True,
                     'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
                     'merge_output_format': 'mp4',
+                    'http_headers': {
+                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    },
                     'extractor_args': {
                         'youtube': {
                             'player_client': ['android', 'web', 'ios'],
                         }
                     },
                 }
-                with st.spinner("⏳ 正在下載 YouTube 1080p 高清影片..."):
+                if temp_cookie:
+                    ydl_opts['cookiefile'] = temp_cookie
+
+                if any(d in target_url for d in ["bilibili.com", "b23.tv"]):
+                    ydl_opts['http_headers']['Referer'] = 'https://www.bilibili.com/'
+
+                with st.spinner(f"⏳ 正在透過 yt-dlp 下載 {platform_name} 1080p 高清影片..."):
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         ydl.download([target_url])
 
@@ -1687,11 +1720,22 @@ def download_media(media_item, force_audio=False):
                     finish_output_file(actual_out, filename)
                     return
                 else:
-                    show_error_log_box("❌ 下載失敗！無法產生影片檔案。", f"Target Output Path: {out_path}", title="YouTube 下載失敗", url=target_url)
+                    show_error_log_box("❌ 下載失敗！無法產生影片檔案。", f"Target Output Path: {out_path}", title=f"{platform_name} 下載失敗", url=target_url)
                     return
             except Exception as yt_err:
-                show_error_log_box(f"❌ YouTube 下載失敗: {yt_err}", traceback.format_exc(), title="YouTube 下載詳細錯誤日誌", url=target_url)
+                err_str = str(yt_err)
+                if any(kw in err_str for kw in ["412", "Precondition Failed", "啥都木有", "KeyError('result')"]):
+                    friendly_msg = "❌ Bilibili 存取受阻：觸發嗶哩嗶哩安全風控策略 (HTTP 412) 或該番劇需登入/大會員。\n\n💡 **原因與建議**：\n1. 該影片/番劇可能已下架、地區限制或需要大會員登入。\n2. 請於上方填入 **Bilibili Cookie (SESSDATA)** 以通過身分驗證及風控限制。"
+                    show_error_log_box(friendly_msg, traceback.format_exc(), title="Bilibili 412 風控限制", url=target_url)
+                else:
+                    show_error_log_box(f"❌ {platform_name} 下載失敗: {yt_err}", traceback.format_exc(), title=f"{platform_name} 下載詳細錯誤日誌", url=target_url)
                 return
+            finally:
+                if temp_cookie and os.path.exists(temp_cookie):
+                    try:
+                        os.remove(temp_cookie)
+                    except Exception:
+                        pass
 
         is_valid_url = isinstance(media_url, str) and (media_url.startswith("http://") or media_url.startswith("https://"))
         is_valid_file = isinstance(media_url, str) and os.path.exists(media_url)
@@ -1912,6 +1956,18 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                     'preferredcodec': 'm4a',
                 })
 
+            temp_cookie = None
+            bili_cookie_str = st.session_state.get('bili_cookie')
+            fb_cookie_str = st.session_state.get('fb_cookie')
+            cookie_to_use = None
+            if any(d in video_path for d in ["bilibili.com", "b23.tv"]) and bili_cookie_str:
+                cookie_to_use = bili_cookie_str
+            elif any(d in video_path for d in ["facebook.com", "fb.com", "fb.watch"]) and fb_cookie_str:
+                cookie_to_use = fb_cookie_str
+            
+            if cookie_to_use:
+                temp_cookie = create_temp_cookiefile(cookie_to_use)
+
             ydl_opts = {
                 'outtmpl': f"{out_base}.%(ext)s",
                 'quiet': True,
@@ -1920,12 +1976,20 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 'legacy_server_connect': True,
                 'format': 'bestaudio/best',
                 'postprocessors': postprocessors,
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                },
                 'extractor_args': {
                     'youtube': {
                         'player_client': ['android', 'web', 'ios'],
                     }
                 },
             }
+            if temp_cookie:
+                ydl_opts['cookiefile'] = temp_cookie
+            if any(d in video_path for d in ["bilibili.com", "b23.tv"]):
+                ydl_opts['http_headers']['Referer'] = 'https://www.bilibili.com/'
+
             with st.spinner("⏳ 正在透過 yt-dlp 從線上網址提取高品質音訊..."):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([video_path])
@@ -1984,8 +2048,19 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 show_error_log_box(f"❌ 提取 `{base_name}` 失敗！無法產出音訊檔。", f"Expected Output Path: {expected_out_path}", title="線上網址音訊提取失敗", url=video_path)
                 return
         except Exception as yt_err:
-            show_error_log_box(f"❌ 線上網址音訊提取失敗: {yt_err}", traceback.format_exc(), title="線上網址音訊提取詳細錯誤日誌", url=video_path)
+            err_str = str(yt_err)
+            if any(kw in err_str for kw in ["412", "Precondition Failed", "啥都木有", "KeyError('result')"]):
+                friendly_msg = "❌ Bilibili 存取受阻：觸發嗶哩嗶哩安全風控策略 (HTTP 412) 或該番劇需登入/大會員。\n\n💡 **原因與建議**：\n1. 該影片/番劇可能已下架、地區限制或需要大會員登入。\n2. 請於「線上影片下載」分頁填入 **Bilibili Cookie (SESSDATA)** 以通過身分驗證及風控限制。"
+                show_error_log_box(friendly_msg, traceback.format_exc(), title="Bilibili 412 風控限制", url=video_path)
+            else:
+                show_error_log_box(f"❌ 線上網址音訊提取失敗: {yt_err}", traceback.format_exc(), title="線上網址音訊提取詳細錯誤日誌", url=video_path)
             return
+        finally:
+            if temp_cookie and os.path.exists(temp_cookie):
+                try:
+                    os.remove(temp_cookie)
+                except Exception:
+                    pass
 
     ext = ""
     ffmpeg_cmd = []
@@ -2293,12 +2368,17 @@ st.divider()
 tab1, tab2 = st.tabs(["🌐 線上影片下載", "📁 影片音訊提取"])
 
 with tab1:
-    st.markdown("將 Movieffm, Gimymax, MissAV, X, YouTube, Facebook, IG, TikTok 等影片網址直接下載。")
+    st.markdown("將 Movieffm, Gimymax, MissAV, Bilibili, X, YouTube, Facebook, IG, TikTok 等影片網址直接下載。")
     
-    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個):", placeholder="https://www.movieffm.net/movies/your-name/ \nhttps://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
+    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個):", placeholder="https://www.bilibili.com/video/BV... \nhttps://www.movieffm.net/movies/your-name/ \nhttps://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
     
-    fb_cookie_str = st.text_input("🔑 Facebook Cookie (選填，用於下載私密社團或好友貼文圖片):", type="password", placeholder="c_user=xxxx; xs=xxxx; ...", help="若要下載私密社團、好友貼文或無法下載時，請在 Chrome 開啟 Facebook -> 按 F12 -> 於 Application (應用程式) -> Cookies 中複製 c_user 與 xs 拼接（或直接複製整段 Cookie 值）並在此貼上。下載公開內容免填。")
-    st.session_state.fb_cookie = fb_cookie_str
+    c_cookie1, c_cookie2 = st.columns(2)
+    with c_cookie1:
+        fb_cookie_str = st.text_input("🔑 Facebook Cookie (選填):", type="password", placeholder="c_user=xxxx; xs=xxxx; ...", help="若要下載私密社團、好友貼文或無法下載相片時填入。")
+        st.session_state.fb_cookie = fb_cookie_str
+    with c_cookie2:
+        bili_cookie_str = st.text_input("🔑 Bilibili Cookie (選填):", type="password", placeholder="SESSDATA=xxxx; buvid3=xxxx; ...", help="若下載 Bilibili 遇 412 風控限制、番劇或需大會員/高畫質時填入。")
+        st.session_state.bili_cookie = bili_cookie_str
     
     # 即時計算目前已輸入的有效網址數量
     current_urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
