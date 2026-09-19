@@ -298,39 +298,84 @@ def normalize_input_url(url_str):
         return "https://" + url_str.lstrip('/')
     # 若輸入的是 MissAV / 平台番號與代碼 (例如 JD-054791cdbc62ac51e7c79c59f86b72960)
     if re.match(r'^[a-zA-Z0-9\-_]{5,}$', url_str):
+        if url_str.startswith(('qsvip-', 'NS4K-', 'NSYS-', 'itdog-')):
+            return url_str
         return f"https://missav.ai/{url_str}"
     return "https://" + url_str
 
 def resolve_gimy_stream(player_url, page_url=''):
     if not player_url:
         return ''
-    if player_url.startswith('http://') or player_url.startswith('https://'):
+    if player_url.startswith(('http://', 'https://')):
         return player_url
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': 'https://play.gimy.bot/jd/'
     }
     
-    # 解析 Gimymax / Gimyplus 的 play.gimy.bot 串流 API
-    if player_url.startswith('JD-') or player_url.startswith('JDQM-') or player_url.startswith('JDHG-'):
-        api_url = f'https://play.gimy.bot/jd/api.php?url={player_url}'
-    elif player_url.startswith('NS4K-') or player_url.startswith('NSYS-'):
-        api_url = f'https://play.gimy.bot/ns/api.php?url={player_url}'
-    elif player_url.startswith('qsvip-'):
-        api_url = f'https://play.gimy.bot/qsvip/api.php?url={player_url}'
+    endpoints = []
+    if player_url.startswith('qsvip-'):
+        endpoints.append((
+            f'https://v.attzy.com/ap/qs/api.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': f'https://v.attzy.com/ap/qs/?url={player_url}&jctype=qsvip'}
+        ))
+        endpoints.append((
+            f'https://play.gimy.bot/qsvip/api.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': 'https://play.gimy.bot/jd/'}
+        ))
+    elif player_url.startswith(('JD-', 'JDQM-', 'JDHG-')):
+        endpoints.append((
+            f'https://v.attzy.com/ap/jd/api.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': f'https://v.attzy.com/ap/jd/?url={player_url}&jctype=JD4K'}
+        ))
+        endpoints.append((
+            f'https://play.gimy.bot/jd/api.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': 'https://play.gimy.bot/jd/'}
+        ))
+    elif player_url.startswith(('NS4K-', 'NSYS-')):
+        endpoints.append((
+            f'https://player.aigm.tv/n/parse.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': f'https://player.aigm.tv/n/?url={player_url}'}
+        ))
+        endpoints.append((
+            f'https://play.gimy.bot/ns/api.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': 'https://play.gimy.bot/jd/'}
+        ))
+    elif player_url.startswith('itdog-'):
+        endpoints.append((
+            f'https://v.attzy.com/ap/lb/api.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': f'https://v.attzy.com/ap/lb/?url={player_url}&jctype=itdog'}
+        ))
     else:
-        api_url = f'https://play.gimy.bot/a/api.php?url={player_url}'
-        
-    try:
-        r = requests.get(api_url, headers=headers, timeout=10)
-        data = r.json()
-        if data.get('code') == 200 and data.get('url'):
-            return data.get('url')
-    except Exception:
-        pass
-        
-    return urllib.parse.urljoin(page_url, player_url)
+        endpoints.append((
+            f'https://v.attzy.com/ap/lb/api.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': 'https://v.attzy.com/'}
+        ))
+        endpoints.append((
+            f'https://v.attzy.com/ap/jd/api.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': 'https://v.attzy.com/'}
+        ))
+        endpoints.append((
+            f'https://play.gimy.bot/a/api.php?url={urllib.parse.quote(player_url)}',
+            {'Referer': 'https://play.gimy.bot/jd/'}
+        ))
+
+    for api_url, api_headers in endpoints:
+        try:
+            req_h = dict(headers)
+            req_h.update(api_headers)
+            r = requests.get(api_url, headers=req_h, timeout=10)
+            data = r.json()
+            resolved = data.get('url') or data.get('video') or data.get('playurl')
+            if resolved and isinstance(resolved, str) and resolved.startswith(('http://', 'https://')):
+                return resolved
+        except Exception:
+            continue
+
+    if player_url.startswith(('/', './')) or any(ext in player_url.lower() for ext in ['.m3u8', '.mp4', '.flv']):
+        return urllib.parse.urljoin(page_url, player_url)
+
+    raise ValueError(f"無法解析 Gimy 播放線路 ({player_url[:25]}...)，伺服器 API 解析失敗或未回傳有效影片網址。請在網頁切換至其他線路 (如 天堂雲、西瓜雲、極速雲等) 後再試。")
 
 def check_m3u8_accessible(m3u8_url, headers=None, timeout=2.5):
     """快速探測 m3u8 串流是否可用 (排除 DNS 失敗、404 等失效伺服器)。"""
@@ -972,7 +1017,23 @@ def get_media_items(url):
         if items:
             return items
             
-    # 原有的 Gimymax 網頁解析邏輯
+    # 原有的 Gimymax 網頁解析邏輯 (支援正常集數頁面與直接傳入的播放線路 token /ep/qsvip-xxx 等)
+    token_match = re.search(r'(qsvip-[a-zA-Z0-9_\-]+|JD[A-Z]*-[a-zA-Z0-9_\-]+|NS[A-Z0-9]*-[a-zA-Z0-9_\-]+|itdog-[a-zA-Z0-9_\-]+)', url)
+    if token_match and not url.endswith('.html'):
+        raw_m3u8 = token_match.group(1)
+        m3u8_url = resolve_gimy_stream(raw_m3u8, page_url=url)
+        referer = 'https://v.attzy.com/' if any(d in m3u8_url for d in ['hxx', 'attzy', 'telegram', 'shenhua']) else url
+        return [{
+            'url': m3u8_url,
+            'title': 'Gimy_Video',
+            'ext': 'mp4',
+            'type': 'video',
+            'headers': {
+                'Referer': referer,
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            }
+        }]
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/122.0.0.0"
     }
@@ -980,6 +1041,20 @@ def get_media_items(url):
     # 找尋 player_data 變數中的 JSON 資料
     match = re.search(r'var player_data=(.*?)</script>', response.text)
     if not match:
+        if token_match:
+            raw_m3u8 = token_match.group(1)
+            m3u8_url = resolve_gimy_stream(raw_m3u8, page_url=url)
+            referer = 'https://v.attzy.com/' if any(d in m3u8_url for d in ['hxx', 'attzy', 'telegram', 'shenhua']) else url
+            return [{
+                'url': m3u8_url,
+                'title': 'Gimy_Video',
+                'ext': 'mp4',
+                'type': 'video',
+                'headers': {
+                    'Referer': referer,
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                }
+            }]
         raise ValueError("Cannot find player_data in the webpage.")
         
     try:
@@ -1054,13 +1129,14 @@ def get_media_items(url):
     # 處理檔名特殊字元
     title = re.sub(r'[\\/:*?"<>|]', '_', title)
     
+    referer = 'https://v.attzy.com/' if any(d in m3u8_url for d in ['hxx', 'attzy', 'telegram', 'shenhua']) else url
     items = [{
         'url': m3u8_url,
         'title': title,
         'ext': 'mp4',
         'type': 'video',
         'headers': {
-            'Referer': url,
+            'Referer': referer,
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         }
     }]
