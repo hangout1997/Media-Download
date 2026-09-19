@@ -294,7 +294,7 @@ def normalize_input_url(url_str):
     if os.path.exists(url_str):
         return url_str
     # 若包含常見影音平台網域但漏填 https:// (例如 missav.ai/..., youtube.com/...)
-    if any(domain in url_str.lower() for domain in [".com", ".ai", ".tv", ".ws", ".net", ".org", ".me", ".co", "youtube", "facebook", "instagram", "tiktok", "twitter", "missav", "movieffm"]):
+    if any(domain in url_str.lower() for domain in [".com", ".ai", ".tv", ".ws", ".net", ".org", ".me", ".co", "youtube", "facebook", "instagram", "tiktok", "twitter", "missav", "movieffm", "mvffm"]):
         return "https://" + url_str.lstrip('/')
     # 若輸入的是 MissAV / 平台番號與代碼 (例如 JD-054791cdbc62ac51e7c79c59f86b72960)
     if re.match(r'^[a-zA-Z0-9\-_]{5,}$', url_str):
@@ -376,14 +376,16 @@ def get_media_items(url):
     url = normalize_input_url(url)
     items = []
     
-    # 支援 Movieffm.net 電影與戲劇串流解析
-    if "movieffm" in url.lower():
+    # 支援 Movieffm / Mvffm 電影與戲劇串流解析
+    if any(k in url.lower() for k in ["movieffm", "mvffm"]):
         import html as html_lib
         from curl_cffi import requests as curl_requests
+        from urllib.parse import urlparse
+        parsed_origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}/"
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Referer": "https://www.movieffm.net/",
+            "Referer": parsed_origin,
         }
         res = None
         last_err = None
@@ -411,7 +413,7 @@ def get_media_items(url):
         
         if t_match:
             title = html_lib.unescape(t_match.group(1)).strip()
-            title = re.sub(r'\s*-\s*Movieffm.*$', '', title, flags=re.IGNORECASE).strip()
+            title = re.sub(r'\s*-\s*(?:Movieffm|mvffm).*$', '', title, flags=re.IGNORECASE).strip()
         else:
             t_js = re.search(r'title\s*:\s*["\']([^"\']+)["\']', html_content)
             if t_js:
@@ -883,7 +885,7 @@ def get_media_items(url):
             print(f"Facebook custom photo scrape failed: {e}, falling back to yt-dlp...")
 
     # 支援各大平台 (Movieffm, MissAV, Gimy, YouTube, X, Facebook, Instagram, TikTok 等與通用線上網址)
-    is_custom_hls = any(k in url.lower() for k in ["missav", "movieffm", "gimymax", "gimyplus", "gimy"])
+    is_custom_hls = any(k in url.lower() for k in ["missav", "movieffm", "mvffm", "gimymax", "gimyplus", "gimy"])
     if not is_custom_hls or any(domain in url for domain in ["x.com", "twitter.com", "t.co", "youtube.com", "youtu.be", "facebook.com", "fb.com", "fb.watch", "instagram.com", "ig.me", "tiktok.com"]):
         # yt-dlp 的 threads extractor 綁定 threads.net，若是 .com 則先替換
         url = url.replace("threads.com", "threads.net")
@@ -957,7 +959,7 @@ def get_media_items(url):
                 if any(kw in err_msg for kw in ["No video formats found", "Unsupported URL", "Cannot parse data", "Private video", "login"]):
                     if "facebook.com" in url or "fb.com" in url or "fb.watch" in url:
                         raise ValueError("此 Facebook 連結可能為「純相片貼文」、「非影片內容」或「私密/限制級內容」。\n\n💡 **下載建議**：請確認您已在下方填入有效的 **Facebook Cookie**。私密社團、好友限閱、相片貼文或部分特定影片必須有 Cookie 授權才能進行下載。")
-                if is_missav_or_gimy:
+                if is_custom_hls:
                     pass
                 else:
                     raise e
