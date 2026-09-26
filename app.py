@@ -1349,13 +1349,30 @@ def filter_and_clean_m3u8_ads(m3u8_text, base_url):
 
     AD_MAX_DURATION = 35.0  # 賭博/插播廣告區塊時長通常在 3~35 秒內
 
+    # 判斷是否為「廣告插入型」串流：
+    # 真正的廣告插入串流必定存在顯著較長的主正片 section (例如 >= 90s 或單一 section 佔總片長 >= 30%)
+    # 若所有 section 都是 ~20s 的短區塊 (如 Telegram 分片或特殊切片源)，說明整部影片都是以頻繁 discontinuity 分段，絕非廣告！
+    has_dominant_feature = any(
+        sum(s['dur'] for s in sec) >= 90.0 or (sum(s['dur'] for s in sec) / total_stream_dur >= 0.3)
+        for sec in sections
+    )
+    short_sections = [sec for sec in sections if sum(s['dur'] for s in sec) <= AD_MAX_DURATION]
+    short_sec_total_dur = sum(sum(s['dur'] for s in sec) for sec in short_sections)
+
+    # 只有當串流長度足夠、存在長正片區塊、且短區塊時長佔比在合理廣告範圍內 (<= 20%) 時，才允許依 section 切割判定廣告
+    allow_section_ad_filter = (
+        total_stream_dur > 180.0 and
+        len(sections) > 1 and
+        has_dominant_feature and
+        (short_sec_total_dur / total_stream_dur <= 0.20)
+    )
+
     for sec_idx, sec in enumerate(sections):
         sec_dur = sum(s['dur'] for s in sec)
         sec_len = len(sec)
         is_ad_section = False
 
-        # 若總片長大於 3 分鐘 (180s)，且被 discontinuity 分割為多個區塊
-        if total_stream_dur > 180.0 and len(sections) > 1:
+        if allow_section_ad_filter:
             # 規則 A: 片頭貼片廣告判定 (第 1 個 section，時長 <= 35s)
             if sec_idx == 0 and sec_dur <= AD_MAX_DURATION:
                 is_ad_section = True
@@ -1377,6 +1394,18 @@ def filter_and_clean_m3u8_ads(m3u8_text, base_url):
                     filtered_ads.append(s)
                 else:
                     clean_segments.append(s)
+
+    # 兜底防護：若過濾後切片為空，或剩餘時長嚴重小於原本總時長的 50% (且總片長 > 60s)，表示發生誤殺，自動回退
+    clean_total_dur = sum(s['dur'] for s in clean_segments)
+    if not clean_segments or (total_stream_dur > 60.0 and clean_total_dur / total_stream_dur < 0.5):
+        clean_segments = []
+        filtered_ads = []
+        for s in raw_segments:
+            url_lower = s['url'].lower()
+            if any(kw in url_lower for kw in ad_keywords):
+                filtered_ads.append(s)
+            else:
+                clean_segments.append(s)
 
     clean_urls = [s['url'] for s in clean_segments]
     clean_durs = [s['dur'] for s in clean_segments]
@@ -1461,7 +1490,18 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     total_segments = len(segment_urls)
     if total_segments == 0:
-        raise ValueError("m3u8 播放列表中找不到任何影片切片 (segments)。")
+        # Fallback: 若過濾後無切片，嘗試從原始 m3u8 文字直接提取所有切片 URI
+        fallback_urls = [
+            urllib.parse.urljoin(m3u8_url, line.strip())
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if fallback_urls:
+            segment_urls = fallback_urls
+            segment_durations = [2.0] * len(segment_urls)
+            total_segments = len(segment_urls)
+        else:
+            raise ValueError("m3u8 播放列表中找不到任何影片切片 (segments)。")
 
     total_duration = sum(segment_durations)
 
