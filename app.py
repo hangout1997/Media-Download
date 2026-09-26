@@ -1045,9 +1045,48 @@ def get_media_items(url):
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/122.0.0.0"
     }
     response = requests.get(url, headers=headers)
-    # 找尋 player_data 變數中的 JSON 資料
-    match = re.search(r'var player_data=(.*?)</script>', response.text)
-    if not match:
+    # 尋找播放器 JSON 資料 (相容 MacCMS 的 var player_aaaa = {...} 或 var player_data = {...} 等變體)
+    data = None
+    # 策略 1: 尋找直接賦值 JSON 物件的 player_xxxx 變數 (例如 MacCMS 的 var player_aaaa = {...})
+    for m in re.finditer(r'var\s+(player_[a-zA-Z0-9_]*)\s*=\s*(\{.*?\})\s*(?:;|</script>)', response.text, re.DOTALL):
+        try:
+            candidate = json.loads(m.group(2))
+            if isinstance(candidate, dict) and ('url' in candidate or 'vod_data' in candidate):
+                data = candidate
+                break
+        except Exception:
+            continue
+
+    # 策略 2: 尋找 var player_data = ... (可能是直接 JSON 或變數指標如 var player_data = player_aaaa;)
+    if not data:
+        m_pd = re.search(r'var\s+player_data\s*=\s*(.*?)\s*(?:;|</script>)', response.text, re.DOTALL)
+        if m_pd:
+            content = m_pd.group(1).strip()
+            try:
+                data = json.loads(content)
+            except Exception:
+                var_match = re.match(r'^[a-zA-Z0-9_]+$', content)
+                if var_match:
+                    target_var = var_match.group(0)
+                    m_var = re.search(rf'var\s+{target_var}\s*=\s*({{.*?}})\s*(?:;|</script>)', response.text, re.DOTALL)
+                    if m_var:
+                        try:
+                            data = json.loads(m_var.group(1))
+                        except Exception:
+                            pass
+
+    # 策略 3: 全文匹配含有 "flag":"play" 的 JSON 物件
+    if not data:
+        for m in re.finditer(r'(\{"flag":"play"[^<]+?\})', response.text):
+            try:
+                candidate = json.loads(m.group(1))
+                if isinstance(candidate, dict) and ('url' in candidate or 'vod_data' in candidate):
+                    data = candidate
+                    break
+            except Exception:
+                continue
+
+    if not data:
         if token_match:
             raw_m3u8 = token_match.group(1)
             m3u8_url = resolve_gimy_stream(raw_m3u8, page_url=url)
@@ -1063,11 +1102,6 @@ def get_media_items(url):
                 }
             }]
         raise ValueError("Cannot find player_data in the webpage.")
-        
-    try:
-        data = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        raise ValueError("Failed to parse player_data JSON.")
         
     raw_m3u8 = data.get("url")
     m3u8_url = resolve_gimy_stream(raw_m3u8, page_url=url)
