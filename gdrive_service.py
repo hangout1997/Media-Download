@@ -151,7 +151,11 @@ def run_oauth_flow(timeout_seconds=180):
         # 逾時未完成授權時，oauthlib 會對 None 呼叫 .replace() 拋出 AttributeError
         creds = None
     if not creds:
-        raise TimeoutError("授權逾時，請重新點擊授權按鈕。")
+        raise TimeoutError(
+            "授權逾時或在 Google 頁面被拒。若 Google 顯示「403 access_denied / 尚未完成 Google 驗證程序」，"
+            "請到 https://console.cloud.google.com/auth/audience 將登入的 Gmail 加入「測試使用者」，"
+            "或按「發布應用程式」改為正式版後再重試。"
+        )
     with open(TOKEN_FILE, 'w', encoding='utf-8') as token:
         token.write(creds.to_json())
     return creds
