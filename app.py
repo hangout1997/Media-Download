@@ -1061,9 +1061,125 @@ def get_media_items(url):
         }]
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/122.0.0.0"
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": url,
     }
-    response = requests.get(url, headers=headers)
+    response = None
+    try:
+        r = _global_session.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            response = r
+    except Exception:
+        pass
+    if not response or response.status_code != 200:
+        try:
+            from curl_cffi import requests as curl_requests
+            r = curl_requests.get(url, headers=headers, impersonate="chrome124", timeout=15)
+            if r.status_code == 200:
+                response = r
+        except Exception:
+            pass
+
+    if not response:
+        response = requests.get(url, headers=headers, timeout=15)
+
+    # 策略 0: Gimy 新版動態 API 播放器架構 (data-pk 配合 /api.php/pk/q 接口)
+    pk_match = re.search(r'data-pk=["\']([^"\']+)["\']', response.text)
+    if pk_match:
+        pk = pk_match.group(1).strip()
+        parsed_origin = f"{urllib.parse.urlparse(url).scheme}://{urllib.parse.urlparse(url).netloc}"
+        api_url = f"{parsed_origin}/api.php/pk/q?k={urllib.parse.quote(pk)}"
+        api_headers = dict(headers)
+        api_headers['Referer'] = url
+        try:
+            r_api = _global_session.get(api_url, headers=api_headers, cookies=getattr(response, 'cookies', None), timeout=10)
+            if r_api.status_code == 200:
+                pk_data = r_api.json()
+                lines_list = pk_data.get('l', [])
+                if lines_list and isinstance(lines_list, list):
+                    # 提取所有候選線路
+                    candidates = [l_item.get('u', '') for l_item in lines_list if l_item.get('u')]
+                    
+                    # 依序解析各線路真實串流網址
+                    valid_streams = []
+                    for raw_cand in candidates:
+                        try:
+                            stream_u = resolve_gimy_stream(raw_cand, page_url=url)
+                            if stream_u and stream_u not in valid_streams:
+                                valid_streams.append(stream_u)
+                        except Exception:
+                            continue
+
+                    # 並行探測可用線路
+                    def _probe_stream(u):
+                        ref = 'https://v.attzy.com/' if any(d in u for d in ['hxx', 'attzy', 'telegram', 'shenhua']) else url
+                        probe_h = {'Referer': ref, 'User-Agent': headers['User-Agent']}
+                        if check_m3u8_accessible(u, headers=probe_h):
+                            return u
+                        return None
+
+                    with ThreadPoolExecutor(max_workers=min(5, max(1, len(valid_streams)))) as executor:
+                        probed = [s for s in executor.map(_probe_stream, valid_streams) if s is not None]
+
+                    chosen_url = probed[0] if probed else (valid_streams[0] if valid_streams else None)
+                    backup_urls = probed[1:] if len(probed) > 1 else []
+
+                    if chosen_url:
+                        # 標題提取
+                        title = "Gimy_Video"
+                        h1_m = re.search(r'<h1\b[^>]*>(.*?)</h1>', response.text, re.DOTALL)
+                        if h1_m:
+                            h1_content = h1_m.group(1)
+                            a_m = re.search(r'<a\b[^>]*>(.*?)</a>', h1_content, re.DOTALL)
+                            span_m = re.search(r'<span\b[^>]*>(.*?)</span>', h1_content, re.DOTALL)
+                            base_name = re.sub(r'<[^>]+>', '', a_m.group(1)).strip() if a_m else ""
+                            ep_name = re.sub(r'<[^>]+>', '', span_m.group(1)).strip() if span_m else ""
+                            ep_name = re.sub(r'^[-\s]+', '', ep_name).strip()
+
+                            match_s = re.search(r'第([一二三四五六七八九十\d]+)季', base_name)
+                            if match_s:
+                                s_num = cn_to_an(match_s.group(1))
+                                base_name = re.sub(r'第[一二三四五六七八九十\d]+季', f'S{s_num}', base_name)
+
+                            if ep_name:
+                                match_e = re.search(r'第(\d+)集', ep_name)
+                                if match_e:
+                                    ep_str = f"E{int(match_e.group(1)):02d}"
+                                else:
+                                    ep_str = ep_name
+                                title = f"{base_name} - {ep_str}" if base_name else ep_str
+                            elif base_name:
+                                title = base_name
+                            else:
+                                raw_h1 = re.sub(r'<[^>]+>', ' ', h1_content)
+                                title = ' '.join(raw_h1.split()).strip()
+                        else:
+                            t_m = re.search(r'<title>(.*?)</title>', response.text)
+                            if t_m:
+                                t_raw = t_m.group(1).strip()
+                                t_raw = re.sub(r'\s*(?:線上看)?\s*-\s*劇迷.*$', '', t_raw, flags=re.IGNORECASE).strip()
+                                if t_raw:
+                                    title = t_raw
+
+                        title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()
+                        if not title:
+                            title = "Gimy_Video"
+
+                        referer = 'https://v.attzy.com/' if any(d in chosen_url for d in ['hxx', 'attzy', 'telegram', 'shenhua']) else url
+                        return [{
+                            'url': chosen_url,
+                            'backup_urls': backup_urls,
+                            'title': title,
+                            'ext': 'mp4',
+                            'type': 'video',
+                            'headers': {
+                                'Referer': referer,
+                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                            }
+                        }]
+        except Exception as e:
+            print(f"Error fetching Gimy pk API: {e}")
+
     # 尋找播放器 JSON 資料 (相容 MacCMS 的 var player_aaaa = {...} 或 var player_data = {...} 等變體)
     data = None
     # 策略 1: 尋找直接賦值 JSON 物件的 player_xxxx 變數 (例如 MacCMS 的 var player_aaaa = {...})
