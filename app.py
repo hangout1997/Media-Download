@@ -17,6 +17,7 @@ import yt_dlp
 import streamlit as st
 import gdrive_service
 import media_converter
+import ramdisk_manager
 
 # ── 全域共用 Session（跨任務複用 TCP 連線池 + DNS 快取）──────────────────────
 _global_session = requests.Session()
@@ -1718,7 +1719,8 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
 
-    with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as tmp_ts:
+    scratch_dir = ramdisk_manager.get_scratch_dir()
+    with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir) as tmp_ts:
         tmp_ts_path = tmp_ts.name
         for chunk in segments_data:
             if chunk:
@@ -1855,10 +1857,12 @@ def download_media(media_item, force_audio=False):
     if is_gdrive:
         if gdrive_precheck_exists(filename):
             return
-        temp_dir = tempfile.gettempdir()
+        temp_dir = ramdisk_manager.get_scratch_dir()
         out_path = os.path.join(temp_dir, f"gdrive_tmp_{int(time.time()*1000)}_{filename}")
         _, _tgt_label = gdrive_service.get_target_folder()
-        st.info(f"☁️ 檔案將在暫存封裝後，**直接直送至 Google Drive `{_tgt_label}{filename}`**（不保留於本機）")
+        is_ram = ramdisk_manager.is_ramdisk_mounted() and temp_dir == ramdisk_manager.MOUNT_POINT
+        storage_note = "🚀 RAM Disk 純記憶體封裝" if is_ram else "暫存封裝"
+        st.info(f"☁️ 檔案將在{storage_note}後，**直接直送至 Google Drive `{_tgt_label}{filename}`**（零硬碟磨損，不保留於本機）")
     else:
         downloads_dir = st.session_state.get('download_dir', load_download_dir())
         is_writable, write_err = check_dir_writable(downloads_dir)
@@ -2125,7 +2129,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         
     is_gdrive = st.session_state.get('storage_destination') == "gdrive_cloud"
     if is_gdrive:
-        out_dir = tempfile.gettempdir()
+        out_dir = ramdisk_manager.get_scratch_dir()
     else:
         out_dir = st.session_state.get('download_dir', load_download_dir())
         is_writable, write_err = check_dir_writable(out_dir)
@@ -2454,7 +2458,15 @@ def release_resources():
         released_info.append("⚙️ 已嘗試終止背景殘留的 FFmpeg 與 yt-dlp 進程。")
     except Exception as e:
         released_info.append(f"⚠️ 嘗試終止進程時發生錯誤: {e}")
-        
+
+    # 5. 清理 RAM Disk 暫存檔案
+    if ramdisk_manager.is_ramdisk_mounted():
+        c_ram = ramdisk_manager.clean_scratch_files()
+        if c_ram > 0:
+            released_info.append(f"🚀 已清理 RAM Disk 暫存區中 {c_ram} 個暫存檔案。")
+        else:
+            released_info.append("🚀 RAM Disk 暫存區已為空。")
+
     return released_info
 
 # ========================================================
@@ -2757,7 +2769,43 @@ else:
         with q_cols[3]:
             st.button("📂 專案內 downloads", use_container_width=True, on_click=_cb_set_folder, args=(proj_downloads, "專案內部 downloads"))
 
-# 2. 系統資源清理控制列 (並排按鈕)
+# 2. 4GB RAM Disk 純記憶體模式控制列
+ram_mounted = ramdisk_manager.is_ramdisk_mounted()
+col_ram1, col_ram2 = st.columns([3, 1])
+with col_ram1:
+    if ram_mounted:
+        tot, used, free, pct = ramdisk_manager.get_ramdisk_usage()
+        st.success(
+            f"🚀 **4GB APFS RAM Disk 運行中 (100% 零 SSD 磨損)**\n\n"
+            f"容量：剩餘 `{free/1024/1024/1024:.2f} GB` / `{tot/1024/1024/1024:.2f} GB` (已用 {pct*100:.1f}%) ｜ 掛載點：`{ramdisk_manager.MOUNT_POINT}`"
+        )
+    else:
+        st.info(
+            "💡 **4GB RAM Disk 未掛載**：目前使用 macOS 系統 SSD 暫存。\n\n"
+            "建議點右側掛載 4GB APFS RAM Disk，切片封裝將全數在記憶體進行，達成 100% 零硬碟讀寫與極速封裝。"
+        )
+
+with col_ram2:
+    st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+    if ram_mounted:
+        if st.button("⏏️ 卸載 RAM Disk", use_container_width=True, help="立即歸還 4GB 記憶體給 macOS 系統"):
+            ok, msg = ramdisk_manager.unmount_ramdisk()
+            if ok:
+                st.session_state.pending_toast = ("✅ 已卸載 RAM Disk 並歸還 4GB 記憶體", "⏏️")
+            else:
+                st.error(msg)
+            st.rerun()
+    else:
+        if st.button("🚀 掛載 4GB RAM Disk", type="primary", use_container_width=True, help="免 root 建立 4GB APFS 虛擬記憶體磁碟"):
+            with st.spinner("正在向 macOS 申請劃分 4GB APFS RAM Disk..."):
+                ok, msg = ramdisk_manager.mount_ramdisk(size_gb=4)
+                if ok:
+                    st.session_state.pending_toast = ("✅ 4GB APFS RAM Disk 掛載成功！", "🚀")
+                else:
+                    st.error(msg)
+                st.rerun()
+
+# 3. 系統資源清理控制列 (並排按鈕)
 col_res1, col_res2 = st.columns(2)
 with col_res1:
     if st.button("🧹 僅釋放記憶體快取 (不關閉服務)", use_container_width=True, help="清空下載快取、暫存 Cookie 與釋放垃圾回收 RAM"):
@@ -2771,6 +2819,7 @@ with col_res1:
 with col_res2:
     if st.button("♻️ 釋放所有資源並關閉", type="primary", use_container_width=True):
         with st.spinner("正在釋放系統資源與關閉程式中..."):
+            ramdisk_manager.unmount_ramdisk()
             info = release_resources()
             for msg in info:
                 st.success(msg)
