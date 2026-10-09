@@ -378,8 +378,17 @@ def resolve_gimy_stream(player_url, page_url=''):
 
     raise ValueError(f"無法解析 Gimy 播放線路 ({player_url[:25]}...)，伺服器 API 解析失敗或未回傳有效影片網址。請在網頁切換至其他線路 (如 天堂雲、西瓜雲、極速雲等) 後再試。")
 
-def check_m3u8_accessible(m3u8_url, headers=None, timeout=2.5):
-    """快速探測 m3u8 串流是否可用 (排除 DNS 失敗、404 等失效伺服器)。"""
+def is_valid_m3u8_content(chunk_bytes):
+    """檢查內容是否為真正的 HLS m3u8 播放清單（排除 HTML 錯誤頁、防盜鏈頁面或 JSON）。"""
+    if not chunk_bytes:
+        return False
+    clean = chunk_bytes.lstrip(b'\xef\xbb\xbf \t\r\n')
+    if clean.startswith((b'<!DOCTYPE', b'<!doctype', b'<html', b'<HTML', b'<?xml', b'{"code"')):
+        return False
+    return b'#EXTM3U' in clean or b'#EXT-X-' in clean or b'#EXTINF' in clean
+
+def check_m3u8_accessible(m3u8_url, headers=None, timeout=3.0):
+    """快速探測 m3u8 串流是否可用 (排除 DNS 失敗、404、防盜鏈阻擋與回傳 HTML 的無效伺服器)。"""
     if not m3u8_url or not m3u8_url.startswith(('http://', 'https://')):
         return False
 
@@ -391,32 +400,43 @@ def check_m3u8_accessible(m3u8_url, headers=None, timeout=2.5):
     try:
         r = _global_session.get(m3u8_url, headers=req_headers, timeout=timeout, stream=True)
         if r.status_code in [200, 206]:
-            chunk = next(r.iter_content(512), b"")
-            if b"#EXT" in chunk or len(chunk) > 0:
+            chunk = next(r.iter_content(1024), b"")
+            if is_valid_m3u8_content(chunk):
                 return True
     except Exception:
         pass
 
-    # 2. 備援：帶 Referer https://www.movieffm.net/
+    # 2. 備援：帶常見 Referer 重試 (部分 CDN 防盜鏈需特定 Referer)
     try:
-        h2 = dict(req_headers)
-        h2['Referer'] = 'https://www.movieffm.net/'
-        r = _global_session.get(m3u8_url, headers=h2, timeout=timeout, stream=True)
-        if r.status_code in [200, 206]:
-            return True
+        parsed = urllib.parse.urlparse(m3u8_url)
+        for ref in ['https://www.movieffm.net/', 'https://www.mvffm.net/', f"{parsed.scheme}://{parsed.netloc}/"]:
+            if req_headers.get('Referer') == ref:
+                continue
+            h2 = dict(req_headers)
+            h2['Referer'] = ref
+            r = _global_session.get(m3u8_url, headers=h2, timeout=timeout, stream=True)
+            if r.status_code in [200, 206]:
+                chunk = next(r.iter_content(1024), b"")
+                if is_valid_m3u8_content(chunk):
+                    return True
     except Exception:
         pass
 
-    # 3. 備援：curl_cffi 模擬瀏覽器
+    # 3. 備援：curl_cffi 模擬真實瀏覽器 TLS 指紋探測
     try:
         from curl_cffi import requests as curl_requests
-        r = curl_requests.get(m3u8_url, headers=req_headers, impersonate="chrome124", timeout=timeout)
-        if r.status_code in [200, 206] and len(r.content) > 0:
-            return True
+        for imp in ["chrome124", "safari15_5"]:
+            try:
+                r = curl_requests.get(m3u8_url, headers=req_headers, impersonate=imp, timeout=timeout)
+                if r.status_code in [200, 206] and is_valid_m3u8_content(r.content[:1024]):
+                    return True
+            except Exception:
+                pass
     except Exception:
         pass
 
     return False
+
 
 def get_media_items(url):
     url = normalize_input_url(url)
@@ -577,18 +597,28 @@ def get_media_items(url):
                         if u and (u.startswith('http://') or u.startswith('https://')) and '.m3u8' in u:
                             valid_candidates.append(u)
                     
-                    chosen_movie_url = None
-                    for cand_url in valid_candidates:
-                        if check_m3u8_accessible(cand_url, headers=headers):
-                            chosen_movie_url = cand_url
-                            break
-                            
-                    if not chosen_movie_url and valid_candidates:
-                        chosen_movie_url = valid_candidates[0]
+                    def _probe_cand(u):
+                        if check_m3u8_accessible(u, headers=headers):
+                            return u
+                        return None
+
+                    with ThreadPoolExecutor(max_workers=min(5, max(1, len(valid_candidates)))) as executor:
+                        probed_cands = [res for res in executor.map(_probe_cand, valid_candidates) if res is not None]
+
+                    chosen_movie_url = probed_cands[0] if probed_cands else None
+                    backup_movie_urls = probed_cands[1:] if len(probed_cands) > 1 else []
+
+                    # 若並行檢測未通過，退回用較寬鬆的超時重試
+                    if not chosen_movie_url:
+                        for cand_url in valid_candidates:
+                            if check_m3u8_accessible(cand_url, headers=headers, timeout=5.0):
+                                chosen_movie_url = cand_url
+                                break
 
                     if chosen_movie_url:
                         items.append({
                             'url': chosen_movie_url,
+                            'backup_urls': backup_movie_urls,
                             'title': title,
                             'ext': 'mp4',
                             'type': 'video',
@@ -617,21 +647,9 @@ def get_media_items(url):
                         }
                     })
                     break
-            
-            if not items and m3u8_matches:
-                items.append({
-                    'url': m3u8_matches[0].replace(r'\/', '/'),
-                    'title': title,
-                    'ext': 'mp4',
-                    'type': 'video',
-                    'headers': {
-                        'Referer': url,
-                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-                    }
-                })
 
         if not items:
-            raise ValueError("無法從 Movieffm 頁面中解析出有效的影片串流網址 (m3u8)。")
+            raise ValueError("無法從 Movieffm 頁面中解析出有效的影片串流網址 (m3u8)。所有提供之播放線路均無法連線或伺服器已失效。")
 
         return items
 
@@ -1459,6 +1477,9 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         raise ValueError(f"無法讀取 m3u8 串流選單 ({url})")
 
     text = fetch_text(m3u8_url)
+    clean_text = text.lstrip('\ufeff \t\r\n')
+    if not (clean_text.startswith("#EXT") or "#EXTM3U" in clean_text or "#EXT-X-" in clean_text):
+        raise ValueError(f"伺服器回傳非有效的 m3u8 內容 (可能為網頁阻擋或無效連結): {clean_text[:120]}")
 
     # ── Master Playlist：優先用 RESOLUTION 高度排序，其次 BANDWIDTH ──────────
     if "#EXT-X-STREAM-INF" in text:
@@ -1483,6 +1504,9 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             sub_playlists.sort(key=lambda x: (x[0], x[1]), reverse=True)
             m3u8_url = sub_playlists[0][2]
             text = fetch_text(m3u8_url)
+            clean_sub = text.lstrip('\ufeff \t\r\n')
+            if not (clean_sub.startswith("#EXT") or "#EXTM3U" in clean_sub or "#EXT-X-" in clean_sub):
+                raise ValueError(f"取得之子播放清單非有效 m3u8: {clean_sub[:120]}")
 
     # ── 智慧廣告切片過濾 (片頭賭博貼片、中插廣告與第三方廣告 CDN) ───────────
     segment_urls, segment_durations, clean_m3u8_text, ad_count, ad_dur = filter_and_clean_m3u8_ads(text, m3u8_url)
@@ -1724,11 +1748,16 @@ def download_media(media_item, force_audio=False):
         extra_headers = media_item.get('headers', {})
 
         if "m3u8" in media_url and not force_audio:
-            try:
-                download_fast_parallel_hls(media_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
-                return
-            except Exception as hls_err:
-                st.warning(f"⚠️ 多線程下載失敗 ({hls_err})，降級使用標準 FFmpeg 串流處理...")
+            cand_m3u8s = [media_url] + [u for u in media_item.get('backup_urls', []) if u != media_url]
+            for c_idx, c_url in enumerate(cand_m3u8s):
+                try:
+                    if c_idx > 0:
+                        st.info(f"🔄 嘗試切換至備用串流線路 ({c_idx+1}/{len(cand_m3u8s)}): `{c_url}`")
+                    download_fast_parallel_hls(c_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
+                    return
+                except Exception as hls_err:
+                    if c_idx == len(cand_m3u8s) - 1:
+                        st.warning(f"⚠️ 多線程下載失敗 ({hls_err})，降級使用標準 FFmpeg 串流處理...")
 
         webpage_url = media_item.get('webpage_url', '')
         is_direct_stream = "m3u8" in media_url or any(media_url.lower().split('?')[0].endswith(ext) for ext in ['.mp4', '.m4a', '.mp3', '.flv', '.ts', '.webm', '.mkv'])
