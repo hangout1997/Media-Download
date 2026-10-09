@@ -1896,6 +1896,9 @@ def download_media(media_item, force_audio=False):
                     if c_idx > 0:
                         st.info(f"🔄 嘗試切換至備用串流線路 ({c_idx+1}/{len(cand_m3u8s)}): `{c_url}`")
                     download_fast_parallel_hls(c_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
+                    if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+                        raise ValueError("封裝後輸出檔案不存在或為空")
+                    finish_output_file(out_path, filename)
                     return
                 except Exception as hls_err:
                     if c_idx == len(cand_m3u8s) - 1:
