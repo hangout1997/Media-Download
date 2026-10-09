@@ -207,12 +207,4 @@ def get_scratch_dir(min_free_bytes=500 * 1024 * 1024):
     return tempfile.gettempdir()
 
 
-# 於行程結束時嘗試自動卸載
-def _auto_cleanup_at_exit():
-    try:
-        if is_ramdisk_mounted():
-            unmount_ramdisk()
-    except Exception:
-        pass
 
-atexit.register(_auto_cleanup_at_exit)
