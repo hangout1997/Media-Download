@@ -621,6 +621,7 @@ def get_media_items(url, cookies=None):
                 'type': 'video',
                 'headers': {
                     'Referer': url,
+                    'Origin': 'https://missav.ai',
                     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
                 }
             })
@@ -1476,6 +1477,13 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         req_headers.update(extra_headers)
     if 'Referer' not in req_headers:
         req_headers['Referer'] = f"https://{urllib.parse.urlparse(m3u8_url).netloc}/"
+    if 'surrit' in m3u8_url or 'missav' in req_headers.get('Referer', ''):
+        req_headers['Origin'] = 'https://missav.ai'
+        if 'Referer' not in req_headers or not req_headers['Referer']:
+            req_headers['Referer'] = 'https://missav.ai/'
+        req_headers['Sec-Fetch-Dest'] = 'empty'
+        req_headers['Sec-Fetch-Mode'] = 'cors'
+        req_headers['Sec-Fetch-Site'] = 'cross-site'
 
     session = _global_session
     thread_local = threading.local()
@@ -1486,15 +1494,16 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         return thread_local.curl_session
 
     def fetch_text(url):
+        # 優先嘗試 curl_cffi 模擬 Chrome 124 TLS 指紋 (免疫 Cloudflare WAF / 403 阻擋)
         try:
-            r = session.get(url, headers=req_headers, timeout=30)
-            if r.status_code == 200:
+            r = get_curl_session().get(url, headers=req_headers, timeout=30)
+            if r.status_code == 200 and r.text:
                 return r.text
         except Exception:
             pass
         try:
-            r = get_curl_session().get(url, headers=req_headers, timeout=30)
-            if r.status_code == 200:
+            r = session.get(url, headers=req_headers, timeout=30)
+            if r.status_code == 200 and r.text:
                 return r.text
         except Exception:
             pass
@@ -1558,9 +1567,18 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     segments_data = [b""] * total_segments
 
+    is_cf_protected = any(k in m3u8_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"])
+
     def download_segment(args):
         idx, seg_url = args
         for attempt in range(3):
+            if is_cf_protected:
+                try:
+                    r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
+                    if r.status_code == 200 and len(r.content) > 0:
+                        return idx, r.content
+                except Exception:
+                    pass
             try:
                 r = session.get(seg_url, headers=req_headers, timeout=15)
                 if r.status_code == 200 and len(r.content) > 0:
@@ -1568,7 +1586,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             except Exception:
                 pass
             try:
-                r = get_curl_session().get(seg_url, headers=req_headers, timeout=15)
+                r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
             except Exception:
@@ -1606,6 +1624,10 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                     pct = completed / total_segments
                 if progress_cb:
                     progress_cb(pct, completed_duration, total_duration, speed_mb, speed_x)
+
+    valid_count = sum(1 for c in segments_data if len(c) > 0)
+    if total_segments > 0 and valid_count < total_segments * 0.7:
+        raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線。")
 
     if scratch_dir is None:
         try:
@@ -1749,6 +1771,13 @@ def download_media_to_path(media_item, out_path, force_audio=False, cookies=None
                     pass
 
     # 4. 標準 FFmpeg 直接串流下載
+    if extra_headers is None:
+        extra_headers = {}
+    if "surrit" in media_url or "missav" in extra_headers.get("Referer", ""):
+        extra_headers["Origin"] = "https://missav.ai"
+        if "Referer" not in extra_headers:
+            extra_headers["Referer"] = "https://missav.ai/"
+
     headers_arg = []
     if extra_headers:
         headers_str = "".join(f"{k}: {v}\r\n" for k, v in extra_headers.items())
