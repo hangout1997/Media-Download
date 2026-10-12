@@ -611,8 +611,18 @@ def get_media_items(url, cookies=None):
                     m3u8_url = m3u8_direct.group(1)
                     break
 
-            if not m3u8_url:
-                raise ValueError("無法從頁面中解析出影片串流網址 (m3u8)。")
+            # 嘗試直接獲取 m3u8 選單內容，免去後續重複請求
+            m3u8_text = None
+            try:
+                r_m3u8 = curl_requests.get(m3u8_url, headers={
+                    'Referer': url,
+                    'Origin': 'https://missav.ai',
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                }, impersonate='chrome124', timeout=15)
+                if r_m3u8.status_code == 200 and r_m3u8.text:
+                    m3u8_text = r_m3u8.text
+            except Exception:
+                pass
 
             items.append({
                 'url': m3u8_url,
@@ -623,7 +633,8 @@ def get_media_items(url, cookies=None):
                     'Referer': url,
                     'Origin': 'https://missav.ai',
                     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-                }
+                },
+                'm3u8_content': m3u8_text
             })
             return items
 
@@ -1464,11 +1475,12 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載", pro
     return process.returncode, stderr_log
 
 
-def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_workers=None, label="影片", progress_cb=None, scratch_dir=None):
+def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_workers=None, label="影片", progress_cb=None, scratch_dir=None, m3u8_content=None):
     """
     平行 HLS 下載引擎（全量 RAM 快取模式，自動過濾片頭賭博/貼片廣告）。
     progress_cb: 可選 callback(pct: float, completed_dur: float, total_dur: float, speed_mb: float, speed_x: float)
     scratch_dir: 封裝中繼目錄 (預設為 None，將依序嘗試 RAM Disk 或系統暫存)
+    m3u8_content: 可選預先抓取的 m3u8 內容 (若提供則完全免除對 m3u8 的 HTTP 請求，100% 免疫 WAF 阻擋)
     """
     from curl_cffi import requests as curl_requests
 
@@ -1513,7 +1525,12 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         diag = "; ".join(err_details)
         raise ValueError(f"無法讀取 m3u8 串流選單 ({url}): {diag}")
 
-    text = fetch_text(m3u8_url)
+    # 若已預先提供有效 m3u8 內容，直接跳過網路請求 (避免雲端節點被 Cloudflare 403 阻擋)
+    if m3u8_content and (m3u8_content.lstrip().startswith("#EXT") or "#EXTM3U" in m3u8_content or "#EXT-X-" in m3u8_content):
+        text = m3u8_content
+    else:
+        text = fetch_text(m3u8_url)
+
     clean_text = text.lstrip('\ufeff \t\r\n')
     if not (clean_text.startswith("#EXT") or "#EXTM3U" in clean_text or "#EXT-X-" in clean_text):
         raise ValueError(f"伺服器回傳非有效的 m3u8 內容 (可能為網頁阻擋或無效連結): {clean_text[:120]}")
@@ -1572,6 +1589,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     segments_data = [b""] * total_segments
 
     is_cf_protected = any(k in m3u8_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"]) or "missav" in req_headers.get("Referer", "") or "missav" in req_headers.get("Origin", "")
+    seg_fail_sample = []
 
     def download_segment(args):
         idx, seg_url = args
@@ -1581,14 +1599,20 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                     r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
                     if r.status_code == 200 and len(r.content) > 0:
                         return idx, r.content
-                except Exception:
-                    pass
+                    elif r.status_code != 200 and len(seg_fail_sample) < 3:
+                        seg_fail_sample.append(f"HTTP {r.status_code}")
+                except Exception as e:
+                    if len(seg_fail_sample) < 3:
+                        seg_fail_sample.append(f"curl_cffi: {e}")
             try:
                 r = session.get(seg_url, headers=req_headers, timeout=15)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
-            except Exception:
-                pass
+                elif r.status_code != 200 and len(seg_fail_sample) < 3:
+                    seg_fail_sample.append(f"requests HTTP {r.status_code}")
+            except Exception as e:
+                if len(seg_fail_sample) < 3:
+                    seg_fail_sample.append(f"requests: {e}")
             try:
                 r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
                 if r.status_code == 200 and len(r.content) > 0:
@@ -1631,7 +1655,8 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     valid_count = sum(1 for c in segments_data if len(c) > 0)
     if total_segments > 0 and valid_count < total_segments * 0.7:
-        raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線。")
+        fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
+        raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
 
     if scratch_dir is None:
         try:
@@ -1708,6 +1733,7 @@ def download_media_to_path(media_item, out_path, force_audio=False, cookies=None
     last_hls_err = None
     if "m3u8" in media_url and not force_audio:
         cand_m3u8s = [media_url] + [u for u in media_item.get('backup_urls', []) if u != media_url]
+        m3u8_content = media_item.get('m3u8_content')
         for c_idx, c_url in enumerate(cand_m3u8s):
             try:
                 download_fast_parallel_hls(
@@ -1717,7 +1743,8 @@ def download_media_to_path(media_item, out_path, force_audio=False, cookies=None
                     max_workers=16,
                     label=title,
                     progress_cb=progress_cb,
-                    scratch_dir=scratch_dir
+                    scratch_dir=scratch_dir,
+                    m3u8_content=m3u8_content if c_idx == 0 else None
                 )
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     return out_path

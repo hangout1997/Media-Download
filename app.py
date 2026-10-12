@@ -433,7 +433,47 @@ def check_m3u8_accessible(m3u8_url, headers=None, timeout=3.0):
     except Exception:
         pass
 
-    return False
+def _ensure_m3u8_prefetched(items):
+    """在本機端預先抓取 m3u8 選單內容，免除雲端 Colab 節點受 Cloudflare 403 阻擋"""
+    if not items:
+        return items
+    from curl_cffi import requests as curl_requests
+    for it in items:
+        m_url = it.get('url', '')
+        if 'm3u8' in m_url and not it.get('m3u8_content'):
+            m_headers = it.get('headers', {})
+            try:
+                r = curl_requests.get(m_url, headers=m_headers, impersonate='chrome124', timeout=15)
+                if r.status_code == 200 and r.text:
+                    m3u8_text = r.text
+                    if "#EXT-X-STREAM-INF" in m3u8_text:
+                        sub_playlists = []
+                        cur_inf = {}
+                        for line in m3u8_text.splitlines():
+                            line = line.strip()
+                            if line.startswith("#EXT-X-STREAM-INF"):
+                                bw_m = re.search(r"BANDWIDTH=(\d+)", line)
+                                res_m = re.search(r"RESOLUTION=\d+x(\d+)", line)
+                                cur_inf['bw'] = int(bw_m.group(1)) if bw_m else 0
+                                cur_inf['height'] = int(res_m.group(1)) if res_m else 0
+                            elif line and not line.startswith("#"):
+                                sub_playlists.append((
+                                    cur_inf.get('height', 0),
+                                    cur_inf.get('bw', 0),
+                                    urllib.parse.urljoin(m_url, line)
+                                ))
+                                cur_inf = {}
+                        if sub_playlists:
+                            sub_playlists.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                            sub_url = sub_playlists[0][2]
+                            r_sub = curl_requests.get(sub_url, headers=m_headers, impersonate='chrome124', timeout=15)
+                            if r_sub.status_code == 200 and r_sub.text:
+                                it['url'] = sub_url
+                                m3u8_text = r_sub.text
+                    it['m3u8_content'] = m3u8_text
+            except Exception:
+                pass
+    return items
 
 
 def get_media_items(url):
@@ -731,8 +771,18 @@ def get_media_items(url):
                     m3u8_url = m3u8_direct.group(1)
                     break
 
-            if not m3u8_url:
-                raise ValueError("無法從頁面中解析出影片串流網址 (m3u8)。")
+            # 嘗試直接獲取 m3u8 選單內容，免去後續重複請求
+            m3u8_text = None
+            try:
+                r_m3u8 = curl_requests.get(m3u8_url, headers={
+                    'Referer': url,
+                    'Origin': 'https://missav.ai',
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                }, impersonate='chrome124', timeout=15)
+                if r_m3u8.status_code == 200 and r_m3u8.text:
+                    m3u8_text = r_m3u8.text
+            except Exception:
+                pass
 
             items.append({
                 'url': m3u8_url,
@@ -743,7 +793,8 @@ def get_media_items(url):
                     'Referer': url,
                     'Origin': 'https://missav.ai',
                     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-                }
+                },
+                'm3u8_content': m3u8_text
             })
             return items
 
@@ -2918,12 +2969,12 @@ with tab1:
             save_folder = target_label.strip('/') if target_label else "Download"
 
             resolved_map = {}
-            with st.spinner("🔍 正在本機快速預解析串流 (免疫 Cloudflare/WAF 阻擋)..."):
+            with st.spinner("🔍 正在本機快速預解析串流與選單 (免疫 Cloudflare/WAF 阻擋)..."):
                 for u in urls:
                     try:
                         m_items = get_media_items(u)
                         if m_items:
-                            resolved_map[u] = m_items
+                            resolved_map[u] = _ensure_m3u8_prefetched(m_items)
                     except Exception:
                         pass
 
@@ -3086,12 +3137,12 @@ with tab2:
                     save_folder = target_label.strip('/') if target_label else "Download"
 
                     resolved_map = {}
-                    with st.spinner("🔍 正在本機快速預解析串流 (免疫 Cloudflare/WAF 阻擋)..."):
+                    with st.spinner("🔍 正在本機快速預解析串流與選單 (免疫 Cloudflare/WAF 阻擋)..."):
                         for u in urls_to_process:
                             try:
                                 m_items = get_media_items(u)
                                 if m_items:
-                                    resolved_map[u] = m_items
+                                    resolved_map[u] = _ensure_m3u8_prefetched(m_items)
                             except Exception:
                                 pass
 
