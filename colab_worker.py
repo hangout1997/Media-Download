@@ -32,7 +32,8 @@ def get_drive_base():
 def ensure_core_downloader():
     try:
         import urllib.request
-        raw_url = 'https://raw.githubusercontent.com/hangout1997/Media-Download/main/core_downloader.py'
+        ts = int(time.time())
+        raw_url = f'https://raw.githubusercontent.com/hangout1997/Media-Download/main/core_downloader.py?ts={ts}'
         urllib.request.urlretrieve(raw_url, '/content/core_downloader.py')
         if '/content' not in sys.path:
             sys.path.insert(0, '/content')
@@ -236,7 +237,7 @@ def run():
                             pass
 
                     res_path = cd.download_media_to_path(
-                        item, out_path=local_temp_path, force_audio=only_audio, cookies=cookies, progress_cb=_prog
+                        item, out_path=local_temp_path, force_audio=only_audio, cookies=cookies, progress_cb=_prog, scratch_dir=local_cache_dir
                     )
 
                     if not os.path.exists(res_path) or os.path.getsize(res_path) == 0:
@@ -289,6 +290,8 @@ def run():
             last_hb_t = now_t
 
         task_files = glob.glob(os.path.join(queue_dir, 'task_*.json'))
+        if task_files:
+            cd = ensure_core_downloader()
         for tf in task_files:
             process_one_task(tf)
         time.sleep(2)

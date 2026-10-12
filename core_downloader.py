@@ -1495,19 +1495,23 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     def fetch_text(url):
         # 優先嘗試 curl_cffi 模擬 Chrome 124 TLS 指紋 (免疫 Cloudflare WAF / 403 阻擋)
+        err_details = []
         try:
             r = get_curl_session().get(url, headers=req_headers, timeout=30)
             if r.status_code == 200 and r.text:
                 return r.text
-        except Exception:
-            pass
+            err_details.append(f"curl_cffi HTTP {r.status_code}")
+        except Exception as e:
+            err_details.append(f"curl_cffi: {e}")
         try:
             r = session.get(url, headers=req_headers, timeout=30)
             if r.status_code == 200 and r.text:
                 return r.text
-        except Exception:
-            pass
-        raise ValueError(f"無法讀取 m3u8 串流選單 ({url})")
+            err_details.append(f"requests HTTP {r.status_code}")
+        except Exception as e:
+            err_details.append(f"requests: {e}")
+        diag = "; ".join(err_details)
+        raise ValueError(f"無法讀取 m3u8 串流選單 ({url}): {diag}")
 
     text = fetch_text(m3u8_url)
     clean_text = text.lstrip('\ufeff \t\r\n')
@@ -1567,7 +1571,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     segments_data = [b""] * total_segments
 
-    is_cf_protected = any(k in m3u8_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"])
+    is_cf_protected = any(k in m3u8_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"]) or "missav" in req_headers.get("Referer", "") or "missav" in req_headers.get("Origin", "")
 
     def download_segment(args):
         idx, seg_url = args
@@ -1656,7 +1660,15 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         ]
         proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
-            raise ValueError(f"FFmpeg 無損封裝失敗: {proc.stderr.decode('utf-8', errors='ignore')}")
+            err_raw = proc.stderr.decode('utf-8', errors='ignore')
+            err_lines = [
+                l.strip() for l in err_raw.splitlines()
+                if l.strip() and not any(l.strip().startswith(k) for k in [
+                    "ffmpeg version", "configuration:", "built with", "libav", "libsw", "libpost", "  built with"
+                ])
+            ]
+            clean_err = " | ".join(err_lines[-3:]) if err_lines else err_raw[-300:]
+            raise ValueError(f"FFmpeg 無損封裝失敗: {clean_err}")
     finally:
         try:
             if os.path.exists(tmp_ts_path):
@@ -1693,6 +1705,7 @@ def download_media_to_path(media_item, out_path, force_audio=False, cookies=None
     extra_headers = media_item.get('headers', {})
 
     # 2. HLS / m3u8 多線程切片下載
+    last_hls_err = None
     if "m3u8" in media_url and not force_audio:
         cand_m3u8s = [media_url] + [u for u in media_item.get('backup_urls', []) if u != media_url]
         for c_idx, c_url in enumerate(cand_m3u8s):
@@ -1709,8 +1722,14 @@ def download_media_to_path(media_item, out_path, force_audio=False, cookies=None
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     return out_path
             except Exception as hls_err:
+                last_hls_err = hls_err
                 if c_idx == len(cand_m3u8s) - 1:
-                    _log_info(f"多線程下載備援耗盡，降級使用標準 FFmpeg/yt-dlp: {hls_err}")
+                    _log_info(f"多線程下載備援耗盡: {hls_err}")
+
+        # 若串流屬於 Cloudflare 防護網域 (如 MissAV / surrit.com)，標準 FFmpeg CLI 必定會被 403 阻擋，直接拋出多線程詳細錯誤
+        is_cf_protected = any(k in media_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"]) or "missav" in extra_headers.get("Referer", "") or "missav" in extra_headers.get("Origin", "")
+        if is_cf_protected and last_hls_err:
+            raise RuntimeError(f"HLS 多線程下載失敗 (來源受 Cloudflare 防護，FFmpeg CLI 無法直連): {last_hls_err}")
 
     # 3. yt-dlp 支援平台 (YouTube, Bilibili, FB, IG 等)
     webpage_url = media_item.get('webpage_url', '')
@@ -1797,4 +1816,14 @@ def download_media_to_path(media_item, out_path, force_audio=False, cookies=None
     ret, stderr = run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=total_dur, label=title)
     if ret == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
         return out_path
-    raise RuntimeError(f"FFmpeg 下載失敗: {stderr[:300]}")
+
+    err_lines = [
+        l.strip() for l in stderr.splitlines()
+        if l.strip() and not any(l.strip().startswith(k) for k in [
+            "ffmpeg version", "configuration:", "built with", "libav", "libsw", "libpost", "  built with"
+        ])
+    ]
+    actual_err = " | ".join(err_lines[-4:]) if err_lines else stderr[-300:]
+    if last_hls_err:
+        raise RuntimeError(f"多線程 HLS 下載失敗 ({last_hls_err})，且 FFmpeg 備援亦失敗: {actual_err}")
+    raise RuntimeError(f"FFmpeg 下載失敗: {actual_err}")
