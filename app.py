@@ -2814,6 +2814,7 @@ ram_mounted = ramdisk_manager.is_ramdisk_mounted()
 col_ram1, col_ram2 = st.columns([3, 1])
 with col_ram1:
     if ram_mounted:
+        ramdisk_manager.auto_purge_if_full()
         tot, used, free, pct = ramdisk_manager.get_ramdisk_usage()
         st.success(
             f"🚀 **4GB APFS RAM Disk 運行中 (100% 零 SSD 磨損)**\n\n"

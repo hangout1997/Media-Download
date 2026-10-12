@@ -194,17 +194,30 @@ def get_ramdisk_usage():
         return 0, 0, 0, 0.0
 
 
-def get_scratch_dir(min_free_bytes=500 * 1024 * 1024):
+def auto_purge_if_full(threshold_pct=0.85):
+    """若 RAM Disk 使用率超過門檻 (預設 85%) 或剩餘不足 500MB，自動清理暫存殘留檔以防磁碟滿溢崩潰。"""
+    if not is_ramdisk_mounted():
+        return 0
+    _, _, free, pct = get_ramdisk_usage()
+    if pct >= threshold_pct or free < 500 * 1024 * 1024:
+        return clean_scratch_files()
+    return 0
+
+
+def get_scratch_dir(min_free_bytes=1024 * 1024 * 1024):
     """
     取得建議的暫存處理目錄：
-    - 若 RAM Disk 已掛載且剩餘空間大於 min_free_bytes (預設 500MB)，優先使用 RAM Disk（100% 零 SSD 磨損）
-    - 若未啟用或空間不足，自動安全降級為系統暫存目錄 (tempfile.gettempdir())
+    - 若 RAM Disk 已掛載且剩餘空間充裕 (>= 1GB)，優先使用 RAM Disk（100% 零 SSD 磨損）
+    - 若空間不足，自動嘗試 auto_purge_if_full() 清理過期暫存
+    - 若依然空間不足，自動安全降級為系統暫存目錄 (tempfile.gettempdir())，徹底避免 ENOSPC 造成程式崩潰
     """
     if is_ramdisk_mounted():
+        auto_purge_if_full()
         _, _, free, _ = get_ramdisk_usage()
         if free >= min_free_bytes:
             return MOUNT_POINT
     return tempfile.gettempdir()
+
 
 
 
