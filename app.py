@@ -2890,19 +2890,31 @@ with tab1:
             _, reason = check_dir_writable(target_check_dir)
             st.error(f"❌ **無法開始下載：目標儲存目錄為唯讀或無寫入權限！**\n\n📍 路徑：`{target_check_dir}`\n⚠️ 原因：{reason}\n\n💡 請切換至本機可寫入的資料夾（如 Downloads）後再下載。")
         elif st.session_state.get('storage_destination') == "colab_cloud":
-            st.info(f"🚀 正在將 {len(urls)} 個下載任務派送至 Google Colab Worker...")
             cookies = {
                 "facebook": st.session_state.get("fb_cookie", ""),
                 "bilibili": st.session_state.get("bili_cookie", "")
             }
             target_id, target_label = gdrive_service.get_target_folder()
             save_folder = target_label.strip('/') if target_label else "Download"
+
+            resolved_map = {}
+            with st.spinner("🔍 正在本機快速預解析串流 (免疫 Cloudflare/WAF 阻擋)..."):
+                for u in urls:
+                    try:
+                        m_items = get_media_items(u)
+                        if m_items:
+                            resolved_map[u] = m_items
+                    except Exception:
+                        pass
+
+            st.info(f"🚀 正在將 {len(urls)} 個下載任務派送至 Google Colab Worker...")
             try:
                 task_id = gdrive_bridge.submit_cloud_task(
                     urls=urls,
                     save_folder=save_folder,
                     only_audio=False,
-                    cookies=cookies
+                    cookies=cookies,
+                    resolved_map=resolved_map
                 )
             except Exception as e:
                 st.error(f"❌ 任務發送至 Google Drive 佇列失敗: {e}")
@@ -3046,19 +3058,31 @@ with tab2:
             
             if urls_to_process:
                 if st.session_state.get('storage_destination') == "colab_cloud":
-                    st.info(f"🚀 正在將 {len(urls_to_process)} 個音訊提取任務派送至 Google Colab Worker...")
                     cookies = {
                         "facebook": st.session_state.get("fb_cookie", ""),
                         "bilibili": st.session_state.get("bili_cookie", "")
                     }
                     target_id, target_label = gdrive_service.get_target_folder()
                     save_folder = target_label.strip('/') if target_label else "Download"
+
+                    resolved_map = {}
+                    with st.spinner("🔍 正在本機快速預解析串流 (免疫 Cloudflare/WAF 阻擋)..."):
+                        for u in urls_to_process:
+                            try:
+                                m_items = get_media_items(u)
+                                if m_items:
+                                    resolved_map[u] = m_items
+                            except Exception:
+                                pass
+
+                    st.info(f"🚀 正在將 {len(urls_to_process)} 個音訊提取任務派送至 Google Colab Worker...")
                     try:
                         task_id = gdrive_bridge.submit_cloud_task(
                             urls=urls_to_process,
                             save_folder=save_folder,
                             only_audio=True,
-                            cookies=cookies
+                            cookies=cookies,
+                            resolved_map=resolved_map
                         )
                     except Exception as e:
                         st.error(f"❌ 任務發送至 Google Drive 佇列失敗: {e}")

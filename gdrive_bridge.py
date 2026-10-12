@@ -27,9 +27,10 @@ def get_or_create_queue_folder():
     _queue_folder_id = gdrive_service.get_or_create_download_folder(service, QUEUE_FOLDER_NAME)
     return _queue_folder_id
 
-def submit_cloud_task(urls, save_folder="Download", only_audio=False, cookies=None):
+def submit_cloud_task(urls, save_folder="Download", only_audio=False, cookies=None, resolved_map=None):
     """
     由本地端提交下載任務至 Google Drive 佇列。
+    resolved_map: 本地預先解析之媒體項目對照表 {url: [media_item, ...]}，免疫雲端被 WAF/Cloudflare 403 阻擋。
     回傳 task_id (str)
     """
     service = gdrive_service.get_gdrive_service()
@@ -43,6 +44,7 @@ def submit_cloud_task(urls, save_folder="Download", only_audio=False, cookies=No
         "save_folder": save_folder,
         "only_audio": only_audio,
         "urls": urls,
+        "resolved_map": resolved_map or {},
         "cookies": cookies or {},
         "current_item": "",
         "progress_pct": 0.0,
