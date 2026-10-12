@@ -47,14 +47,37 @@ def ensure_core_downloader():
         import core_downloader as cd_mod
         return cd_mod
 
+def ensure_environment():
+    # 1. 檢查並自動安裝依賴
+    try:
+        import yt_dlp
+        import curl_cffi
+    except ImportError:
+        print("📦 正在自動安裝必要依賴 (yt-dlp, curl_cffi)...")
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "yt-dlp", "curl_cffi", "requests", "beautifulsoup4"])
+        print("✅ 依賴安裝完成！")
+
+    # 2. 檢查並自動掛載 Google Drive
+    candidates = ['/content/drive/MyDrive', '/content/drive/我的雲端硬碟']
+    if not any(os.path.exists(c) for c in candidates):
+        try:
+            print("🔑 正在自動掛載 Google Drive（若彈出視窗請點擊允許連接）...")
+            from google.colab import drive
+            drive.mount('/content/drive')
+            print("✅ Google Drive 掛載成功！")
+        except Exception as e:
+            print(f"⚠️ 自動掛載 Google Drive: {e}")
+
 def run():
     print("=" * 65)
     print("🤖 正在啟動 Google Colab 雲端工作節點...")
+    ensure_environment()
     
     drive_base = get_drive_base()
     if not os.path.exists(drive_base):
         print(f"❌ 找不到 Google Drive 掛載目錄 ({drive_base})！")
-        print("👉 請確認您已先執行【步驟 1：環境安裝與掛載 Google Drive】。")
+        print("👉 請確認 Google Drive 已授權連接。")
         return
 
     queue_dir = os.path.join(drive_base, 'MediaDownloadQueue')
