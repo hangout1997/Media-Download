@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import yt_dlp
 import streamlit as st
 import gdrive_service
+import gdrive_bridge
 import media_converter
 import ramdisk_manager
 
@@ -2516,22 +2517,33 @@ st.title("🎬 媒體下載與音訊提取器")
 # 1. 儲存目標選擇區
 _DEST_LOCAL = "📁 本機硬碟資料夾 (Local Disk)"
 _DEST_GDRIVE = "☁️ Google Drive 雲端直送 (不存本地硬碟)"
+_DEST_COLAB = "🤖 Google Colab 雲端直存 (0 本地頻寬)"
 
 def _cb_dest_change():
-    mode = "gdrive_cloud" if st.session_state.dest_radio == _DEST_GDRIVE else "local"
+    if st.session_state.dest_radio == _DEST_COLAB:
+        mode = "colab_cloud"
+    elif st.session_state.dest_radio == _DEST_GDRIVE:
+        mode = "gdrive_cloud"
+    else:
+        mode = "local"
     st.session_state.storage_destination = mode
     gdrive_service.update_config(storage_destination=mode)
 
 if "dest_radio" not in st.session_state:
-    st.session_state.dest_radio = _DEST_GDRIVE if st.session_state.storage_destination == "gdrive_cloud" else _DEST_LOCAL
+    if st.session_state.storage_destination == "colab_cloud":
+        st.session_state.dest_radio = _DEST_COLAB
+    elif st.session_state.storage_destination == "gdrive_cloud":
+        st.session_state.dest_radio = _DEST_GDRIVE
+    else:
+        st.session_state.dest_radio = _DEST_LOCAL
 
 st.radio(
     "📦 **儲存目標模式**:",
-    options=[_DEST_LOCAL, _DEST_GDRIVE],
+    options=[_DEST_LOCAL, _DEST_GDRIVE, _DEST_COLAB],
     key="dest_radio",
     horizontal=True,
     on_change=_cb_dest_change,
-    help="雲端直送：檔案先在系統暫存區完成封裝，再以 Google Drive API 分塊上傳至指定資料夾，上傳後立即刪除本機暫存。選擇會自動記住。",
+    help="選擇下載儲存方式。Colab 雲端直存模式由 Colab 遠端主機極速下載並直接封裝於雲端硬碟，本機零頻寬消耗。",
 )
 
 
@@ -2666,7 +2678,16 @@ def _render_gdrive_folder_picker():
                     st.error(f"❌ 無法存取此資料夾：{e}")
 
 
-if st.session_state.storage_destination == "gdrive_cloud":
+if st.session_state.storage_destination in ("gdrive_cloud", "colab_cloud"):
+    if st.session_state.storage_destination == "colab_cloud":
+        st.info("🤖 **Google Colab 雲端直存模式已啟動**：任務將自動提交至雲端佇列，由 Colab 遠端主機極速下載並直接封裝至 Google Drive，本機 0 頻寬消耗！")
+        with st.expander("📖 如何啟動 Colab 雲端 Worker 待命 (只需執行一次)", expanded=False):
+            st.markdown(
+                "1. 前往 Google Colab 開啟您的 `Media_Download_Colab.ipynb` 筆記本\n"
+                "2. 依序執行 **步驟 1**（安裝環境與掛載 Google Drive）\n"
+                "3. 執行 **模式一：啟動 Worker 待命監聽**（此 cell 會持續在背景待命）\n"
+                "4. 回到此處輸入網址並點擊下載，Colab 即會自動接單並將進度實時回傳至此頁面！"
+            )
     cred_path = gdrive_service.get_credentials_path()
     is_auth = gdrive_service.is_authenticated()
     user_email = gdrive_service.get_connected_account_email() if is_auth else None
@@ -2862,12 +2883,69 @@ with tab1:
         
         if not urls:
             st.warning("⚠️ 請先輸入網址！")
-        elif st.session_state.get('storage_destination') == "gdrive_cloud" and not gdrive_service.is_authenticated():
+        elif st.session_state.get('storage_destination') in ("gdrive_cloud", "colab_cloud") and not gdrive_service.is_authenticated():
             st.error("❌ **尚未連接 Google Drive**：請先在上方完成授權，或切換回「📁 本機硬碟資料夾」模式。")
         elif st.session_state.get('storage_destination') == "local" and not check_dir_writable(st.session_state.get('download_dir', load_download_dir()))[0]:
             target_check_dir = st.session_state.get('download_dir', load_download_dir())
             _, reason = check_dir_writable(target_check_dir)
             st.error(f"❌ **無法開始下載：目標儲存目錄為唯讀或無寫入權限！**\n\n📍 路徑：`{target_check_dir}`\n⚠️ 原因：{reason}\n\n💡 請切換至本機可寫入的資料夾（如 Downloads）後再下載。")
+        elif st.session_state.get('storage_destination') == "colab_cloud":
+            st.info(f"🚀 正在將 {len(urls)} 個下載任務派送至 Google Colab Worker...")
+            cookies = {
+                "facebook": st.session_state.get("fb_cookie", ""),
+                "bilibili": st.session_state.get("bili_cookie", "")
+            }
+            target_id, target_label = gdrive_service.get_target_folder()
+            save_folder = target_label.strip('/') if target_label else "Download"
+            try:
+                task_id = gdrive_bridge.submit_cloud_task(
+                    urls=urls,
+                    save_folder=save_folder,
+                    only_audio=False,
+                    cookies=cookies
+                )
+            except Exception as e:
+                st.error(f"❌ 任務發送至 Google Drive 佇列失敗: {e}")
+                task_id = None
+
+            if task_id:
+                st.success(f"✅ 任務已成功送達雲端佇列！(任務 ID: `{task_id}`)")
+                status_placeholder = st.empty()
+                progress_bar = st.progress(0.0)
+                detail_placeholder = st.empty()
+                
+                timeout_sec = 7200
+                start_time = time.time()
+                
+                with st.spinner("⏳ Colab Worker 處理中..."):
+                    while time.time() - start_time < timeout_sec:
+                        time.sleep(2)
+                        st_data = gdrive_bridge.get_cloud_task_status(task_id)
+                        if not st_data:
+                            status_placeholder.info("⏳ 正在等待 Colab 認領任務... (請確認 Colab 筆記本已執行 Mode 1 Worker)")
+                            continue
+                        
+                        st_status = st_data.get("status", "running")
+                        item_name = st_data.get("current_item", "")
+                        pct = float(st_data.get("progress_pct", 0.0))
+                        speed_mb = float(st_data.get("speed_mb", 0.0))
+                        log_msg = st_data.get("log", "")
+                        
+                        progress_bar.progress(min(max(pct, 0.0), 1.0))
+                        speed_text = f" | ⚡ {speed_mb:.2f} MB/s" if speed_mb > 0 else ""
+                        status_placeholder.markdown(f"🤖 **Colab 進度**: `{item_name}` ({int(pct*100)}%){speed_text}")
+                        if log_msg:
+                            detail_placeholder.caption(f"📝 最新訊息: `{log_msg}`")
+                        
+                        if st_status == "completed":
+                            progress_bar.progress(1.0)
+                            folder_link = gdrive_service.get_folder_link(target_id) if target_id else "https://drive.google.com/drive/my-drive"
+                            st.balloons()
+                            st.success(f"🎉 Colab 已全數下載並封裝完成！檔案已直接保存在 [我的雲端硬碟 `/{save_folder}/`]({folder_link})。")
+                            break
+                        elif st_status == "failed":
+                            st.error(f"❌ Colab 處理任務失敗: {log_msg}")
+                            break
         else:
             st.info(f"📥 準備下載 {len(urls)} 個影片檔案...")
             
@@ -2924,7 +3002,7 @@ with tab2:
         input_path = normalize_input_url(raw_input_path)
         if not input_path:
             st.warning("⚠️ 請先輸入路徑！")
-        elif st.session_state.get('storage_destination') == "gdrive_cloud" and not gdrive_service.is_authenticated():
+        elif st.session_state.get('storage_destination') in ("gdrive_cloud", "colab_cloud") and not gdrive_service.is_authenticated():
             st.error("❌ **尚未連接 Google Drive**：請先在上方完成授權，或切換回「📁 本機硬碟資料夾」模式。")
         elif st.session_state.get('storage_destination') == "local" and not check_dir_writable(st.session_state.get('download_dir', load_download_dir()))[0]:
             target_check_dir = st.session_state.get('download_dir', load_download_dir())
@@ -2963,7 +3041,65 @@ with tab2:
             urls_to_process = [u for u in urls_to_process if u]
             
             if urls_to_process:
-                st.info(f"📥 準備處理 {len(urls_to_process)} 個線上影片...")
+                if st.session_state.get('storage_destination') == "colab_cloud":
+                    st.info(f"🚀 正在將 {len(urls_to_process)} 個音訊提取任務派送至 Google Colab Worker...")
+                    cookies = {
+                        "facebook": st.session_state.get("fb_cookie", ""),
+                        "bilibili": st.session_state.get("bili_cookie", "")
+                    }
+                    target_id, target_label = gdrive_service.get_target_folder()
+                    save_folder = target_label.strip('/') if target_label else "Download"
+                    try:
+                        task_id = gdrive_bridge.submit_cloud_task(
+                            urls=urls_to_process,
+                            save_folder=save_folder,
+                            only_audio=True,
+                            cookies=cookies
+                        )
+                    except Exception as e:
+                        st.error(f"❌ 任務發送至 Google Drive 佇列失敗: {e}")
+                        task_id = None
+
+                    if task_id:
+                        st.success(f"✅ 音訊任務已成功送達雲端佇列！(任務 ID: `{task_id}`)")
+                        status_placeholder = st.empty()
+                        progress_bar = st.progress(0.0)
+                        detail_placeholder = st.empty()
+                        
+                        timeout_sec = 7200
+                        start_time = time.time()
+                        
+                        with st.spinner("⏳ Colab Worker 提取音訊中..."):
+                            while time.time() - start_time < timeout_sec:
+                                time.sleep(2)
+                                st_data = gdrive_bridge.get_cloud_task_status(task_id)
+                                if not st_data:
+                                    status_placeholder.info("⏳ 正在等待 Colab 認領任務... (請確認 Colab 筆記本已執行 Mode 1 Worker)")
+                                    continue
+                                
+                                st_status = st_data.get("status", "running")
+                                item_name = st_data.get("current_item", "")
+                                pct = float(st_data.get("progress_pct", 0.0))
+                                speed_mb = float(st_data.get("speed_mb", 0.0))
+                                log_msg = st_data.get("log", "")
+                                
+                                progress_bar.progress(min(max(pct, 0.0), 1.0))
+                                speed_text = f" | ⚡ {speed_mb:.2f} MB/s" if speed_mb > 0 else ""
+                                status_placeholder.markdown(f"🤖 **Colab 音訊進度**: `{item_name}` ({int(pct*100)}%){speed_text}")
+                                if log_msg:
+                                    detail_placeholder.caption(f"📝 最新訊息: `{log_msg}`")
+                                
+                                if st_status == "completed":
+                                    progress_bar.progress(1.0)
+                                    folder_link = gdrive_service.get_folder_link(target_id) if target_id else "https://drive.google.com/drive/my-drive"
+                                    st.balloons()
+                                    st.success(f"🎉 Colab 已全數提取完成！音訊檔已直接保存在 [我的雲端硬碟 `/{save_folder}/`]({folder_link})。")
+                                    break
+                                elif st_status == "failed":
+                                    st.error(f"❌ Colab 處理任務失敗: {log_msg}")
+                                    break
+                else:
+                    st.info(f"📥 準備處理 {len(urls_to_process)} 個線上影片...")
                 progress_bar = st.progress(0)
                 
                 for i, url in enumerate(urls_to_process):

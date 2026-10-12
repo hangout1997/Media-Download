@@ -1,3 +1,7 @@
 {
-  "download_dir": "/Users/ericcheng/Downloads/Video downloads"
+  "download_dir": "/Users/ericcheng/Downloads/Video downloads",
+  "storage_destination": "gdrive_cloud",
+  "gdrive_skip_duplicates": false,
+  "gdrive_folder_id": null,
+  "gdrive_folder_label": "/Download/"
 }
