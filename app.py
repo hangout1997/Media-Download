@@ -2961,6 +2961,17 @@ with tab1:
             _, reason = check_dir_writable(target_check_dir)
             st.error(f"❌ **無法開始下載：目標儲存目錄為唯讀或無寫入權限！**\n\n📍 路徑：`{target_check_dir}`\n⚠️ 原因：{reason}\n\n💡 請切換至本機可寫入的資料夾（如 Downloads）後再下載。")
         elif st.session_state.get('storage_destination') == "colab_cloud":
+            has_missav = any("missav" in u.lower() or "surrit" in u.lower() for u in urls)
+            if has_missav:
+                st.error(
+                    "❌ **MissAV (surrit.com) 啟用 Cloudflare 嚴格機房黑名單，全面封鎖 Google Cloud 機房 IP (AS15169)！**\n\n"
+                    "💡 **請切換上方「儲存目標位置」**：\n"
+                    "- ☁️ **「Google Drive (本機下載自動同步)」**：由本機家用寬頻下載 (100% 免疫 403)，配合 4GB RAM Disk (零 SSD 損耗)，完成後自動上傳至 Google Drive！\n"
+                    "- 📁 **「本機硬碟資料夾」**：直接下載至 Mac 本機。\n\n"
+                    "*(註：YouTube、Bilibili、FB、IG、Movieffm 等未阻擋機房 IP 的平台可正常使用 Colab 雲端直存)*"
+                )
+                st.stop()
+
             cookies = {
                 "facebook": st.session_state.get("fb_cookie", ""),
                 "bilibili": st.session_state.get("bili_cookie", "")
@@ -3129,6 +3140,14 @@ with tab2:
             
             if urls_to_process:
                 if st.session_state.get('storage_destination') == "colab_cloud":
+                    has_missav = any("missav" in u.lower() or "surrit" in u.lower() for u in urls_to_process)
+                    if has_missav:
+                        st.error(
+                            "❌ **MissAV (surrit.com) 啟用 Cloudflare 嚴格機房黑名單，全面封鎖 Google Cloud 機房 IP (AS15169)！**\n\n"
+                            "💡 請切換至 **「☁️ Google Drive (本機下載自動同步)」** 或 **「📁 本機硬碟資料夾」** 模式！"
+                        )
+                        st.stop()
+
                     cookies = {
                         "facebook": st.session_state.get("fb_cookie", ""),
                         "bilibili": st.session_state.get("bili_cookie", "")
