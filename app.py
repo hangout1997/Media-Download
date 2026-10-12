@@ -2945,6 +2945,10 @@ with tab1:
                             break
                         elif st_status == "failed":
                             st.error(f"❌ Colab 處理任務失敗: {log_msg}")
+                            err_detail = st_data.get("error")
+                            if err_detail:
+                                with st.expander("🔍 查看詳細雲端錯誤日誌", expanded=True):
+                                    st.code(err_detail)
                             break
         else:
             st.info(f"📥 準備下載 {len(urls)} 個影片檔案...")
@@ -3097,6 +3101,10 @@ with tab2:
                                     break
                                 elif st_status == "failed":
                                     st.error(f"❌ Colab 處理任務失敗: {log_msg}")
+                                    err_detail = st_data.get("error")
+                                    if err_detail:
+                                        with st.expander("🔍 查看詳細雲端錯誤日誌", expanded=True):
+                                            st.code(err_detail)
                                     break
                 else:
                     st.info(f"📥 準備處理 {len(urls_to_process)} 個線上影片...")
