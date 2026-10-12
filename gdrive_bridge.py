@@ -115,8 +115,57 @@ def clean_old_queue_files(max_age_hours=24):
         folder_id = get_or_create_queue_folder()
         res = service.files().list(q=f"'{folder_id}' in parents and trashed = false", fields='files(id, name, createdTime)').execute()
         for f in res.get('files', []):
-            # 若為任務或狀態檔
             if f['name'].startswith("task_") or f['name'].startswith("status_"):
                 pass
     except Exception:
         pass
+
+COLAB_NOTEBOOK_URL = "https://colab.research.google.com/github/hangout1997/Media-Download/blob/main/Media_Download_Colab.ipynb"
+
+def get_worker_heartbeat(timeout_seconds=35):
+    """
+    查詢 Colab Worker 的即時心跳狀態。
+    回傳 dict: {
+        'online': bool,
+        'last_seen_seconds': float,
+        'last_update': float,
+        'status': 'idle' / 'busy' / 'offline',
+        'message': str
+    }
+    """
+    try:
+        service = gdrive_service.get_gdrive_service()
+        folder_id = get_or_create_queue_folder()
+        q = f"name = 'worker_heartbeat.json' and '{folder_id}' in parents and trashed = false"
+        res = service.files().list(q=q, fields='files(id, name, modifiedTime)', spaces='drive').execute()
+        files = res.get('files', [])
+        if not files:
+            return {'online': False, 'last_seen_seconds': -1, 'status': 'offline', 'message': '尚未偵測到 Worker 心跳 (離線)'}
+
+        content = service.files().get_media(fileId=files[0]['id']).execute()
+        data = json.loads(content.decode('utf-8'))
+        last_time = float(data.get('timestamp', 0))
+        now = time.time()
+        diff = max(0, now - last_time)
+
+        if diff <= timeout_seconds:
+            worker_st = data.get('status', 'idle')
+            st_text = "處理任務中" if worker_st == 'busy' else "空閒待命中"
+            return {
+                'online': True,
+                'last_seen_seconds': round(diff, 1),
+                'last_update': last_time,
+                'status': worker_st,
+                'message': f"Worker 在線 ({st_text}，心跳: {int(diff)} 秒前)"
+            }
+        else:
+            return {
+                'online': False,
+                'last_seen_seconds': round(diff, 1),
+                'last_update': last_time,
+                'status': 'offline',
+                'message': f"Worker 已離線 (最後心跳: {int(diff)} 秒前)"
+            }
+    except Exception as e:
+        return {'online': False, 'last_seen_seconds': -1, 'status': 'offline', 'message': f"心跳查詢失敗: {e}"}
+

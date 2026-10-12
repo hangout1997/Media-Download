@@ -2680,13 +2680,26 @@ def _render_gdrive_folder_picker():
 
 if st.session_state.storage_destination in ("gdrive_cloud", "colab_cloud"):
     if st.session_state.storage_destination == "colab_cloud":
-        st.info("🤖 **Google Colab 雲端直存模式已啟動**：任務將自動提交至雲端佇列，由 Colab 遠端主機極速下載並直接封裝至 Google Drive，本機 0 頻寬消耗！")
-        with st.expander("📖 如何啟動 Colab 雲端 Worker 待命 (只需執行一次)", expanded=False):
+        col_c1, col_c2 = st.columns([3, 1])
+        with col_c1:
+            st.info("🤖 **Google Colab 雲端直存模式**：由 Colab 遠端主機以千兆頻寬極速下載並直接封裝至 Google Drive，本機 0 頻寬消耗！")
+        with col_c2:
             st.markdown(
-                "1. 前往 Google Colab 開啟您的 `Media_Download_Colab.ipynb` 筆記本\n"
-                "2. 依序執行 **步驟 1**（安裝環境與掛載 Google Drive）\n"
-                "3. 執行 **模式一：啟動 Worker 待命監聽**（此 cell 會持續在背景待命）\n"
-                "4. 回到此處輸入網址並點擊下載，Colab 即會自動接單並將進度實時回傳至此頁面！"
+                f'<a href="{gdrive_bridge.COLAB_NOTEBOOK_URL}" target="_blank">'
+                f'<button style="width:100%;margin-top:4px;padding:8px 0;background-color:#F9AB00;color:black;border:none;border-radius:6px;font-weight:bold;cursor:pointer;">'
+                f'🚀 開啟 Colab 筆記本</button></a>',
+                unsafe_allow_html=True
+            )
+        
+        # 即時偵測 Colab Worker 心跳
+        hb = gdrive_bridge.get_worker_heartbeat()
+        if hb.get("online"):
+            st.success(f"🟢 **雲端工作節點在線中**：{hb.get('message')}，可直接輸入網址下載！")
+        else:
+            st.warning(
+                f"🟡 **雲端工作節點目前離線** ({hb.get('message')})\n\n"
+                f"👉 點擊右上角 **「🚀 開啟 Colab 筆記本」** 執行 **模式一：啟動 Worker** 後即可常駐待命；"
+                f"任務已具備熱重載，啟動一次即可處理整日下載！"
             )
     cred_path = gdrive_service.get_credentials_path()
     is_auth = gdrive_service.is_authenticated()
