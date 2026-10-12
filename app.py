@@ -2692,15 +2692,20 @@ if st.session_state.storage_destination in ("gdrive_cloud", "colab_cloud"):
             )
         
         # 即時偵測 Colab Worker 心跳
-        hb = gdrive_bridge.get_worker_heartbeat()
-        if hb.get("online"):
-            st.success(f"🟢 **雲端工作節點在線中**：{hb.get('message')}，可直接輸入網址下載！")
-        else:
-            st.warning(
-                f"🟡 **雲端工作節點目前離線** ({hb.get('message')})\n\n"
-                f"👉 點擊右上角 **「🚀 開啟 Colab 筆記本」** 執行 **模式一：啟動 Worker** 後即可常駐待命；"
-                f"任務已具備熱重載，啟動一次即可處理整日下載！"
-            )
+        hb_col1, hb_col2 = st.columns([5, 1])
+        with hb_col1:
+            hb = gdrive_bridge.get_worker_heartbeat()
+            if hb.get("online"):
+                st.success(f"🟢 **雲端工作節點在線中**：{hb.get('message')}，可直接輸入網址下載！")
+            else:
+                st.warning(
+                    f"🟡 **雲端工作節點目前離線** ({hb.get('message')})\n\n"
+                    f"👉 若已在 Colab 執行模式一，可點擊右側「🔄 刷新狀態」；或點擊右上角「🚀 開啟 Colab 筆記本」重新點擊模式一即可。"
+                )
+        with hb_col2:
+            st.markdown("<div style='margin-top: 4px;'></div>", unsafe_allow_html=True)
+            if st.button("🔄 刷新狀態", use_container_width=True, help="重新檢查 Colab Worker 心跳"):
+                st.rerun()
     cred_path = gdrive_service.get_credentials_path()
     is_auth = gdrive_service.is_authenticated()
     user_email = gdrive_service.get_connected_account_email() if is_auth else None
