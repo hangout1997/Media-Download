@@ -9,10 +9,11 @@ Google Drive Bridge Service
 """
 
 import os
+import io
 import json
 import time
 import uuid
-import tempfile
+from googleapiclient.http import MediaIoBaseUpload
 import gdrive_service
 
 QUEUE_FOLDER_NAME = "MediaDownloadQueue"
@@ -23,8 +24,7 @@ def get_or_create_queue_folder():
     global _queue_folder_id
     if _queue_folder_id:
         return _queue_folder_id
-    service = gdrive_service.get_gdrive_service()
-    _queue_folder_id = gdrive_service.get_or_create_download_folder(service, QUEUE_FOLDER_NAME)
+    _queue_folder_id = gdrive_service.get_or_create_download_folder(folder_name=QUEUE_FOLDER_NAME)
     return _queue_folder_id
 
 def submit_cloud_task(urls, save_folder="Download", only_audio=False, cookies=None, resolved_map=None):
@@ -33,7 +33,6 @@ def submit_cloud_task(urls, save_folder="Download", only_audio=False, cookies=No
     resolved_map: 本地預先解析之媒體項目對照表 {url: [media_item, ...]}，免疫雲端被 WAF/Cloudflare 403 阻擋。
     回傳 task_id (str)
     """
-    service = gdrive_service.get_gdrive_service()
     folder_id = get_or_create_queue_folder()
 
     task_id = f"task_{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -53,45 +52,40 @@ def submit_cloud_task(urls, save_folder="Download", only_audio=False, cookies=No
         "log_messages": ["任務已由本機發送至 Google Drive 佇列，等待 Colab 認領..."]
     }
 
-    # 寫入暫存檔案後上傳
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as tf:
-        json.dump(task_payload, tf, ensure_ascii=False, indent=2)
-        tmp_name = tf.name
+    raw_bytes = json.dumps(task_payload, ensure_ascii=False, indent=2).encode('utf-8')
+    filename = f"{task_id}.json"
+    file_metadata = {
+        'name': filename,
+        'parents': [folder_id]
+    }
 
-    try:
-        filename = f"{task_id}.json"
-        from googleapiclient.http import MediaFileUpload
-        file_metadata = {
-            'name': filename,
-            'parents': [folder_id]
-        }
-        media = MediaFileUpload(tmp_name, mimetype='application/json')
-        service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        return task_id
-    finally:
-        if os.path.exists(tmp_name):
-            try:
-                os.remove(tmp_name)
-            except Exception:
-                pass
+    def _create_task_req(s):
+        media = MediaIoBaseUpload(io.BytesIO(raw_bytes), mimetype='application/json')
+        return s.files().create(body=file_metadata, media_body=media, fields='id')
+
+    gdrive_service.execute_with_retry(_create_task_req)
+    return task_id
 
 def get_cloud_task_status(task_id):
     """
     由本地端查詢指定任務的最新狀態與進度。
     回傳 dict (或 None 若尚未產生 status)
     """
-    service = gdrive_service.get_gdrive_service()
     folder_id = get_or_create_queue_folder()
 
     status_filename = f"status_{task_id}.json"
     q = f"name = '{status_filename}' and '{folder_id}' in parents and trashed = false"
-    res = service.files().list(q=q, fields='files(id, name, modifiedTime)', spaces='drive').execute()
+    res = gdrive_service.execute_with_retry(
+        lambda s: s.files().list(q=q, fields='files(id, name, modifiedTime)', spaces='drive')
+    )
     files = res.get('files', [])
 
     if not files:
         # 檢查原始 task 是否還在 (代表 Colab 尚未認領或剛啟動)
         q_task = f"name = '{task_id}.json' and '{folder_id}' in parents and trashed = false"
-        res_task = service.files().list(q=q_task, fields='files(id, name)', spaces='drive').execute()
+        res_task = gdrive_service.execute_with_retry(
+            lambda s: s.files().list(q=q_task, fields='files(id, name)', spaces='drive')
+        )
         if res_task.get('files'):
             return {
                 "status": "pending",
@@ -102,7 +96,9 @@ def get_cloud_task_status(task_id):
         return None
 
     file_id = files[0]['id']
-    content = service.files().get_media(fileId=file_id).execute()
+    content = gdrive_service.execute_with_retry(
+        lambda s: s.files().get_media(fileId=file_id)
+    )
     try:
         return json.loads(content.decode('utf-8'))
     except Exception:
@@ -111,9 +107,10 @@ def get_cloud_task_status(task_id):
 def clean_old_queue_files(max_age_hours=24):
     """清理超過指定時間的舊任務檔案。"""
     try:
-        service = gdrive_service.get_gdrive_service()
         folder_id = get_or_create_queue_folder()
-        res = service.files().list(q=f"'{folder_id}' in parents and trashed = false", fields='files(id, name, createdTime)').execute()
+        res = gdrive_service.execute_with_retry(
+            lambda s: s.files().list(q=f"'{folder_id}' in parents and trashed = false", fields='files(id, name, createdTime)')
+        )
         for f in res.get('files', []):
             if f['name'].startswith("task_") or f['name'].startswith("status_"):
                 pass
@@ -134,15 +131,18 @@ def get_worker_heartbeat(timeout_seconds=35):
     }
     """
     try:
-        service = gdrive_service.get_gdrive_service()
         folder_id = get_or_create_queue_folder()
         q = f"name = 'worker_heartbeat.json' and '{folder_id}' in parents and trashed = false"
-        res = service.files().list(q=q, fields='files(id, name, modifiedTime)', spaces='drive').execute()
+        res = gdrive_service.execute_with_retry(
+            lambda s: s.files().list(q=q, fields='files(id, name, modifiedTime)', spaces='drive')
+        )
         files = res.get('files', [])
         if not files:
             return {'online': False, 'last_seen_seconds': -1, 'status': 'offline', 'message': '尚未偵測到 Worker 心跳 (離線)'}
 
-        content = service.files().get_media(fileId=files[0]['id']).execute()
+        content = gdrive_service.execute_with_retry(
+            lambda s: s.files().get_media(fileId=files[0]['id'])
+        )
         data = json.loads(content.decode('utf-8'))
         last_time = float(data.get('timestamp', 0))
         now = time.time()
@@ -168,4 +168,3 @@ def get_worker_heartbeat(timeout_seconds=35):
             }
     except Exception as e:
         return {'online': False, 'last_seen_seconds': -1, 'status': 'offline', 'message': f"心跳查詢失敗: {e}"}
-

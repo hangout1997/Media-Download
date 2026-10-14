@@ -161,14 +161,25 @@ def run_oauth_flow(timeout_seconds=180):
     return creds
 
 
-def get_gdrive_service(interactive=False):
+def invalidate_service_cache():
+    """強制清空快取的 Drive service 與帳號資訊，迫使下次調用時重建底層連線與憑證。"""
+    with _cache_lock:
+        _service_cache["key"] = None
+        _service_cache["service"] = None
+        _service_cache["creds"] = None
+        _account_cache["key"] = None
+        _account_cache["email"] = None
+
+
+def get_gdrive_service(interactive=False, force_new=False):
     """
     取得 Drive service (含快取)。
     interactive=False 時若未授權直接拋出 GDriveAuthRequired，避免下載途中突然彈出瀏覽器卡住流程。
+    force_new=True 時強制忽略記憶體快取，重建全新底層連線與 Drive service。
     """
     with _cache_lock:
         key = _token_key()
-        if key is not None and _service_cache["key"] == key and _service_cache["service"] is not None:
+        if not force_new and key is not None and _service_cache["key"] == key and _service_cache["service"] is not None:
             cached_creds = _service_cache.get("creds")
             if cached_creds is not None and cached_creds.valid:
                 return _service_cache["service"]
@@ -186,14 +197,41 @@ def get_gdrive_service(interactive=False):
         return service
 
 
+def execute_with_retry(request_factory, max_retries=3, delay=1.0):
+    """
+    執行 Google Drive API 請求，具備底層 SSL 斷線/連線重置 (如 RECORD_LAYER_FAILURE) 自動刷新快取並重試機制。
+    request_factory: 接收 service 物件並回傳 Google API request 的函式 (例如 lambda s: s.files().list(...))。
+    """
+    import ssl
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            service = get_gdrive_service(force_new=(attempt > 0))
+            request = request_factory(service)
+            return request.execute(num_retries=2)
+        except Exception as e:
+            last_err = e
+            err_str = str(e).lower()
+            is_ssl_or_conn = any(kw in err_str for kw in [
+                "ssl", "record_layer_failure", "connectionreset", "brokenpipe",
+                "remotedisconnected", "timeout", "bad handshake", "token", "closed"
+            ]) or isinstance(e, (ssl.SSLError, OSError, ConnectionError))
+            
+            if is_ssl_or_conn and attempt < max_retries - 1:
+                invalidate_service_cache()
+                time.sleep(delay * (attempt + 1))
+                continue
+            raise
+    raise last_err
+
+
 def get_connected_account_email():
     """取得當前已授權的 Google 帳號 Email (依 token 快取)。"""
     key = _token_key()
     if key is not None and _account_cache["key"] == key and _account_cache["email"]:
         return _account_cache["email"]
     try:
-        service = get_gdrive_service()
-        about = service.about().get(fields="user(displayName,emailAddress)").execute()
+        about = execute_with_retry(lambda s: s.about().get(fields="user(displayName,emailAddress)"))
         user = about.get('user', {})
         email = user.get('emailAddress') or user.get('displayName') or "已連接"
         _account_cache["key"] = _token_key()
@@ -253,15 +291,14 @@ def parse_folder_input(text):
 
 
 def list_subfolders(parent_id="root"):
-    service = get_gdrive_service()
     q = f"'{_q_escape(parent_id)}' in parents and mimeType = '{FOLDER_MIME}' and trashed = false"
     folders, page_token = [], None
     while True:
-        resp = service.files().list(
+        resp = execute_with_retry(lambda s: s.files().list(
             q=q, spaces='drive', fields='nextPageToken, files(id, name)',
             orderBy='name', pageSize=200, pageToken=page_token,
             supportsAllDrives=True, includeItemsFromAllDrives=True,
-        ).execute()
+        ))
         folders.extend(resp.get('files', []))
         page_token = resp.get('nextPageToken')
         if not page_token:
@@ -271,11 +308,10 @@ def list_subfolders(parent_id="root"):
 
 def get_folder_meta(folder_id):
     """回傳 {'id','name','webViewLink'}；若不是資料夾或無權限則拋例外。"""
-    service = get_gdrive_service()
-    meta = service.files().get(
+    meta = execute_with_retry(lambda s: s.files().get(
         fileId=folder_id, fields='id, name, mimeType, webViewLink, trashed',
         supportsAllDrives=True,
-    ).execute()
+    ))
     if meta.get('mimeType') != FOLDER_MIME:
         raise ValueError("此 ID 不是資料夾")
     if meta.get('trashed'):
@@ -285,10 +321,11 @@ def get_folder_meta(folder_id):
 
 def get_folder_path_label(folder_id):
     """組出 /A/B/C/ 形式的路徑文字 (最多往上 8 層)。"""
-    service = get_gdrive_service()
     parts, cur = [], folder_id
     for _ in range(8):
-        meta = service.files().get(fileId=cur, fields='id, name, parents', supportsAllDrives=True).execute()
+        meta = execute_with_retry(lambda s: s.files().get(
+            fileId=cur, fields='id, name, parents', supportsAllDrives=True
+        ))
         parents = meta.get('parents') or []
         if not parents:
             # 抵達「我的雲端硬碟」根目錄 (根目錄本身名稱為 My Drive)，不加入路徑
@@ -299,17 +336,23 @@ def get_folder_path_label(folder_id):
 
 
 def create_folder(name, parent_id="root"):
-    service = get_gdrive_service()
     meta = {'name': name, 'mimeType': FOLDER_MIME, 'parents': [parent_id]}
-    return service.files().create(body=meta, fields='id, name, webViewLink', supportsAllDrives=True).execute()
+    return execute_with_retry(lambda s: s.files().create(
+        body=meta, fields='id, name, webViewLink', supportsAllDrives=True
+    ))
 
 
 def get_or_create_download_folder(service=None, folder_name=DEFAULT_FOLDER_NAME):
     """在「我的雲端硬碟」根目錄搜尋指定資料夾，不存在時自動建立。"""
-    service = service or get_gdrive_service()
     q = (f"name = '{_q_escape(folder_name)}' and mimeType = '{FOLDER_MIME}' "
          f"and 'root' in parents and trashed = false")
-    files = service.files().list(q=q, spaces='drive', fields='files(id, name)').execute().get('files', [])
+    if service is not None:
+        try:
+            files = service.files().list(q=q, spaces='drive', fields='files(id, name)').execute().get('files', [])
+        except Exception:
+            files = execute_with_retry(lambda s: s.files().list(q=q, spaces='drive', fields='files(id, name)')).get('files', [])
+    else:
+        files = execute_with_retry(lambda s: s.files().list(q=q, spaces='drive', fields='files(id, name)')).get('files', [])
     if files:
         return files[0]['id']
     return create_folder(folder_name, "root")['id']
@@ -333,12 +376,12 @@ def get_folder_link(folder_id):
 
 def find_existing_file(filename, folder_id):
     """在目標資料夾中尋找同名檔案，回傳檔案資訊或 None。"""
-    service = get_gdrive_service()
     q = f"name = '{_q_escape(filename)}' and '{_q_escape(folder_id)}' in parents and trashed = false"
-    files = service.files().list(
+    res = execute_with_retry(lambda s: s.files().list(
         q=q, spaces='drive', fields='files(id, name, size, webViewLink)', pageSize=1,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
-    ).execute().get('files', [])
+    ))
+    files = res.get('files', [])
     return files[0] if files else None
 
 
