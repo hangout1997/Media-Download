@@ -21,9 +21,11 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 FOLDER_MIME = 'application/vnd.google-apps.folder'
 DEFAULT_FOLDER_NAME = "Download"
 
-# 以 token 檔案 mtime 為 key 快取 service / 帳號資訊，避免每次 Streamlit rerun 都打 API
+# 以 token 檔案 mtime 與 generation 為 key 快取 service / 帳號資訊，避免每次 Streamlit rerun 都打 API
 _cache_lock = threading.Lock()
-_service_cache = {"key": None, "service": None}
+_api_lock = threading.Lock()
+_thread_local = threading.local()
+_cache_generation = 0
 _account_cache = {"key": None, "email": None}
 
 
@@ -163,66 +165,73 @@ def run_oauth_flow(timeout_seconds=180):
 
 def invalidate_service_cache():
     """強制清空快取的 Drive service 與帳號資訊，迫使下次調用時重建底層連線與憑證。"""
+    global _cache_generation
     with _cache_lock:
-        _service_cache["key"] = None
-        _service_cache["service"] = None
-        _service_cache["creds"] = None
+        _cache_generation += 1
         _account_cache["key"] = None
         _account_cache["email"] = None
 
 
 def get_gdrive_service(interactive=False, force_new=False):
     """
-    取得 Drive service (含快取)。
+    取得 Drive service (採用 Thread-Local 獨立快取，徹底防止多線程共用 OpenSSL 連線造成崩潰)。
     interactive=False 時若未授權直接拋出 GDriveAuthRequired，避免下載途中突然彈出瀏覽器卡住流程。
     force_new=True 時強制忽略記憶體快取，重建全新底層連線與 Drive service。
     """
-    with _cache_lock:
-        key = _token_key()
-        if not force_new and key is not None and _service_cache["key"] == key and _service_cache["service"] is not None:
-            cached_creds = _service_cache.get("creds")
-            if cached_creds is not None and cached_creds.valid:
-                return _service_cache["service"]
+    key = _token_key()
+    service = getattr(_thread_local, "service", None)
+    cached_key = getattr(_thread_local, "key", None)
+    cached_creds = getattr(_thread_local, "creds", None)
+    cached_gen = getattr(_thread_local, "gen", -1)
 
+    if (not force_new and service is not None and cached_key == key 
+            and cached_gen == _cache_generation and cached_creds is not None and cached_creds.valid):
+        return service
+
+    with _cache_lock:
         creds = _load_creds(refresh=True)
         if not creds:
             if not interactive:
                 raise GDriveAuthRequired("Google Drive 授權已失效或尚未登入，請重新授權。")
             creds = run_oauth_flow()
 
-        service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-        _service_cache["key"] = _token_key()
-        _service_cache["service"] = service
-        _service_cache["creds"] = creds
-        return service
+    # 每個 Thread 獨立建立，避免多線程共用 OpenSSL 連線造成 libmalloc double-free 崩潰
+    service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+    _thread_local.service = service
+    _thread_local.key = key
+    _thread_local.creds = creds
+    _thread_local.gen = _cache_generation
+    return service
 
 
 def execute_with_retry(request_factory, max_retries=3, delay=1.0):
     """
     執行 Google Drive API 請求，具備底層 SSL 斷線/連線重置 (如 RECORD_LAYER_FAILURE) 自動刷新快取並重試機制。
     request_factory: 接收 service 物件並回傳 Google API request 的函式 (例如 lambda s: s.files().list(...))。
+    全程以 _api_lock 保護，保證單一時刻僅有單一線程與 OpenSSL 網路通訊，杜絕多線程競爭導致之 C 擴充套件記憶體衝突。
     """
     import ssl
     last_err = None
-    for attempt in range(max_retries):
-        try:
-            service = get_gdrive_service(force_new=(attempt > 0))
-            request = request_factory(service)
-            return request.execute(num_retries=2)
-        except Exception as e:
-            last_err = e
-            err_str = str(e).lower()
-            is_ssl_or_conn = any(kw in err_str for kw in [
-                "ssl", "record_layer_failure", "connectionreset", "brokenpipe",
-                "remotedisconnected", "timeout", "bad handshake", "token", "closed"
-            ]) or isinstance(e, (ssl.SSLError, OSError, ConnectionError))
-            
-            if is_ssl_or_conn and attempt < max_retries - 1:
-                invalidate_service_cache()
-                time.sleep(delay * (attempt + 1))
-                continue
-            raise
-    raise last_err
+    with _api_lock:
+        for attempt in range(max_retries):
+            try:
+                service = get_gdrive_service(force_new=(attempt > 0))
+                request = request_factory(service)
+                return request.execute(num_retries=2)
+            except Exception as e:
+                last_err = e
+                err_str = str(e).lower()
+                is_ssl_or_conn = any(kw in err_str for kw in [
+                    "ssl", "record_layer_failure", "connectionreset", "brokenpipe",
+                    "remotedisconnected", "timeout", "bad handshake", "token", "closed"
+                ]) or isinstance(e, (ssl.SSLError, OSError, ConnectionError))
+                
+                if is_ssl_or_conn and attempt < max_retries - 1:
+                    invalidate_service_cache()
+                    time.sleep(delay * (attempt + 1))
+                    continue
+                raise
+        raise last_err
 
 
 def get_connected_account_email():

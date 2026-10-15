@@ -2918,9 +2918,9 @@ with col_res2:
             st.toast("♻️ 資源釋放成功，程式即將關閉...")
             st.warning("⚠️ 程式已終止，請手動關閉此網頁分頁。")
             import time
-            time.sleep(1.5)
-            import os
-            os._exit(0)
+            import signal
+            time.sleep(1.2)
+            os.kill(os.getpid(), signal.SIGTERM)
 
 st.divider()
 
