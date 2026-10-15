@@ -1113,6 +1113,52 @@ def get_media_items(url, cookies=None):
                 continue
 
     if not data:
+        # 策略 4: 檢查是否為劇集目錄/介紹頁面 (例如 /vod/240147.html 或 /detail/xxx.html)，提取其下所有集數播放連結
+        from urllib.parse import urljoin
+        
+        # 優先尋找播放列表區塊 (如 class="playlist-grid" 或 class="content_playlist" 等)
+        playlist_matches = re.findall(r'<(?:div|ul)[^>]+class=[\"\'][^\"\']*(?:playlist-grid|content_playlist|playlist_full|play_list)[^\"\']*[\"\'][^>]*>(.*?)</(?:div|ul)>', response.text, re.DOTALL | re.IGNORECASE)
+        search_html = playlist_matches[0] if playlist_matches else response.text
+        
+        raw_ep_matches = re.findall(r'<a[^>]+href=[\"\']((?:/ep/|/play/|/vod-play-id-)[^\"\']+)[\"\'][^>]*>(.*?)</a>', search_html, re.DOTALL)
+        if not raw_ep_matches and playlist_matches:
+            raw_ep_matches = re.findall(r'<a[^>]+href=[\"\']((?:/ep/|/play/|/vod-play-id-)[^\"\']+)[\"\'][^>]*>(.*?)</a>', response.text, re.DOTALL)
+        
+        if raw_ep_matches:
+            seen_hrefs = set()
+            unique_ep_urls = []
+            
+            # 若有明確的 -1-, -2- 線路標記，優先鎖定出現次數最多的首條線路 (如 -1-)
+            line_ids = [re.search(r'-(\d+)-\d+\.html', href).group(1) for href, _ in raw_ep_matches if re.search(r'-(\d+)-\d+\.html', href)]
+            target_line = line_ids[0] if line_ids else None
+            
+            for href, _ in raw_ep_matches:
+                full_ep_url = urljoin(url, href)
+                if target_line and f"-{target_line}-" not in href and re.search(r'-\d+-\d+\.html', href):
+                    continue
+                if full_ep_url not in seen_hrefs:
+                    seen_hrefs.add(full_ep_url)
+                    unique_ep_urls.append(full_ep_url)
+            
+            if unique_ep_urls:
+                _log_info(f"📺 偵測到劇集目錄/選單頁面，共解析出 {len(unique_ep_urls)} 個集數，正在併發解析各集串流...")
+                
+                def _fetch_single_ep(ep_u):
+                    try:
+                        return get_media_items(ep_u, cookies=cookies)
+                    except Exception as e:
+                        _log_info(f"⚠️ 解析單集失敗 ({ep_u}): {e}")
+                        return []
+
+                playlist_items = []
+                with ThreadPoolExecutor(max_workers=min(10, max(1, len(unique_ep_urls)))) as executor:
+                    for ep_result in executor.map(_fetch_single_ep, unique_ep_urls):
+                        if ep_result:
+                            playlist_items.extend(ep_result)
+                
+                if playlist_items:
+                    return playlist_items
+
         if token_match:
             raw_m3u8 = token_match.group(1)
             m3u8_url = resolve_gimy_stream(raw_m3u8, page_url=url)
