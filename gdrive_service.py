@@ -264,9 +264,7 @@ def revoke_gdrive_auth():
             )
     except Exception:
         pass
-    with _cache_lock:
-        _service_cache.update(key=None, service=None)
-        _account_cache.update(key=None, email=None)
+    invalidate_service_cache()
     if os.path.exists(TOKEN_FILE):
         try:
             os.remove(TOKEN_FILE)
