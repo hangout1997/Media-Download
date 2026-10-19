@@ -8,7 +8,17 @@ import subprocess
 
 VOLUME_NAME = "MediaRAMDisk"
 MOUNT_POINT = f"/Volumes/{VOLUME_NAME}"
-DEFAULT_SIZE_GB = 4
+def get_system_total_ram_gb():
+    """取得 macOS 系統實體記憶體總量 (GB)。"""
+    try:
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)
+        return round(int(out.strip()) / (1024 ** 3))
+    except Exception:
+        return 16
+
+
+_total_ram = get_system_total_ram_gb()
+DEFAULT_SIZE_GB = 8 if _total_ram >= 24 else (6 if _total_ram >= 16 else 4)
 
 # 模組內部紀錄關聯的 ramdisk 裝置 (例如 /dev/disk4)
 _associated_device = None
@@ -204,10 +214,19 @@ def auto_purge_if_full(threshold_pct=0.85):
     return 0
 
 
-def get_scratch_dir(min_free_bytes=1024 * 1024 * 1024):
+def is_ramdisk_sufficient(required_bytes):
+    """檢查 RAM Disk 是否有足夠的可用空間 (含 500MB 安全緩衝)。"""
+    if not is_ramdisk_mounted():
+        return False
+    auto_purge_if_full()
+    _, _, free, _ = get_ramdisk_usage()
+    return free >= (required_bytes + 500 * 1024 * 1024)
+
+
+def get_scratch_dir(min_free_bytes=3 * 1024 * 1024 * 1024):
     """
     取得建議的暫存處理目錄：
-    - 若 RAM Disk 已掛載且剩餘空間充裕 (>= 1GB)，優先使用 RAM Disk（100% 零 SSD 磨損）
+    - 若 RAM Disk 已掛載且剩餘空間充裕 (預設 >= 3GB 或指定容量)，優先使用 RAM Disk（100% 零 SSD 磨損）
     - 若空間不足，自動嘗試 auto_purge_if_full() 清理過期暫存
     - 若依然空間不足，自動安全降級為系統暫存目錄 (tempfile.gettempdir())，徹底避免 ENOSPC 造成程式崩潰
     """

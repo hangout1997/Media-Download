@@ -1661,6 +1661,13 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         req_headers.update(extra_headers)
     if 'Referer' not in req_headers:
         req_headers['Referer'] = f"https://{urllib.parse.urlparse(m3u8_url).netloc}/"
+    if 'surrit' in m3u8_url or 'missav' in req_headers.get('Referer', ''):
+        req_headers['Origin'] = 'https://missav.ai'
+        if 'Referer' not in req_headers or not req_headers['Referer']:
+            req_headers['Referer'] = 'https://missav.ai/'
+        req_headers['Sec-Fetch-Dest'] = 'empty'
+        req_headers['Sec-Fetch-Mode'] = 'cors'
+        req_headers['Sec-Fetch-Site'] = 'cross-site'
 
     # 複用全域 Session，不重建
     session = _global_session
@@ -1756,9 +1763,18 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     # 24G RAM 環境下，2h 影片約佔 2–4 GB，完全在記憶體範圍內
     segments_data = [b""] * total_segments
 
+    is_cf_protected = any(k in m3u8_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"]) or "missav" in req_headers.get("Referer", "") or "missav" in req_headers.get("Origin", "")
+
     def download_segment(args):
         idx, seg_url = args
         for attempt in range(3):
+            if is_cf_protected:
+                try:
+                    r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
+                    if r.status_code == 200 and len(r.content) > 0:
+                        return idx, r.content
+                except Exception:
+                    pass
             try:
                 r = session.get(seg_url, headers=req_headers, timeout=15)
                 if r.status_code == 200 and len(r.content) > 0:
@@ -1766,7 +1782,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             except Exception:
                 pass
             try:
-                r = get_curl_session().get(seg_url, headers=req_headers, timeout=15)
+                r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
             except Exception:
@@ -1819,16 +1835,17 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
 
     scratch_dir = ramdisk_manager.get_scratch_dir()
-    with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir) as tmp_ts:
-        tmp_ts_path = tmp_ts.name
-        for chunk in segments_data:
-            if chunk:
-                tmp_ts.write(chunk)
-
-    del segments_data
-    gc.collect()
-
+    tmp_ts_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir) as tmp_ts:
+            tmp_ts_path = tmp_ts.name
+            for chunk in segments_data:
+                if chunk:
+                    tmp_ts.write(chunk)
+
+        del segments_data
+        gc.collect()
+
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", tmp_ts_path,
@@ -1848,7 +1865,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     finally:
         try:
-            if os.path.exists(tmp_ts_path):
+            if tmp_ts_path and os.path.exists(tmp_ts_path):
                 os.remove(tmp_ts_path)
         except Exception:
             pass
@@ -1956,12 +1973,23 @@ def download_media(media_item, force_audio=False):
     if is_gdrive:
         if gdrive_precheck_exists(filename):
             return
-        temp_dir = ramdisk_manager.get_scratch_dir()
+
+        extra_headers = media_item.get('headers', {})
+        total_dur = get_media_duration(media_url, headers=extra_headers) if ("m3u8" in media_url or not force_audio) else 0
+        est_size_bytes = int(total_dur * 650 * 1024) if total_dur and total_dur > 0 else 0
+        # 需預留封裝雙倍 (TS + MP4) 或至少 3GB 安全緩衝
+        required_free = max(est_size_bytes * 2, 3 * 1024 * 1024 * 1024) if est_size_bytes > 0 else (3 * 1024 * 1024 * 1024)
+
+        temp_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_free)
         out_path = os.path.join(temp_dir, f"gdrive_tmp_{int(time.time()*1000)}_{filename}")
         _, _tgt_label = gdrive_service.get_target_folder()
         is_ram = ramdisk_manager.is_ramdisk_mounted() and temp_dir == ramdisk_manager.MOUNT_POINT
-        storage_note = "🚀 RAM Disk 純記憶體封裝" if is_ram else "暫存封裝"
-        st.info(f"☁️ 檔案將在{storage_note}後，**直接直送至 Google Drive `{_tgt_label}{filename}`**（零硬碟磨損，不保留於本機）")
+        if ramdisk_manager.is_ramdisk_mounted() and not is_ram:
+            dur_text = format_time(total_dur) if total_dur else "未知"
+            est_gb = (est_size_bytes / (1024 ** 3)) if est_size_bytes else 0
+            st.warning(f"⚠️ 影片片長約 {dur_text}，預估容量約 {est_gb:.1f} GB（封裝需雙倍快取空間），超出 RAM Disk 剩餘可用空間。已自動切換至本機暫存封裝，確保下載不中斷。")
+        storage_note = "🚀 RAM Disk 純記憶體封裝" if is_ram else "本機暫存封裝"
+        st.info(f"☁️ 檔案將在{storage_note}後，**直接直送至 Google Drive `{_tgt_label}{filename}`**（不保留於本機）")
     else:
         downloads_dir = st.session_state.get('download_dir', load_download_dir())
         is_writable, write_err = check_dir_writable(downloads_dir)
@@ -2004,6 +2032,11 @@ def download_media(media_item, force_audio=False):
                     finish_output_file(out_path, filename)
                     return
                 except Exception as hls_err:
+                    ramdisk_manager.clean_scratch_files()
+                    if is_gdrive and "/Volumes/MediaRAMDisk" in out_path:
+                        temp_dir = tempfile.gettempdir()
+                        out_path = os.path.join(temp_dir, f"gdrive_tmp_{int(time.time()*1000)}_{filename}")
+                        st.info(f"🔄 偵測到 RAM Disk 空間吃緊或多線程中斷，已自動將標準下載路徑切換至本機暫存: `{temp_dir}`")
                     if c_idx == len(cand_m3u8s) - 1:
                         st.warning(f"⚠️ 多線程下載失敗 ({hls_err})，降級使用標準 FFmpeg 串流處理...")
 
@@ -2159,7 +2192,17 @@ def download_media(media_item, force_audio=False):
         if returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             finish_output_file(out_path, filename)
         else:
-            if any(k in stderr_log for k in ["Failed to resolve hostname", "nodename nor servname provided", "Name or service not known", "Could not resolve host", "Temporary failure in name resolution"]):
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
+            ramdisk_manager.clean_scratch_files()
+
+            if "No space left on device" in stderr_log or "error code: -28" in stderr_log:
+                friendly_msg = "❌ 下載失敗：儲存或暫存磁碟空間耗盡 (No space left on device, Error 28)！\n\n💡 **原因與建議**：\n1. 目前影片容量超出暫存磁碟（RAM Disk 或本機磁區）剩餘空間。\n2. 若您有開啟 RAM Disk，長篇高畫質影片建議點擊下方控制列卸載後「改掛載 8GB / 12GB RAM Disk」，或暫時切換至系統本機硬碟暫存。"
+                show_error_log_box(friendly_msg, stderr_log, title="磁碟空間滿溢錯誤 (No space left on device)", url=media_url)
+            elif any(k in stderr_log for k in ["Failed to resolve hostname", "nodename nor servname provided", "Name or service not known", "Could not resolve host", "Temporary failure in name resolution"]):
                 parsed_host = urllib.parse.urlparse(media_url).hostname or "串流伺服器"
                 friendly_msg = f"❌ 影片伺服器連線失敗：串流主機網域 `{parsed_host}` 無法解析或已失效。\n\n💡 **原因與建議**：該影片來源伺服器已下線或 CDN 網址已過期。若是在 Movieffm / Gimy 等影音網站觀看，請嘗試切換至其他播放線路 (如 FLV 2, FLV 3...)。"
                 show_error_log_box(friendly_msg, stderr_log, title="伺服器連線與 DNS 錯誤日誌", url=media_url)
@@ -2906,39 +2949,44 @@ else:
         with q_cols[3]:
             st.button("📂 專案內 downloads", use_container_width=True, on_click=_cb_set_folder, args=(proj_downloads, "專案內部 downloads"))
 
-# 2. 4GB RAM Disk 純記憶體模式控制列
+# 2. RAM Disk 純記憶體模式控制列
+sys_ram_gb = ramdisk_manager.get_system_total_ram_gb()
 ram_mounted = ramdisk_manager.is_ramdisk_mounted()
-col_ram1, col_ram2 = st.columns([3, 1])
+col_ram1, col_ram2 = st.columns([2.5, 1.5])
 with col_ram1:
     if ram_mounted:
         ramdisk_manager.auto_purge_if_full()
         tot, used, free, pct = ramdisk_manager.get_ramdisk_usage()
+        tot_gb = tot / (1024 ** 3)
         st.success(
-            f"🚀 **4GB APFS RAM Disk 運行中 (100% 零 SSD 磨損)**\n\n"
-            f"容量：剩餘 `{free/1024/1024/1024:.2f} GB` / `{tot/1024/1024/1024:.2f} GB` (已用 {pct*100:.1f}%) ｜ 掛載點：`{ramdisk_manager.MOUNT_POINT}`"
+            f"🚀 **{tot_gb:.0f}GB APFS RAM Disk 運行中 (100% 零 SSD 磨損)**\n\n"
+            f"容量：剩餘 `{free/1024/1024/1024:.2f} GB` / `{tot_gb:.2f} GB` (已用 {pct*100:.1f}%) ｜ 掛載點：`{ramdisk_manager.MOUNT_POINT}`"
         )
     else:
         st.info(
-            "💡 **4GB RAM Disk 未掛載**：目前使用 macOS 系統 SSD 暫存。\n\n"
-            "建議點右側掛載 4GB APFS RAM Disk，切片封裝將全數在記憶體進行，達成 100% 零硬碟讀寫與極速封裝。"
+            f"💡 **RAM Disk 未掛載**（系統實體 RAM: {sys_ram_gb}GB）：目前使用 macOS 系統 SSD 暫存。\n\n"
+            f"建議掛載 APFS RAM Disk（1080p 長片或電影推薦 8GB 以上），切片封裝全數在記憶體進行，達成 100% 零硬碟讀寫與極速封裝。"
         )
 
 with col_ram2:
-    st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
     if ram_mounted:
-        if st.button("⏏️ 卸載 RAM Disk", use_container_width=True, help="立即歸還 4GB 記憶體給 macOS 系統"):
+        st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+        if st.button("⏏️ 卸載 RAM Disk", use_container_width=True, help="立即歸還記憶體給 macOS 系統"):
             ok, msg = ramdisk_manager.unmount_ramdisk()
             if ok:
-                st.session_state.pending_toast = ("✅ 已卸載 RAM Disk 並歸還 4GB 記憶體", "⏏️")
+                st.session_state.pending_toast = ("✅ 已卸載 RAM Disk 並歸還記憶體", "⏏️")
             else:
                 st.error(msg)
             st.rerun()
     else:
-        if st.button("🚀 掛載 4GB RAM Disk", type="primary", use_container_width=True, help="免 root 建立 4GB APFS 虛擬記憶體磁碟"):
-            with st.spinner("正在向 macOS 申請劃分 4GB APFS RAM Disk..."):
-                ok, msg = ramdisk_manager.mount_ramdisk(size_gb=4)
+        default_size = 8 if sys_ram_gb >= 24 else (6 if sys_ram_gb >= 16 else 4)
+        size_options = [4, 8, 12, 16] if sys_ram_gb >= 24 else ([4, 8] if sys_ram_gb >= 16 else [2, 4])
+        selected_size = st.selectbox("劃分大小", size_options, index=size_options.index(default_size) if default_size in size_options else 0, format_func=lambda x: f"{x} GB 記憶體")
+        if st.button(f"🚀 掛載 {selected_size}GB RAM Disk", type="primary", use_container_width=True, help=f"免 root 建立 {selected_size}GB APFS 虛擬記憶體磁碟"):
+            with st.spinner(f"正在向 macOS 申請劃分 {selected_size}GB APFS RAM Disk..."):
+                ok, msg = ramdisk_manager.mount_ramdisk(size_gb=selected_size)
                 if ok:
-                    st.session_state.pending_toast = ("✅ 4GB APFS RAM Disk 掛載成功！", "🚀")
+                    st.session_state.pending_toast = (f"✅ {selected_size}GB APFS RAM Disk 掛載成功！", "🚀")
                 else:
                     st.error(msg)
                 st.rerun()

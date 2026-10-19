@@ -1711,16 +1711,17 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         except Exception:
             scratch_dir = tempfile.gettempdir()
 
-    with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir) as tmp_ts:
-        tmp_ts_path = tmp_ts.name
-        for chunk in segments_data:
-            if chunk:
-                tmp_ts.write(chunk)
-
-    del segments_data
-    gc.collect()
-
+    tmp_ts_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir) as tmp_ts:
+            tmp_ts_path = tmp_ts.name
+            for chunk in segments_data:
+                if chunk:
+                    tmp_ts.write(chunk)
+
+        del segments_data
+        gc.collect()
+
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", tmp_ts_path,
@@ -1742,7 +1743,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             raise ValueError(f"FFmpeg 無損封裝失敗: {clean_err}")
     finally:
         try:
-            if os.path.exists(tmp_ts_path):
+            if tmp_ts_path and os.path.exists(tmp_ts_path):
                 os.remove(tmp_ts_path)
         except Exception:
             pass
