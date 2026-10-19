@@ -1489,40 +1489,48 @@ def run_ffmpeg_with_progress(ffmpeg_cmd, total_duration=0.0, label="下載"):
     last_update_time = 0.0
     stderr_lines = []
 
-    for line in iter(process.stderr.readline, b''):
-        line_str = line.decode('utf-8', errors='ignore').strip()
-        if not line_str:
-            continue
-        stderr_lines.append(line_str)
-        if len(stderr_lines) > 50:
-            stderr_lines.pop(0)
+    try:
+        for line in iter(process.stderr.readline, b''):
+            line_str = line.decode('utf-8', errors='ignore').strip()
+            if not line_str:
+                continue
+            stderr_lines.append(line_str)
+            if len(stderr_lines) > 50:
+                stderr_lines.pop(0)
 
-        if line_str.startswith("out_time_us="):
+            if line_str.startswith("out_time_us="):
+                try:
+                    us = int(line_str.split("=")[1])
+                    current_sec = us / 1000000.0
+                except ValueError:
+                    pass
+            elif line_str.startswith("speed="):
+                speed = line_str.split("=")[1].strip()
+
+            now = time.time()
+            if now - last_update_time >= 0.5:
+                last_update_time = now
+                if total_duration > 0:
+                    pct = min(1.0, max(0.0, current_sec / total_duration))
+                    pct_num = pct * 100
+                    progress_bar.progress(pct)
+                    status_text.markdown(f"⏳ **{label}進度**: `{pct_num:.1f}%` ({format_time(current_sec)} / {format_time(total_duration)}) | 速度: `{speed}`")
+                else:
+                    status_text.markdown(f"⏳ **{label}處理中...** 已完成 `{format_time(current_sec)}` | 速度: `{speed}`")
+
+        process.wait()
+    finally:
+        if process.poll() is None:
             try:
-                us = int(line_str.split("=")[1])
-                current_sec = us / 1000000.0
-            except ValueError:
+                process.kill()
+                process.wait(timeout=2)
+            except Exception:
                 pass
-        elif line_str.startswith("speed="):
-            speed = line_str.split("=")[1].strip()
+        status_text.empty()
+        progress_bar.empty()
 
-        now = time.time()
-        if now - last_update_time >= 0.5:
-            last_update_time = now
-            if total_duration > 0:
-                pct = min(1.0, max(0.0, current_sec / total_duration))
-                pct_num = pct * 100
-                progress_bar.progress(pct)
-                status_text.markdown(f"⏳ **{label}進度**: `{pct_num:.1f}%` ({format_time(current_sec)} / {format_time(total_duration)}) | 速度: `{speed}`")
-            else:
-                status_text.markdown(f"⏳ **{label}處理中...** 已完成 `{format_time(current_sec)}` | 速度: `{speed}`")
-
-    process.wait()
-
-    if total_duration > 0:
+    if total_duration > 0 and process.returncode == 0:
         progress_bar.progress(1.0)
-    status_text.empty()
-    progress_bar.empty()
 
     stderr_log = "\n".join(stderr_lines)
     return process.returncode, stderr_log
@@ -2237,6 +2245,14 @@ def download_media(media_item, force_audio=False):
         else:
             show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=media_url)
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
+    finally:
+        # 若中途被中斷（使用者跳過）或下載失敗，清理未完成的殘留暫存檔以釋放空間
+        if is_gdrive and out_path and os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+        ramdisk_manager.clean_scratch_files()
 
 def get_audio_stream_info(media_path, headers=None):
     """透過 ffprobe 探測音訊串流資訊：(codec_name, bitrate_kbps, channels)。"""
@@ -3055,7 +3071,8 @@ with tab1:
     if current_count > 0:
         st.caption(f"ℹ️ 已輸入 **{current_count}** 個網址。")
     
-    btn_video = st.button("⬇️ 開始批次下載影片", type="primary", use_container_width=True)
+    is_batch_active = st.session_state.get('is_video_batch_running', False)
+    btn_video = st.button("⬇️ 開始批次下載影片", type="primary", use_container_width=True, disabled=is_batch_active)
     
     if btn_video:
         raw_urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
@@ -3154,50 +3171,85 @@ with tab1:
                                     st.code(err_detail)
                             break
         else:
-            st.info(f"📥 準備下載 {len(urls)} 個影片檔案...")
-            
-            # 建立進度條
-            progress_bar = st.progress(0)
-            
-            # 遍歷網址進行下載
-            for i, url in enumerate(urls):
-                current_num = i + 1
-                st.markdown(f"### 📍 正在處理第 {current_num}/{len(urls)} 個...")
-                
-                # 偵測是否為社團首頁網址
-                is_fb_group_home = False
-                if "facebook.com/groups/" in url or "fb.com/groups/" in url:
-                    clean_url = url.split('?')[0].rstrip('/')
-                    parts = clean_url.split('/groups/')
-                    if len(parts) == 2 and '/' not in parts[1]:
-                        is_fb_group_home = True
-                        
-                if is_fb_group_home:
-                    st.warning("⚠️ 偵測到您輸入的是 **社團首頁** 的網址，而非個別貼文！\n\n👉 **正確做法**：請在社團中找到該貼文，點擊貼文下方的 **「發佈時間」**（例如：3小時前、昨天下午 5:00），進入個別貼文頁面後，再複製網址貼到下載器中。")
-                    progress_bar.progress(current_num / len(urls))
-                    st.divider()
-                    continue
-                
-                try:
-                    st.text(f"正在擷取網頁資訊: {url}")
-                    with st.spinner("🔍 尋找影片串流中..."):
-                        media_items = get_media_items(url)
-                    
-                    if not media_items:
-                        st.error(f"❌ 找不到有效的影片串流網址: {url}")
-                    else:
-                        for item in media_items:
-                            download_media(item)
-                        
-                except Exception as e:
-                    show_error_log_box(f"❌ 處理 {url} 時發生錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=url)
-                
-                # 更新進度條
-                progress_bar.progress(current_num / len(urls))
-                st.divider()
-                
+            st.session_state.video_batch_queue = urls
+            st.session_state.video_batch_idx = 0
+            st.session_state.is_video_batch_running = True
+            st.rerun()
+
+    # ── 佇列下載控制器 (支援即時中斷、跳過當前並開始下一部) ──────────────────
+    if st.session_state.get('is_video_batch_running', False):
+        queue = st.session_state.get('video_batch_queue', [])
+        idx = st.session_state.get('video_batch_idx', 0)
+
+        if idx >= len(queue):
+            st.session_state.is_video_batch_running = False
+            st.session_state.video_batch_queue = []
+            st.session_state.video_batch_idx = 0
             st.balloons()
             st.success("🎉 所有下載任務處理完畢！")
+        else:
+            current_num = idx + 1
+            url = queue[idx]
+
+            # 頂部控制面板
+            st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
+            ctrl_box = st.container()
+            with ctrl_box:
+                c_title, c_skip, c_stop = st.columns([3, 1.3, 1.1])
+                with c_title:
+                    st.markdown(f"### 📍 批次進度：正在處理第 **{current_num} / {len(queue)}** 部")
+                    st.caption(f"🔗 來源網址: `{url}`")
+                with c_skip:
+                    st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+                    if st.button("⏭️ 中斷並跳過此部", key=f"skip_btn_{idx}", type="secondary", use_container_width=True, help="立即中斷目前影片的下載與轉檔，直接開始清單中的下一部影片"):
+                        st.session_state.video_batch_idx = idx + 1
+                        st.toast(f"⏭️ 已中斷第 {current_num} 部，正在開始下載下一部...", icon="⏭️")
+                        st.rerun()
+                with c_stop:
+                    st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+                    if st.button("⏹️ 終止全部", key=f"stop_btn_{idx}", type="primary", use_container_width=True, help="立即終止目前的下載並取消剩餘的所有任務"):
+                        st.session_state.is_video_batch_running = False
+                        st.session_state.video_batch_queue = []
+                        st.session_state.video_batch_idx = 0
+                        st.warning("⏹️ 已終止全部批次下載任務。")
+                        st.rerun()
+
+                # 整體批次進度條
+                batch_pct = idx / len(queue)
+                st.progress(batch_pct, text=f"批次總進度: {idx}/{len(queue)} 部完成 ({batch_pct*100:.0f}%)")
+
+            st.divider()
+
+            # 偵測是否為社團首頁網址
+            is_fb_group_home = False
+            if "facebook.com/groups/" in url or "fb.com/groups/" in url:
+                clean_url = url.split('?')[0].rstrip('/')
+                parts = clean_url.split('/groups/')
+                if len(parts) == 2 and '/' not in parts[1]:
+                    is_fb_group_home = True
+
+            if is_fb_group_home:
+                st.warning("⚠️ 偵測到您輸入的是 **社團首頁** 的網址，而非個別貼文！\n\n👉 **正確做法**：請在社團中找到該貼文，點擊貼文下方的 **「發佈時間」**（例如：3小時前、昨天下午 5:00），進入個別貼文頁面後，再複製網址貼到下載器中。")
+                st.session_state.video_batch_idx = idx + 1
+                st.rerun()
+
+            try:
+                st.text(f"正在擷取網頁資訊: {url}")
+                with st.spinner("🔍 尋找影片串流中..."):
+                    media_items = get_media_items(url)
+
+                if not media_items:
+                    st.error(f"❌ 找不到有效的影片串流網址: {url}")
+                else:
+                    for item in media_items:
+                        download_media(item)
+
+            except Exception as e:
+                show_error_log_box(f"❌ 處理 {url} 時發生錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=url)
+
+            # 當前影片處理結束（成功或失敗），前進至下一部
+            st.session_state.video_batch_idx = idx + 1
+            st.rerun()
 
 with tab2:
     st.markdown("從本地檔案或線上播放清單提取出純音訊，完全在記憶體內處理，避免硬碟損耗。")
