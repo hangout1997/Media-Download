@@ -223,10 +223,10 @@ def is_ramdisk_sufficient(required_bytes):
     return free >= (required_bytes + 500 * 1024 * 1024)
 
 
-def get_scratch_dir(min_free_bytes=3 * 1024 * 1024 * 1024):
+def get_scratch_dir(min_free_bytes=1024 * 1024 * 1024):
     """
     取得建議的暫存處理目錄：
-    - 若 RAM Disk 已掛載且剩餘空間充裕 (預設 >= 3GB 或指定容量)，優先使用 RAM Disk（100% 零 SSD 磨損）
+    - 若 RAM Disk 已掛載且剩餘空間充裕 (預設 >= 1GB 或指定容量)，優先使用 RAM Disk（100% 零 SSD 磨損）
     - 若空間不足，自動嘗試 auto_purge_if_full() 清理過期暫存
     - 若依然空間不足，自動安全降級為系統暫存目錄 (tempfile.gettempdir())，徹底避免 ENOSPC 造成程式崩潰
     """

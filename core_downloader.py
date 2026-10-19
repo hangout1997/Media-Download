@@ -1707,7 +1707,15 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     if scratch_dir is None:
         try:
             import ramdisk_manager
-            scratch_dir = ramdisk_manager.get_scratch_dir()
+            is_out_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
+            if is_out_on_ram:
+                _, _, ram_free, _ = ramdisk_manager.get_ramdisk_usage()
+                if ram_free >= (total_downloaded_bytes * 2 + 200 * 1024 * 1024):
+                    scratch_dir = ramdisk_manager.MOUNT_POINT
+                else:
+                    scratch_dir = tempfile.gettempdir()
+            else:
+                scratch_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=total_downloaded_bytes + 200 * 1024 * 1024)
         except Exception:
             scratch_dir = tempfile.gettempdir()
 

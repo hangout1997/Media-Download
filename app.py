@@ -1834,7 +1834,20 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
 
-    scratch_dir = ramdisk_manager.get_scratch_dir()
+    # 智慧選擇 TS 中繼暫存目錄：
+    # 若 out_path 位於 RAM Disk，檢查 RAM Disk 是否足以容納 (TS 暫存 + MP4 成品)
+    # 若空間充裕，兩者皆在 RAM Disk（100% 零 SSD 磨損）；
+    # 若不足以容納雙倍，將 TS 暫存置於系統暫存 (SSD)，保留 RAM Disk 專門存放最終 MP4！
+    is_out_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
+    if is_out_on_ram:
+        _, _, ram_free, _ = ramdisk_manager.get_ramdisk_usage()
+        if ram_free >= (total_downloaded_bytes * 2 + 200 * 1024 * 1024):
+            scratch_dir = ramdisk_manager.MOUNT_POINT
+        else:
+            scratch_dir = tempfile.gettempdir()
+    else:
+        scratch_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=total_downloaded_bytes + 200 * 1024 * 1024)
+
     tmp_ts_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir) as tmp_ts:
@@ -1976,9 +1989,10 @@ def download_media(media_item, force_audio=False):
 
         extra_headers = media_item.get('headers', {})
         total_dur = get_media_duration(media_url, headers=extra_headers) if ("m3u8" in media_url or not force_audio) else 0
-        est_size_bytes = int(total_dur * 650 * 1024) if total_dur and total_dur > 0 else 0
-        # 需預留封裝雙倍 (TS + MP4) 或至少 3GB 安全緩衝
-        required_free = max(est_size_bytes * 2, 3 * 1024 * 1024 * 1024) if est_size_bytes > 0 else (3 * 1024 * 1024 * 1024)
+        # 線上 1080p 串流平均碼率約 2000-2600 kbps (約 320 KB/s)
+        est_size_bytes = int(total_dur * 320 * 1024) if total_dur and total_dur > 0 else 0
+        # RAM Disk 僅需存放最終 MP4 檔案 (含 300MB 安全緩衝)，中繼 TS 若空間吃緊會自動轉移至 SSD
+        required_free = (est_size_bytes + 300 * 1024 * 1024) if est_size_bytes > 0 else (1024 * 1024 * 1024)
 
         temp_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_free)
         out_path = os.path.join(temp_dir, f"gdrive_tmp_{int(time.time()*1000)}_{filename}")
@@ -1987,7 +2001,8 @@ def download_media(media_item, force_audio=False):
         if ramdisk_manager.is_ramdisk_mounted() and not is_ram:
             dur_text = format_time(total_dur) if total_dur else "未知"
             est_gb = (est_size_bytes / (1024 ** 3)) if est_size_bytes else 0
-            st.warning(f"⚠️ 影片片長約 {dur_text}，預估容量約 {est_gb:.1f} GB（封裝需雙倍快取空間），超出 RAM Disk 剩餘可用空間。已自動切換至本機暫存封裝，確保下載不中斷。")
+            _, _, ram_free, _ = ramdisk_manager.get_ramdisk_usage()
+            st.warning(f"⚠️ 影片片長約 {dur_text}，預估容量約 {est_gb:.1f} GB，超出目前 RAM Disk 剩餘可用空間 ({ram_free/1024/1024/1024:.1f} GB)。已自動切換至本機暫存封裝，確保下載不中斷。")
         storage_note = "🚀 RAM Disk 純記憶體封裝" if is_ram else "本機暫存封裝"
         st.info(f"☁️ 檔案將在{storage_note}後，**直接直送至 Google Drive `{_tgt_label}{filename}`**（不保留於本機）")
     else:
