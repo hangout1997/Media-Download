@@ -559,6 +559,31 @@ def get_media_items(url):
                     else:
                         primary_source = data[0] if len(data) > 0 and isinstance(data[0], list) else []
                         total_eps = len(primary_source)
+
+                    def _find_ep_in_source(src_list, target_ep_num, target_name, pos_idx):
+                        if not isinstance(src_list, list):
+                            return None
+                        # 1. 優先比對集數數字 (如 1 匹配 01)
+                        if target_ep_num is not None:
+                            for it in src_list:
+                                m = re.search(r'\d+', str(it.get('name', '')))
+                                if m and int(m.group()) == target_ep_num:
+                                    u = it.get('url')
+                                    if u and u.startswith('http'):
+                                        return u
+                        # 2. 次要比對名稱字串完全一致
+                        if target_name:
+                            for it in src_list:
+                                if str(it.get('name', '')).strip() == target_name:
+                                    u = it.get('url')
+                                    if u and u.startswith('http'):
+                                        return u
+                        # 3. 退回索引位置比對
+                        if pos_idx < len(src_list):
+                            u = src_list[pos_idx].get('url')
+                            if u and u.startswith('http'):
+                                return u
+                        return None
                     
                     for idx in range(total_eps):
                         chosen_ep_url = None
@@ -603,21 +628,36 @@ def get_media_items(url):
                             continue
 
                         # 命名處理
+                        target_ep_num = None
+                        if chosen_raw_name:
+                            num_match = re.search(r'\d+', chosen_raw_name)
+                            if num_match:
+                                target_ep_num = int(num_match.group())
+
                         if total_eps == 1:
                             ep_title = title
                         else:
-                            if chosen_raw_name:
-                                num_match = re.search(r'\d+', chosen_raw_name)
-                                if num_match:
-                                    ep_num = int(num_match.group())
-                                    ep_title = f"{title} - EP{ep_num:02d}"
-                                else:
-                                    ep_title = f"{title} - {chosen_raw_name}"
+                            if target_ep_num is not None:
+                                ep_title = f"{title} - EP{target_ep_num:02d}"
+                            elif chosen_raw_name:
+                                ep_title = f"{title} - {chosen_raw_name}"
                             else:
                                 ep_title = f"{title} - EP{idx+1:02d}"
+
+                        # 收集其他來源線路的備援網址 (例如 FLV 2 海外線路、FLV 3 等)
+                        backup_ep_urls = []
+                        for _, src_list, _ in valid_sources:
+                            cand_u = _find_ep_in_source(src_list, target_ep_num, chosen_raw_name, idx)
+                            if cand_u and cand_u != chosen_ep_url and cand_u not in backup_ep_urls:
+                                backup_ep_urls.append(cand_u)
+                        for src_list in data:
+                            cand_u = _find_ep_in_source(src_list, target_ep_num, chosen_raw_name, idx)
+                            if cand_u and cand_u != chosen_ep_url and cand_u not in backup_ep_urls:
+                                backup_ep_urls.append(cand_u)
                                 
                         items.append({
                             'url': chosen_ep_url,
+                            'backup_urls': backup_ep_urls,
                             'title': ep_title,
                             'ext': 'mp4',
                             'type': 'video',
@@ -1435,6 +1475,27 @@ def show_error_log_box(error_msg, log_text=None, title="詳細錯誤日誌", url
             st.caption("💡 點擊下方框框右上角的 **「📋 複製 (Copy)」** 按鈕，即可快速複製完整日誌（包含目標網址）提供給 AI：")
             st.code(full_log.strip(), language="log")
 
+_cached_ffmpeg_hls_args = None
+
+def get_ffmpeg_hls_args():
+    """動態探測當前系統 FFmpeg 對 HLS demuxer 選項的相容性 (相容 FFmpeg 4.x ~ 9.x)。"""
+    global _cached_ffmpeg_hls_args
+    if _cached_ffmpeg_hls_args is not None:
+        return list(_cached_ffmpeg_hls_args)
+
+    opts = ["-allowed_extensions", "ALL"]
+    try:
+        proc = subprocess.run(["ffmpeg", "-h", "demuxer=hls"], capture_output=True, text=True, timeout=3)
+        hls_help = (proc.stdout or "") + (proc.stderr or "")
+        if "-allowed_segment_extensions" in hls_help:
+            opts += ["-allowed_segment_extensions", "ALL"]
+        if "-extension_picky" in hls_help:
+            opts += ["-extension_picky", "0"]
+    except Exception:
+        pass
+    _cached_ffmpeg_hls_args = opts
+    return list(_cached_ffmpeg_hls_args)
+
 def get_media_duration(media_url, headers=None):
     if "m3u8" in media_url:
         try:
@@ -1456,7 +1517,7 @@ def get_media_duration(media_url, headers=None):
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
             headers_arg = ["-headers", headers_str]
             if "m3u8" in media_url:
-                headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+                headers_arg += get_ffmpeg_hls_args()
         
         probe_cmd = ["ffprobe", "-v", "error"] + headers_arg + [
             "-show_entries", "format=duration",
@@ -1772,6 +1833,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     segments_data = [b""] * total_segments
 
     is_cf_protected = any(k in m3u8_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"]) or "missav" in req_headers.get("Referer", "") or "missav" in req_headers.get("Origin", "")
+    seg_fail_sample = []
 
     def download_segment(args):
         idx, seg_url = args
@@ -1781,20 +1843,29 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                     r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
                     if r.status_code == 200 and len(r.content) > 0:
                         return idx, r.content
-                except Exception:
-                    pass
+                    elif r.status_code != 200 and len(seg_fail_sample) < 3:
+                        seg_fail_sample.append(f"HTTP {r.status_code}")
+                except Exception as e:
+                    if len(seg_fail_sample) < 3:
+                        seg_fail_sample.append(f"curl_cffi: {e}")
             try:
                 r = session.get(seg_url, headers=req_headers, timeout=15)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
-            except Exception:
-                pass
+                elif r.status_code != 200 and len(seg_fail_sample) < 3:
+                    seg_fail_sample.append(f"requests HTTP {r.status_code}")
+            except Exception as e:
+                if len(seg_fail_sample) < 3:
+                    seg_fail_sample.append(f"requests: {e}")
             try:
                 r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
                 if r.status_code == 200 and len(r.content) > 0:
                     return idx, r.content
-            except Exception:
-                pass
+                elif r.status_code != 200 and len(seg_fail_sample) < 3:
+                    seg_fail_sample.append(f"curl_cffi HTTP {r.status_code}")
+            except Exception as e:
+                if len(seg_fail_sample) < 3:
+                    seg_fail_sample.append(f"curl_cffi: {e}")
             # exponential backoff：第 1 次失敗等 0.5s，第 2 次等 1s
             if attempt < 2:
                 time.sleep(0.5 * (2 ** attempt))
@@ -1815,6 +1886,13 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             completed += 1
             completed_duration += segment_durations[idx]
             total_downloaded_bytes += len(content)
+
+            # 早期熔斷保護：若前 20 個切片全數失敗且無一成功，判定來源 CDN 徹底阻擋當前節點，立即中斷切換備援線路
+            if completed >= 20 and sum(1 for c in segments_data if len(c) > 0) == 0:
+                for rem_f in futures:
+                    rem_f.cancel()
+                fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
+                raise ValueError(f"切片下載成功率不足 (前 {completed} 個切片全數遭來源阻擋，觸發線路熔斷備援){fail_diag}。")
 
             now = time.time()
             if now - last_update_time >= 0.25 or completed == total_segments:
@@ -1839,6 +1917,11 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                         f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)"
                     )
                 progress_bar.progress(pct)
+
+    valid_count = sum(1 for c in segments_data if len(c) > 0)
+    if total_segments > 0 and valid_count < total_segments * 0.7:
+        fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
+        raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
 
     status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
 
@@ -2172,7 +2255,7 @@ def download_media(media_item, force_audio=False):
             headers_arg = ["-headers", headers_str]
         
         if "m3u8" in media_url:
-            headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+            headers_arg += get_ffmpeg_hls_args()
 
         if force_audio:
             ffmpeg_cmd = [
@@ -2211,6 +2294,20 @@ def download_media(media_item, force_audio=False):
         returncode, stderr_log = run_ffmpeg_with_progress(
             ffmpeg_cmd, total_duration=total_dur, label=label_text
         )
+
+        # 若因 FFmpeg 版本過舊出現參數不識別 (Unrecognized option)，安全剔除進階參數重試
+        if returncode != 0 and "Unrecognized option" in stderr_log:
+            simplified_cmd = ["ffmpeg", "-y"]
+            if extra_headers:
+                headers_str = "".join(f"{k}: {v}\r\n" for k, v in extra_headers.items())
+                simplified_cmd += ["-headers", headers_str]
+            if force_audio:
+                simplified_cmd += ["-i", media_url, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", out_path]
+            else:
+                simplified_cmd += ["-i", media_url, "-c", "copy", out_path]
+            returncode, stderr_log = run_ffmpeg_with_progress(
+                simplified_cmd, total_duration=total_dur, label=label_text
+            )
 
         if returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             finish_output_file(out_path, filename)
@@ -2261,7 +2358,7 @@ def get_audio_stream_info(media_path, headers=None):
         headers_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         headers_arg = ["-headers", headers_str]
     if "m3u8" in media_path:
-        headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+        headers_arg += get_ffmpeg_hls_args()
 
     probe_cmd = [
         "ffprobe", "-v", "error"
@@ -2500,7 +2597,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         headers_arg = ["-headers", headers_str]
         
     if "m3u8" in video_path:
-        headers_arg += ["-allowed_segment_extensions", "ALL", "-extension_picky", "0"]
+        headers_arg += get_ffmpeg_hls_args()
     
     if is_mono_96k:
         # 96kbps, 單聲道格式 (智慧上限：若原音訊低於 96k 則不膨脹)
