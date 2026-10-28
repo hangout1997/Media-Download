@@ -2073,13 +2073,6 @@ def finish_output_file(local_temp_or_final_path, filename):
 
         # 2. 驗證 Google Drive 授權
         if not gdrive_service.is_authenticated():
-            if not st.session_state[local_saved_key] and os.path.exists(local_temp_or_final_path):
-                try:
-                    shutil.copy2(local_temp_or_final_path, local_dest_path)
-                    st.session_state[local_saved_key] = True
-                    st.info(f"💾 尚未授權 Google Drive，已自動保全至本地資料夾：`{local_dest_path}`")
-                except Exception:
-                    pass
             st.error("❌ 尚未完成 Google Drive 授權！請先至上方儲存設定區點擊「授權連接 Google Drive」完成登入。")
             return False
 
@@ -2199,13 +2192,6 @@ def finish_output_file(local_temp_or_final_path, filename):
 
             elif task.status == "failed":
                 err = task.error
-                if not st.session_state.get(local_saved_key) and os.path.exists(local_temp_or_final_path):
-                    try:
-                        shutil.copy2(local_temp_or_final_path, local_dest_path)
-                        st.session_state[local_saved_key] = True
-                        st.warning(f"⚠️ 雲端上傳異常，已自動將已下載檔案保全至本地資料夾：`{local_dest_path}`")
-                    except Exception:
-                        pass
                 show_error_log_box(f"❌ Google Drive 雲端直送失敗: {err}", traceback.format_exc(), title="Google Drive API 上傳錯誤")
                 _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
                 gc.collect()
@@ -2230,21 +2216,18 @@ def download_media(media_item, force_audio=False):
     filename = f"{title}.{ext}"
     is_gdrive = st.session_state.get('storage_destination') == "gdrive_cloud"
 
-    # 全面防重複下載檢查（跨 RAM Disk、系統暫存與本地目錄，只要已封裝就緒，100% 絕不重複下載）：
+    # 全面防重複下載檢查（跨 RAM Disk 與系統暫存區，只要暫存區已封裝就緒，100% 絕不重複下載）：
     clean_tmp_name = f"gdrive_tmp_{re.sub(r'[\/\\:\*\?\"<>\|]', '_', filename)}"
-    downloads_dir = st.session_state.get('download_dir', load_download_dir())
-    local_existing_path = os.path.join(downloads_dir, filename)
 
     cand_ready_paths = []
     if ramdisk_manager.is_ramdisk_mounted():
         cand_ready_paths.append(os.path.join(ramdisk_manager.MOUNT_POINT, clean_tmp_name))
     cand_ready_paths.append(os.path.join(tempfile.gettempdir(), clean_tmp_name))
-    cand_ready_paths.append(local_existing_path)
 
     for p in cand_ready_paths:
         if os.path.exists(p) and os.path.getsize(p) > 1024 * 1024:
-            where_desc = "RAM Disk 記憶體" if "/Volumes/MediaRAMDisk" in p else ("本地資料夾" if p == local_existing_path else "本機暫存區")
-            st.success(f"⚡ **檔案已在 {where_desc} 封裝就緒** ({os.path.getsize(p)/1024/1024:.1f} MB)，直接進入分發流程！")
+            where_desc = "RAM Disk 記憶體" if "/Volumes/MediaRAMDisk" in p else "本機暫存區"
+            st.success(f"⚡ **檔案已在 {where_desc} 封裝就緒** ({os.path.getsize(p)/1024/1024:.1f} MB)，直接進入雲端/本地分發流程！")
             finish_output_file(p, filename)
             return
 
