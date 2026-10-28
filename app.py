@@ -2005,8 +2005,45 @@ def finish_output_file(local_temp_or_final_path, filename):
     """
     is_gdrive_mode = st.session_state.get('storage_destination') == "gdrive_cloud"
     if is_gdrive_mode:
+        local_dest_dir = st.session_state.get('download_dir', load_download_dir())
+        os.makedirs(local_dest_dir, exist_ok=True)
+        local_dest_path = os.path.join(local_dest_dir, filename)
+        saved_locally = False
+
+        # 1. 檢查是否勾選「同步在本地儲存一份」
+        if st.session_state.get('gdrive_save_local_copy', False):
+            try:
+                if os.path.exists(local_temp_or_final_path) and not os.path.exists(local_dest_path):
+                    shutil.copy2(local_temp_or_final_path, local_dest_path)
+                    saved_locally = True
+                    st.success(f"💾 **已同步儲存至本地資料夾**：`{local_dest_path}`")
+                elif os.path.exists(local_dest_path):
+                    saved_locally = True
+            except Exception as copy_err:
+                st.warning(f"⚠️ 本地同步備份失敗: {copy_err}")
+
+        # 2. 增加下載/儲存本地按鍵：提供手動按鈕讓使用者直接儲存至上一次使用的本地資料夾
+        c_status_col, c_save_btn_col = st.columns([3, 1.3])
+        with c_save_btn_col:
+            safe_btn_key = f"save_local_btn_{re.sub(r'[^a-zA-Z0-9_]', '_', filename)}_{int(time.time()*100)}"
+            if st.button("📥 儲存至本地資料夾", key=safe_btn_key, use_container_width=True, help=f"立即複製檔案至上一次儲存的資料夾：\n{local_dest_dir}"):
+                try:
+                    if os.path.exists(local_temp_or_final_path):
+                        shutil.copy2(local_temp_or_final_path, local_dest_path)
+                        saved_locally = True
+                        st.toast(f"✅ 檔案已成功存入本地：{filename}", icon="💾")
+                except Exception as b_err:
+                    st.error(f"❌ 儲存失敗: {b_err}")
+
         try:
             if not gdrive_service.is_authenticated():
+                if not saved_locally and os.path.exists(local_temp_or_final_path):
+                    try:
+                        shutil.copy2(local_temp_or_final_path, local_dest_path)
+                        saved_locally = True
+                        st.info(f"💾 尚未授權 Google Drive，檔案已自動保全至本地資料夾：`{local_dest_path}`")
+                    except Exception:
+                        pass
                 st.error("❌ 尚未完成 Google Drive 授權！請先至上方儲存設定區點擊「授權連接 Google Drive」完成登入。")
                 return False
 
@@ -2014,12 +2051,14 @@ def finish_output_file(local_temp_or_final_path, filename):
             prog_bar = st.progress(0.0)
             status_text = st.empty()
 
-            def _upload_cb(pct, cur_bytes, tot_bytes, speed_mb):
+            def _upload_cb(pct, cur_bytes, tot_bytes, speed_mb, eta_sec=0):
                 pct_val = min(1.0, max(0.0, pct))
                 prog_bar.progress(pct_val)
                 cur_mb = cur_bytes / 1024 / 1024
                 tot_mb = tot_bytes / 1024 / 1024
-                status_text.markdown(f"☁️ **Google Drive 雲端直送中**: `{pct_val*100:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB) | 上傳速度: `{speed_mb:.2f} MB/s`")
+                eta_str = f" ｜ 預估剩餘: `{format_time(eta_sec)}`" if eta_sec > 0 else ""
+                speed_note = " 🐢 (家用上傳頻寬受限)" if speed_mb < 0.8 else ""
+                status_text.markdown(f"☁️ **Google Drive 雲端直送中**: `{pct_val*100:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB) ｜ 上傳速度: `{speed_mb:.2f} MB/s`{speed_note}{eta_str}")
 
             with st.spinner(f"☁️ 正在直送至 Google Drive {target_label}{filename}..."):
                 res = gdrive_service.upload_file_directly_to_gdrive(
@@ -2036,19 +2075,36 @@ def finish_output_file(local_temp_or_final_path, filename):
             folder_link = gdrive_service.get_folder_link(res['folder_id']) if res and res.get('folder_id') else None
             link_md = f" [🔗 開啟檔案]({link})" if link else ""
             folder_md = f" ｜ [📂 開啟資料夾]({folder_link})" if folder_link else ""
+            local_note = f"（已同步保留於本地 `{local_dest_path}`）" if saved_locally else "（本機無殘留）"
+
             if res and res.get('skipped'):
-                st.info(f"⏭️ 雲端 `{target_label}` 已存在同名檔案，已跳過上傳：`{filename}`{link_md}{folder_md}")
+                st.info(f"⏭️ 雲端 `{target_label}` 已存在同名檔案，已跳過上傳：`{filename}`{link_md}{folder_md} {local_note}")
             else:
-                st.success(f"🎉 **雲端直送成功！** `{target_label}{filename}`{link_md}{folder_md}（本機無殘留）")
+                st.success(f"🎉 **雲端直送成功！** `{target_label}{filename}`{link_md}{folder_md} {local_note}")
             return True
         except gdrive_service.GDriveAuthRequired as e:
+            if not saved_locally and os.path.exists(local_temp_or_final_path):
+                try:
+                    shutil.copy2(local_temp_or_final_path, local_dest_path)
+                    saved_locally = True
+                    st.info(f"💾 雲端需重新授權，已自動將檔案保全至本地資料夾：`{local_dest_path}`")
+                except Exception:
+                    pass
             st.error(f"❌ {e} 請至上方「☁️ Google Drive」區塊重新授權後再試。")
             return False
         except Exception as e:
+            # 雲端上傳若因頻寬慢或中斷，自動保全至本地資料夾，避免白下載
+            if not saved_locally and os.path.exists(local_temp_or_final_path):
+                try:
+                    shutil.copy2(local_temp_or_final_path, local_dest_path)
+                    saved_locally = True
+                    st.warning(f"⚠️ 雲端直送因網路異常中斷，已自動為您將下載好的檔案保全儲存至本地資料夾：`{local_dest_path}`")
+                except Exception:
+                    pass
             show_error_log_box(f"❌ Google Drive 雲端直送失敗: {e}", traceback.format_exc(), title="Google Drive API 上傳錯誤")
             return False
         finally:
-            if os.path.exists(local_temp_or_final_path):
+            if os.path.exists(local_temp_or_final_path) and os.path.abspath(local_temp_or_final_path) != os.path.abspath(local_dest_path):
                 try:
                     os.remove(local_temp_or_final_path)
                 except Exception:
@@ -2753,6 +2809,8 @@ if "storage_destination" not in st.session_state:
     st.session_state.storage_destination = gdrive_service.load_config().get("storage_destination", "local")
 if "gdrive_skip_dup" not in st.session_state:
     st.session_state.gdrive_skip_dup = gdrive_service.load_config().get("gdrive_skip_duplicates", True)
+if "gdrive_save_local_copy" not in st.session_state:
+    st.session_state.gdrive_save_local_copy = gdrive_service.load_config().get("gdrive_save_local_copy", False)
 
 # 回呼函數 (Callbacks: 於 Widget 實例化前優先執行，允許修改 session_state)
 def _cb_choose_folder():
@@ -2993,7 +3051,15 @@ if st.session_state.storage_destination in ("gdrive_cloud", "colab_cloud"):
         def _cb_skip_dup():
             gdrive_service.update_config(gdrive_skip_duplicates=st.session_state.gdrive_skip_dup)
 
-        st.checkbox("⏭️ 雲端已有同名檔案時自動跳過 (下載前先檢查，節省流量)", key="gdrive_skip_dup", on_change=_cb_skip_dup)
+        def _cb_save_local_copy():
+            gdrive_service.update_config(gdrive_save_local_copy=st.session_state.gdrive_save_local_copy)
+
+        saved_local_dir = st.session_state.get('download_dir', load_download_dir())
+        c_opt1, c_opt2 = st.columns([1.2, 1.3])
+        with c_opt1:
+            st.checkbox("⏭️ 雲端已有同名檔案時自動跳過", key="gdrive_skip_dup", on_change=_cb_skip_dup, help="下載前先檢查目標資料夾，已有同名檔案則略過以節省流量與時間。")
+        with c_opt2:
+            st.checkbox(f"📥 同步在本地儲存一份 (位置: `{os.path.basename(saved_local_dir.rstrip('/')) or saved_local_dir}`)", key="gdrive_save_local_copy", on_change=_cb_save_local_copy, help=f"若啟用，影片封裝完成後會先將檔案儲存至上一次使用的本地下載資料夾 ({saved_local_dir})，再上傳至雲端，確保本地立刻有檔案可看。")
 
         with st.expander("📂 變更雲端目標資料夾", expanded=False):
             _render_gdrive_folder_picker()

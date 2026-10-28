@@ -201,9 +201,9 @@ def get_gdrive_service(interactive=False, force_new=False):
             creds = run_oauth_flow()
 
     # 每個 Thread 獨立建立，避免多線程共用 OpenSSL 連線造成 libmalloc double-free 崩潰
-    # 使用 Google 專屬 build_http 並設定 timeout 為 180 秒（排除 308 重定向，因 Google Resumable Upload 使用 308 Resume Incomplete）
+    # 使用 Google 專屬 build_http 並設定 timeout 為 300 秒（排除 308 重定向，因 Google Resumable Upload 使用 308 Resume Incomplete）
     http_transport = build_http()
-    http_transport.timeout = 180
+    http_transport.timeout = 300
     try:
         http_transport.redirect_codes = http_transport.redirect_codes - {308}
     except AttributeError:
@@ -432,8 +432,18 @@ def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_c
 
     file_metadata = {'name': filename, 'parents': [folder_id]}
 
-    # 5MB 分塊 (需為 256KB 整數倍)，降低單次 socket write 負擔並提升抗抖動續傳能力
-    chunk_size = 5 * 1024 * 1024
+    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+
+    # 依檔案大小動態決定最優分塊 (皆為 256KB 整數倍)，顯著降低 HTTP 往返延遲並提升傳輸效能
+    if file_size > 200 * 1024 * 1024:
+        chunk_size = 32 * 1024 * 1024  # 32MB
+    elif file_size > 50 * 1024 * 1024:
+        chunk_size = 16 * 1024 * 1024  # 16MB
+    elif file_size > 15 * 1024 * 1024:
+        chunk_size = 8 * 1024 * 1024   # 8MB
+    else:
+        chunk_size = 4 * 1024 * 1024   # 4MB
+
     media = MediaFileUpload(file_path, mimetype=mime_type, chunksize=chunk_size, resumable=True)
     request = service.files().create(
         body=file_metadata, media_body=media,
@@ -442,7 +452,6 @@ def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_c
 
     response = None
     start_time = time.time()
-    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
     max_chunk_retries = 6
     consecutive_errors = 0
@@ -474,10 +483,19 @@ def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_c
             uploaded_bytes = int(progress_pct * file_size)
             elapsed = max(0.1, time.time() - start_time)
             speed_mb = (uploaded_bytes / 1024 / 1024) / elapsed
-            progress_callback(progress_pct, uploaded_bytes, file_size, speed_mb)
+            remaining_bytes = max(0, file_size - uploaded_bytes)
+            speed_bytes_sec = uploaded_bytes / elapsed if elapsed > 0 else 0
+            eta_sec = int(remaining_bytes / speed_bytes_sec) if speed_bytes_sec > 0 else 0
+            try:
+                progress_callback(progress_pct, uploaded_bytes, file_size, speed_mb, eta_sec)
+            except TypeError:
+                progress_callback(progress_pct, uploaded_bytes, file_size, speed_mb)
 
     if progress_callback:
-        progress_callback(1.0, file_size, file_size, 0.0)
+        try:
+            progress_callback(1.0, file_size, file_size, 0.0, 0)
+        except TypeError:
+            progress_callback(1.0, file_size, file_size, 0.0)
 
     response['skipped'] = False
     response['folder_id'] = folder_id
