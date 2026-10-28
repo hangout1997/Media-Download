@@ -2117,7 +2117,6 @@ def finish_output_file(local_temp_or_final_path, filename):
                             shutil.copy2(src_to_copy, local_dest_path)
                             st.session_state[local_saved_key] = True
                             st.toast(f"✅ 檔案已成功存入本地資料夾！", icon="💾")
-                            st.rerun()
                     except Exception as b_err:
                         st.error(f"❌ 儲存失敗: {b_err}")
 
@@ -2243,7 +2242,23 @@ def download_media(media_item, force_audio=False):
         required_free = (est_size_bytes + 300 * 1024 * 1024) if est_size_bytes > 0 else (1024 * 1024 * 1024)
 
         temp_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_free)
-        out_path = os.path.join(temp_dir, f"gdrive_tmp_{int(time.time()*1000)}_{filename}")
+        clean_tmp_name = f"gdrive_tmp_{re.sub(r'[\/\\:\*\?\"<>\|]', '_', filename)}"
+        out_path = os.path.join(temp_dir, clean_tmp_name)
+
+        # 優先檢查 1：暫存區或 RAM Disk 是否已有完整封裝檔案（徹底防範 rerun 導致重複下載）
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1024 * 1024:
+            st.success(f"⚡ **檔案已在暫存區封裝就緒** ({os.path.getsize(out_path)/1024/1024:.1f} MB)，直接進入雲端/本地流程！")
+            finish_output_file(out_path, filename)
+            return
+
+        # 優先檢查 2：本地目標資料夾是否已有同名檔案 (例如剛才已點擊儲存至本地)
+        downloads_dir = st.session_state.get('download_dir', load_download_dir())
+        local_existing_path = os.path.join(downloads_dir, filename)
+        if os.path.exists(local_existing_path) and os.path.getsize(local_existing_path) > 1024 * 1024:
+            st.success(f"⚡ **本地已存在完整檔案** ({os.path.getsize(local_existing_path)/1024/1024:.1f} MB)，直接進入雲端直送流程！")
+            finish_output_file(local_existing_path, filename)
+            return
+
         _, _tgt_label = gdrive_service.get_target_folder()
         is_ram = ramdisk_manager.is_ramdisk_mounted() and temp_dir == ramdisk_manager.MOUNT_POINT
         if ramdisk_manager.is_ramdisk_mounted() and not is_ram:
@@ -2298,7 +2313,7 @@ def download_media(media_item, force_audio=False):
                     ramdisk_manager.clean_scratch_files()
                     if is_gdrive and "/Volumes/MediaRAMDisk" in out_path:
                         temp_dir = tempfile.gettempdir()
-                        out_path = os.path.join(temp_dir, f"gdrive_tmp_{int(time.time()*1000)}_{filename}")
+                        out_path = os.path.join(temp_dir, clean_tmp_name)
                         st.info(f"🔄 偵測到 RAM Disk 空間吃緊或多線程中斷，已自動將標準下載路徑切換至本機暫存: `{temp_dir}`")
                     if c_idx == len(cand_m3u8s) - 1:
                         st.warning(f"⚠️ 多線程下載失敗 ({hls_err})，降級使用標準 FFmpeg 串流處理...")
