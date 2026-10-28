@@ -12,7 +12,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, build_http
 from googleapiclient.errors import HttpError
 
 # 允許的 OAuth 範圍：完整 Drive 檔案管理 (需能瀏覽使用者既有資料夾)
@@ -201,8 +201,13 @@ def get_gdrive_service(interactive=False, force_new=False):
             creds = run_oauth_flow()
 
     # 每個 Thread 獨立建立，避免多線程共用 OpenSSL 連線造成 libmalloc double-free 崩潰
-    # 設定 httplib2 timeout 為 180 秒，避免大檔案或網路慢速時 socket 提前寫入逾時
-    http_transport = httplib2.Http(timeout=180)
+    # 使用 Google 專屬 build_http 並設定 timeout 為 180 秒（排除 308 重定向，因 Google Resumable Upload 使用 308 Resume Incomplete）
+    http_transport = build_http()
+    http_transport.timeout = 180
+    try:
+        http_transport.redirect_codes = http_transport.redirect_codes - {308}
+    except AttributeError:
+        pass
     authorized_http = google_auth_httplib2.AuthorizedHttp(creds, http=http_transport)
     service = build('drive', 'v3', http=authorized_http, cache_discovery=False)
     _thread_local.service = service
