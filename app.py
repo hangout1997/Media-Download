@@ -2230,6 +2230,24 @@ def download_media(media_item, force_audio=False):
     filename = f"{title}.{ext}"
     is_gdrive = st.session_state.get('storage_destination') == "gdrive_cloud"
 
+    # 全面防重複下載檢查（跨 RAM Disk、系統暫存與本地目錄，只要已封裝就緒，100% 絕不重複下載）：
+    clean_tmp_name = f"gdrive_tmp_{re.sub(r'[\/\\:\*\?\"<>\|]', '_', filename)}"
+    downloads_dir = st.session_state.get('download_dir', load_download_dir())
+    local_existing_path = os.path.join(downloads_dir, filename)
+
+    cand_ready_paths = []
+    if ramdisk_manager.is_ramdisk_mounted():
+        cand_ready_paths.append(os.path.join(ramdisk_manager.MOUNT_POINT, clean_tmp_name))
+    cand_ready_paths.append(os.path.join(tempfile.gettempdir(), clean_tmp_name))
+    cand_ready_paths.append(local_existing_path)
+
+    for p in cand_ready_paths:
+        if os.path.exists(p) and os.path.getsize(p) > 1024 * 1024:
+            where_desc = "RAM Disk 記憶體" if "/Volumes/MediaRAMDisk" in p else ("本地資料夾" if p == local_existing_path else "本機暫存區")
+            st.success(f"⚡ **檔案已在 {where_desc} 封裝就緒** ({os.path.getsize(p)/1024/1024:.1f} MB)，直接進入分發流程！")
+            finish_output_file(p, filename)
+            return
+
     if is_gdrive:
         if gdrive_precheck_exists(filename):
             return
@@ -2242,22 +2260,7 @@ def download_media(media_item, force_audio=False):
         required_free = (est_size_bytes + 300 * 1024 * 1024) if est_size_bytes > 0 else (1024 * 1024 * 1024)
 
         temp_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_free)
-        clean_tmp_name = f"gdrive_tmp_{re.sub(r'[\/\\:\*\?\"<>\|]', '_', filename)}"
         out_path = os.path.join(temp_dir, clean_tmp_name)
-
-        # 優先檢查 1：暫存區或 RAM Disk 是否已有完整封裝檔案（徹底防範 rerun 導致重複下載）
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1024 * 1024:
-            st.success(f"⚡ **檔案已在暫存區封裝就緒** ({os.path.getsize(out_path)/1024/1024:.1f} MB)，直接進入雲端/本地流程！")
-            finish_output_file(out_path, filename)
-            return
-
-        # 優先檢查 2：本地目標資料夾是否已有同名檔案 (例如剛才已點擊儲存至本地)
-        downloads_dir = st.session_state.get('download_dir', load_download_dir())
-        local_existing_path = os.path.join(downloads_dir, filename)
-        if os.path.exists(local_existing_path) and os.path.getsize(local_existing_path) > 1024 * 1024:
-            st.success(f"⚡ **本地已存在完整檔案** ({os.path.getsize(local_existing_path)/1024/1024:.1f} MB)，直接進入雲端直送流程！")
-            finish_output_file(local_existing_path, filename)
-            return
 
         _, _tgt_label = gdrive_service.get_target_folder()
         is_ram = ramdisk_manager.is_ramdisk_mounted() and temp_dir == ramdisk_manager.MOUNT_POINT
