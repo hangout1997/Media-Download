@@ -4,11 +4,16 @@ import time
 import json
 import mimetypes
 import threading
+import socket
+import ssl
+import httplib2
+import google_auth_httplib2
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 
 # 允許的 OAuth 範圍：完整 Drive 檔案管理 (需能瀏覽使用者既有資料夾)
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -196,7 +201,10 @@ def get_gdrive_service(interactive=False, force_new=False):
             creds = run_oauth_flow()
 
     # 每個 Thread 獨立建立，避免多線程共用 OpenSSL 連線造成 libmalloc double-free 崩潰
-    service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+    # 設定 httplib2 timeout 為 180 秒，避免大檔案或網路慢速時 socket 提前寫入逾時
+    http_transport = httplib2.Http(timeout=180)
+    authorized_http = google_auth_httplib2.AuthorizedHttp(creds, http=http_transport)
+    service = build('drive', 'v3', http=authorized_http, cache_discovery=False)
     _thread_local.service = service
     _thread_local.key = key
     _thread_local.creds = creds
@@ -419,7 +427,8 @@ def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_c
 
     file_metadata = {'name': filename, 'parents': [folder_id]}
 
-    chunk_size = 10 * 1024 * 1024
+    # 5MB 分塊 (需為 256KB 整數倍)，降低單次 socket write 負擔並提升抗抖動續傳能力
+    chunk_size = 5 * 1024 * 1024
     media = MediaFileUpload(file_path, mimetype=mime_type, chunksize=chunk_size, resumable=True)
     request = service.files().create(
         body=file_metadata, media_body=media,
@@ -430,9 +439,31 @@ def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_c
     start_time = time.time()
     file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
+    max_chunk_retries = 6
+    consecutive_errors = 0
+
     while response is None:
-        # num_retries：遇 5xx / 網路中斷時自動指數退避重試，不必整檔重傳
-        status, response = request.next_chunk(num_retries=5)
+        try:
+            # num_retries=2 處理短暫 HTTP 狀態重試
+            status, response = request.next_chunk(num_retries=2)
+            consecutive_errors = 0  # 傳輸成功一個 chunk，重置錯誤計數
+        except (TimeoutError, socket.timeout, ssl.SSLError, OSError, ConnectionError, httplib2.HttpLib2Error) as net_err:
+            consecutive_errors += 1
+            if consecutive_errors > max_chunk_retries:
+                raise TimeoutError(f"Google Drive 上傳逾時中斷，連續重試 {max_chunk_retries} 次依然失敗：{net_err}") from net_err
+            # 發生 socket / ssl 逾時後，googleapiclient 會自動將 request._in_error_state 設為 True
+            # 下次呼叫 next_chunk 時 SDK 會發送空 PUT 查詢伺服器已接收的 Range 並自動無縫斷點續傳
+            backoff_sec = min(30, 2 ** (consecutive_errors - 1))
+            time.sleep(backoff_sec)
+            continue
+        except HttpError as http_err:
+            if http_err.resp.status in [429, 500, 502, 503, 504] and consecutive_errors < max_chunk_retries:
+                consecutive_errors += 1
+                backoff_sec = min(30, 2 ** (consecutive_errors - 1))
+                time.sleep(backoff_sec)
+                continue
+            raise
+
         if status and progress_callback:
             progress_pct = status.progress()
             uploaded_bytes = int(progress_pct * file_size)
