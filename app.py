@@ -1994,122 +1994,223 @@ def gdrive_precheck_exists(filename):
         return True
     return False
 
+class GDriveBackgroundUploadTask:
+    """非同步 Google Drive 背景上傳任務，讓前台即時互動（儲存本地、立即觀看）與雲端上傳並行執行，互不干擾。"""
+    def __init__(self, file_path, filename, folder_id, skip_if_exists):
+        self.file_path = file_path
+        self.filename = filename
+        self.folder_id = folder_id
+        self.skip_if_exists = skip_if_exists
+        self.progress = 0.0
+        self.uploaded_bytes = 0
+        self.file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        self.speed_mb = 0.0
+        self.eta_sec = 0
+        self.status = "uploading"  # uploading, success, skipped, failed
+        self.res = None
+        self.error = None
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            def _cb(pct, cur, tot, spd, eta=0):
+                self.progress = pct
+                self.uploaded_bytes = cur
+                self.file_size = tot
+                self.speed_mb = spd
+                self.eta_sec = eta
+
+            self.res = gdrive_service.upload_file_directly_to_gdrive(
+                self.file_path,
+                original_filename=self.filename,
+                folder_id=self.folder_id,
+                progress_callback=_cb,
+                skip_if_exists=self.skip_if_exists,
+            )
+            if self.res and self.res.get('skipped'):
+                self.status = "skipped"
+            else:
+                self.status = "success"
+        except Exception as e:
+            self.error = e
+            self.status = "failed"
+
+_ACTIVE_GDRIVE_UPLOADS = {}
+
+
 def finish_output_file(local_temp_or_final_path, filename):
     """
     完成檔案處理並依據儲存模式分發：
     - 若選擇 '☁️ Google Drive 雲端直送 (Cloud API)'：
-      直接透過 Google Drive REST API 將串流上傳至 Google Drive 雲端的 'Download' 資料夾，
-      上傳完成後立刻刪除本機暫存檔並回收記憶體，確保本機硬碟 100% 零殘留！
+      以背景 Thread 異步上傳至 Google Drive 目標資料夾。
+      在上傳同時提供「📥 儲存至本地資料夾」、「📂 在 Finder 顯示」、「🎬 立即播放觀賞」等按鍵，
+      讓使用者能隨時將影片存入本地即時觀賞，完全不影響背景持續進行的雲端上傳。
     - 若選擇 '📁 本地硬碟資料夾'：
-      檔案保留於使用者指定的本機資料夾中。
+      檔案直接保留於使用者指定的本機資料夾中。
     """
     is_gdrive_mode = st.session_state.get('storage_destination') == "gdrive_cloud"
     if is_gdrive_mode:
         local_dest_dir = st.session_state.get('download_dir', load_download_dir())
         os.makedirs(local_dest_dir, exist_ok=True)
         local_dest_path = os.path.join(local_dest_dir, filename)
-        saved_locally = False
+
+        local_saved_key = f"saved_local_{filename}"
+        if local_saved_key not in st.session_state:
+            st.session_state[local_saved_key] = os.path.exists(local_dest_path)
 
         # 1. 檢查是否勾選「同步在本地儲存一份」
-        if st.session_state.get('gdrive_save_local_copy', False):
+        if st.session_state.get('gdrive_save_local_copy', False) and not st.session_state[local_saved_key]:
             try:
                 if os.path.exists(local_temp_or_final_path) and not os.path.exists(local_dest_path):
                     shutil.copy2(local_temp_or_final_path, local_dest_path)
-                    saved_locally = True
-                    st.success(f"💾 **已同步儲存至本地資料夾**：`{local_dest_path}`")
-                elif os.path.exists(local_dest_path):
-                    saved_locally = True
+                    st.session_state[local_saved_key] = True
             except Exception as copy_err:
-                st.warning(f"⚠️ 本地同步備份失敗: {copy_err}")
+                st.warning(f"⚠️ 本地同步失敗: {copy_err}")
 
-        # 2. 增加下載/儲存本地按鍵：提供手動按鈕讓使用者直接儲存至上一次使用的本地資料夾
-        c_status_col, c_save_btn_col = st.columns([3, 1.3])
-        with c_save_btn_col:
-            safe_btn_key = f"save_local_btn_{re.sub(r'[^a-zA-Z0-9_]', '_', filename)}_{int(time.time()*100)}"
-            if st.button("📥 儲存至本地資料夾", key=safe_btn_key, use_container_width=True, help=f"立即複製檔案至上一次儲存的資料夾：\n{local_dest_dir}"):
+        # 2. 驗證 Google Drive 授權
+        if not gdrive_service.is_authenticated():
+            if not st.session_state[local_saved_key] and os.path.exists(local_temp_or_final_path):
                 try:
-                    if os.path.exists(local_temp_or_final_path):
-                        shutil.copy2(local_temp_or_final_path, local_dest_path)
-                        saved_locally = True
-                        st.toast(f"✅ 檔案已成功存入本地：{filename}", icon="💾")
-                except Exception as b_err:
-                    st.error(f"❌ 儲存失敗: {b_err}")
+                    shutil.copy2(local_temp_or_final_path, local_dest_path)
+                    st.session_state[local_saved_key] = True
+                    st.info(f"💾 尚未授權 Google Drive，已自動保全至本地資料夾：`{local_dest_path}`")
+                except Exception:
+                    pass
+            st.error("❌ 尚未完成 Google Drive 授權！請先至上方儲存設定區點擊「授權連接 Google Drive」完成登入。")
+            return False
 
-        try:
-            if not gdrive_service.is_authenticated():
-                if not saved_locally and os.path.exists(local_temp_or_final_path):
+        target_folder_id, target_label = gdrive_service.get_target_folder()
+
+        # 3. 取得或啟動背景非同步上傳任務 (背景持續執行，絕不阻塞前台與按鍵響應)
+        task_key = f"{filename}_{local_temp_or_final_path}"
+        task = _ACTIVE_GDRIVE_UPLOADS.get(task_key)
+        if not task or (task.status in ("failed", "success", "skipped") and not (task.thread and task.thread.is_alive())):
+            task = GDriveBackgroundUploadTask(
+                local_temp_or_final_path,
+                filename=filename,
+                folder_id=target_folder_id,
+                skip_if_exists=st.session_state.get('gdrive_skip_dup', True)
+            )
+            _ACTIVE_GDRIVE_UPLOADS[task_key] = task
+            task.start()
+
+        # 4. 前端即時互動卡片 (上傳 Google Drive 的同時，讓使用者能儲存至本地並立即觀看)
+        with st.container(border=True):
+            st.markdown(f"#### ☁️ Google Drive 上傳進行中：`{filename}`")
+            file_sz_mb = task.file_size / 1024 / 1024
+            st.caption(f"📁 檔案大小: `{file_sz_mb:.1f} MB` ｜ 本地目標資料夾: `{local_dest_dir}`")
+
+            # 核心互動按鍵：上傳同時可隨時點擊，不影響雲端上傳進度
+            c_btn1, c_btn2, c_btn3 = st.columns([1.6, 1.2, 1.2])
+
+            with c_btn1:
+                is_saved = st.session_state.get(local_saved_key, False) or os.path.exists(local_dest_path)
+                btn_label = "✅ 本地已儲存" if is_saved else "📥 儲存至本地資料夾"
+                if st.button(btn_label, key=f"btn_save_{filename}", disabled=is_saved, use_container_width=True, help=f"立即複製檔案至上一次儲存的資料夾：\n{local_dest_path}"):
                     try:
-                        shutil.copy2(local_temp_or_final_path, local_dest_path)
-                        saved_locally = True
-                        st.info(f"💾 尚未授權 Google Drive，檔案已自動保全至本地資料夾：`{local_dest_path}`")
-                    except Exception:
-                        pass
-                st.error("❌ 尚未完成 Google Drive 授權！請先至上方儲存設定區點擊「授權連接 Google Drive」完成登入。")
-                return False
+                        src_to_copy = local_temp_or_final_path if os.path.exists(local_temp_or_final_path) else None
+                        if src_to_copy:
+                            shutil.copy2(src_to_copy, local_dest_path)
+                            st.session_state[local_saved_key] = True
+                            st.toast(f"✅ 檔案已成功存入本地資料夾！", icon="💾")
+                            st.rerun()
+                    except Exception as b_err:
+                        st.error(f"❌ 儲存失敗: {b_err}")
 
-            _, target_label = gdrive_service.get_target_folder()
-            prog_bar = st.progress(0.0)
+            with c_btn2:
+                if st.button("📂 在 Finder 顯示", key=f"btn_finder_{filename}", use_container_width=True, help="在 Mac Finder 中定位並高亮選取此影片"):
+                    target_show = local_dest_path if os.path.exists(local_dest_path) else local_temp_or_final_path
+                    if os.path.exists(target_show):
+                        try:
+                            subprocess.Popen(["open", "-R", target_show])
+                            st.toast("📂 已在 Finder 中為您高亮選取！", icon="📂")
+                        except Exception as o_err:
+                            st.error(f"開啟失敗: {o_err}")
+
+            with c_btn3:
+                if st.button("🎬 立即播放觀賞", key=f"btn_play_{filename}", use_container_width=True, help="直接以系統預設播放器 (如 QuickTime / IINA) 立即開啟影片"):
+                    target_play = local_dest_path if os.path.exists(local_dest_path) else local_temp_or_final_path
+                    if os.path.exists(target_play):
+                        try:
+                            subprocess.Popen(["open", target_play])
+                            st.toast("🎬 已拉起預設播放器！", icon="🎬")
+                        except Exception as p_err:
+                            st.error(f"播放失敗: {p_err}")
+
+            if st.session_state.get(local_saved_key, False):
+                st.success(f"💾 **本地已妥善保存**：`{local_dest_path}`（您可以立即觀賞，雲端上傳不受影響繼續進行中）")
+
+            # 雲端上傳進度監控
+            prog_bar = st.progress(min(1.0, max(0.0, task.progress)))
             status_text = st.empty()
 
-            def _upload_cb(pct, cur_bytes, tot_bytes, speed_mb, eta_sec=0):
-                pct_val = min(1.0, max(0.0, pct))
+            # 輪詢更新進度 (每次間隔 0.8 秒；使用者隨時點擊上方按鈕均可立即打斷觸發 rerun，不影響背景上傳)
+            while task.status == "uploading":
+                pct_val = min(1.0, max(0.0, task.progress))
                 prog_bar.progress(pct_val)
-                cur_mb = cur_bytes / 1024 / 1024
-                tot_mb = tot_bytes / 1024 / 1024
-                eta_str = f" ｜ 預估剩餘: `{format_time(eta_sec)}`" if eta_sec > 0 else ""
-                speed_note = " 🐢 (家用上傳頻寬受限)" if speed_mb < 0.8 else ""
-                status_text.markdown(f"☁️ **Google Drive 雲端直送中**: `{pct_val*100:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB) ｜ 上傳速度: `{speed_mb:.2f} MB/s`{speed_note}{eta_str}")
-
-            with st.spinner(f"☁️ 正在直送至 Google Drive {target_label}{filename}..."):
-                res = gdrive_service.upload_file_directly_to_gdrive(
-                    local_temp_or_final_path,
-                    original_filename=filename,
-                    progress_callback=_upload_cb,
-                    skip_if_exists=st.session_state.get('gdrive_skip_dup', True),
-                )
+                cur_mb = task.uploaded_bytes / 1024 / 1024
+                tot_mb = task.file_size / 1024 / 1024
+                eta_str = f" ｜ 預估剩餘: `{format_time(task.eta_sec)}`" if task.eta_sec > 0 else ""
+                speed_note = " 🐢 (家用上傳頻寬受限)" if task.speed_mb < 0.8 else ""
+                status_text.markdown(f"☁️ **Google Drive 雲端直送中**: `{pct_val*100:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB) ｜ 上傳速度: `{task.speed_mb:.2f} MB/s`{speed_note}{eta_str}")
+                time.sleep(0.8)
 
             prog_bar.empty()
             status_text.empty()
 
-            link = res.get('webViewLink') if res else None
-            folder_link = gdrive_service.get_folder_link(res['folder_id']) if res and res.get('folder_id') else None
-            link_md = f" [🔗 開啟檔案]({link})" if link else ""
-            folder_md = f" ｜ [📂 開啟資料夾]({folder_link})" if folder_link else ""
-            local_note = f"（已同步保留於本地 `{local_dest_path}`）" if saved_locally else "（本機無殘留）"
-
-            if res and res.get('skipped'):
-                st.info(f"⏭️ 雲端 `{target_label}` 已存在同名檔案，已跳過上傳：`{filename}`{link_md}{folder_md} {local_note}")
-            else:
+            if task.status == "success":
+                res = task.res
+                link = res.get('webViewLink') if res else None
+                folder_link = gdrive_service.get_folder_link(res['folder_id']) if res and res.get('folder_id') else None
+                link_md = f" [🔗 開啟檔案]({link})" if link else ""
+                folder_md = f" ｜ [📂 開啟資料夾]({folder_link})" if folder_link else ""
+                local_note = f"（已同步保留於本地 `{local_dest_path}`）" if st.session_state.get(local_saved_key) else "（本機無殘留）"
                 st.success(f"🎉 **雲端直送成功！** `{target_label}{filename}`{link_md}{folder_md} {local_note}")
-            return True
-        except gdrive_service.GDriveAuthRequired as e:
-            if not saved_locally and os.path.exists(local_temp_or_final_path):
-                try:
-                    shutil.copy2(local_temp_or_final_path, local_dest_path)
-                    saved_locally = True
-                    st.info(f"💾 雲端需重新授權，已自動將檔案保全至本地資料夾：`{local_dest_path}`")
-                except Exception:
-                    pass
-            st.error(f"❌ {e} 請至上方「☁️ Google Drive」區塊重新授權後再試。")
-            return False
-        except Exception as e:
-            # 雲端上傳若因頻寬慢或中斷，自動保全至本地資料夾，避免白下載
-            if not saved_locally and os.path.exists(local_temp_or_final_path):
-                try:
-                    shutil.copy2(local_temp_or_final_path, local_dest_path)
-                    saved_locally = True
-                    st.warning(f"⚠️ 雲端直送因網路異常中斷，已自動為您將下載好的檔案保全儲存至本地資料夾：`{local_dest_path}`")
-                except Exception:
-                    pass
-            show_error_log_box(f"❌ Google Drive 雲端直送失敗: {e}", traceback.format_exc(), title="Google Drive API 上傳錯誤")
-            return False
-        finally:
-            if os.path.exists(local_temp_or_final_path) and os.path.abspath(local_temp_or_final_path) != os.path.abspath(local_dest_path):
-                try:
-                    os.remove(local_temp_or_final_path)
-                except Exception:
-                    pass
-            gc.collect()
+
+                # 清理暫存檔 (若已存本地則清理暫存，本地不受影響)
+                if os.path.exists(local_temp_or_final_path) and os.path.abspath(local_temp_or_final_path) != os.path.abspath(local_dest_path):
+                    try:
+                        os.remove(local_temp_or_final_path)
+                    except Exception:
+                        pass
+                _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
+                gc.collect()
+                return True
+
+            elif task.status == "skipped":
+                res = task.res
+                link = res.get('webViewLink') if res else None
+                folder_link = gdrive_service.get_folder_link(res['folder_id']) if res and res.get('folder_id') else None
+                link_md = f" [🔗 開啟檔案]({link})" if link else ""
+                folder_md = f" ｜ [📂 開啟資料夾]({folder_link})" if folder_link else ""
+                local_note = f"（已同步保留於本地 `{local_dest_path}`）" if st.session_state.get(local_saved_key) else ""
+                st.info(f"⏭️ 雲端 `{target_label}` 已存在同名檔案，已跳過上傳：`{filename}`{link_md}{folder_md} {local_note}")
+                if os.path.exists(local_temp_or_final_path) and os.path.abspath(local_temp_or_final_path) != os.path.abspath(local_dest_path):
+                    try:
+                        os.remove(local_temp_or_final_path)
+                    except Exception:
+                        pass
+                _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
+                gc.collect()
+                return True
+
+            elif task.status == "failed":
+                err = task.error
+                if not st.session_state.get(local_saved_key) and os.path.exists(local_temp_or_final_path):
+                    try:
+                        shutil.copy2(local_temp_or_final_path, local_dest_path)
+                        st.session_state[local_saved_key] = True
+                        st.warning(f"⚠️ 雲端上傳異常，已自動將已下載檔案保全至本地資料夾：`{local_dest_path}`")
+                    except Exception:
+                        pass
+                show_error_log_box(f"❌ Google Drive 雲端直送失敗: {err}", traceback.format_exc(), title="Google Drive API 上傳錯誤")
+                _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
+                gc.collect()
+                return False
     else:
         st.success(f"✅ 下載完成！檔案已儲存至本機: `{local_temp_or_final_path}`")
         gc.collect()
