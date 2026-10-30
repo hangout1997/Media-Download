@@ -31,9 +31,38 @@ _GLOBAL_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 }
 
-# ── 全域工作暫停/恢復事件（秒級釋放上/下行頻寬供線上會議等使用）────────────────
-_GLOBAL_PAUSE_EVENT = threading.Event()
-_GLOBAL_PAUSE_EVENT.set()  # 預設為運行狀態 (未暫停)
+# ── 全域工作暫停/恢復事件（秒級釋放上/下行頻寬供線上會議等使用，單例持久化）────────────────
+_GLOBAL_PAUSE_EVENT = gdrive_service.get_pause_event()
+
+
+def is_work_paused():
+    return gdrive_service.is_work_paused()
+
+
+def pause_work_callback():
+    gdrive_service.pause_all_work()
+    st.session_state.is_batch_paused = True
+
+
+def resume_work_callback():
+    gdrive_service.resume_all_work()
+    st.session_state.is_batch_paused = False
+
+
+def skip_current_video_callback(next_idx):
+    gdrive_service.resume_all_work()
+    st.session_state.is_batch_paused = False
+    st.session_state.video_batch_idx = next_idx
+
+
+def stop_all_batch_callback():
+    gdrive_service.resume_all_work()
+    st.session_state.is_batch_paused = False
+    st.session_state.is_video_batch_running = False
+    st.session_state.video_batch_queue = []
+    st.session_state.video_batch_idx = 0
+
+
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 DEFAULT_DOWNLOAD_DIR = "/Users/ericcheng/Downloads"
@@ -3485,37 +3514,45 @@ with tab1:
                     st.caption(f"🔗 來源網址: `{url}`")
                 with c_pause:
                     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-                    is_paused = not _GLOBAL_PAUSE_EVENT.is_set()
-                    if is_paused:
-                        if st.button("▶️ 恢復工作", key=f"resume_btn_{idx}", type="primary", use_container_width=True, help="立即喚醒下載與雲端上傳，繼續進行任務"):
-                            _GLOBAL_PAUSE_EVENT.set()
-                            st.session_state.is_batch_paused = False
-                            st.toast("▶️ 工作已恢復，繼續傳輸！", icon="▶️")
-                            st.rerun()
+                    if is_work_paused():
+                        st.button(
+                            "▶️ 恢復工作",
+                            key=f"resume_btn_{idx}",
+                            type="primary",
+                            on_click=resume_work_callback,
+                            use_container_width=True,
+                            help="立即喚醒下載與雲端上傳，繼續進行任務"
+                        )
                     else:
-                        if st.button("⏸️ 暫停工作", key=f"pause_btn_{idx}", type="secondary", use_container_width=True, help="立即暫停目前下載與雲端上傳，秒級釋出完整網路頻寬供線上會議等使用"):
-                            _GLOBAL_PAUSE_EVENT.clear()
-                            st.session_state.is_batch_paused = True
-                            st.toast("⏸️ 工作已暫停，頻寬已釋出！", icon="⏸️")
-                            st.rerun()
+                        st.button(
+                            "⏸️ 暫停工作",
+                            key=f"pause_btn_{idx}",
+                            type="secondary",
+                            on_click=pause_work_callback,
+                            use_container_width=True,
+                            help="立即暫停目前下載與雲端上傳，秒級釋出完整網路頻寬供線上會議等使用"
+                        )
                 with c_skip:
                     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-                    if st.button("⏭️ 中斷並跳過此部", key=f"skip_btn_{idx}", type="secondary", use_container_width=True, help="立即中斷目前影片的下載與轉檔，直接開始清單中的下一部影片"):
-                        _GLOBAL_PAUSE_EVENT.set()
-                        st.session_state.is_batch_paused = False
-                        st.session_state.video_batch_idx = idx + 1
-                        st.toast(f"⏭️ 已中斷第 {current_num} 部，正在開始下載下一部...", icon="⏭️")
-                        st.rerun()
+                    st.button(
+                        "⏭️ 中斷並跳過此部",
+                        key=f"skip_btn_{idx}",
+                        type="secondary",
+                        on_click=skip_current_video_callback,
+                        args=(idx + 1,),
+                        use_container_width=True,
+                        help="立即中斷目前影片的下載與轉檔，直接開始清單中的下一部影片"
+                    )
                 with c_stop:
                     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-                    if st.button("⏹️ 終止全部", key=f"stop_btn_{idx}", type="primary", use_container_width=True, help="立即終止目前的下載並取消剩餘的所有任務"):
-                        _GLOBAL_PAUSE_EVENT.set()
-                        st.session_state.is_batch_paused = False
-                        st.session_state.is_video_batch_running = False
-                        st.session_state.video_batch_queue = []
-                        st.session_state.video_batch_idx = 0
-                        st.warning("⏹️ 已終止全部批次下載任務。")
-                        st.rerun()
+                    st.button(
+                        "⏹️ 終止全部",
+                        key=f"stop_btn_{idx}",
+                        type="primary",
+                        on_click=stop_all_batch_callback,
+                        use_container_width=True,
+                        help="立即終止目前的下載並取消剩餘的所有任務"
+                    )
 
                 # 整體批次進度條
                 batch_pct = idx / len(queue)

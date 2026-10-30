@@ -33,6 +33,24 @@ _thread_local = threading.local()
 _cache_generation = 0
 _account_cache = {"key": None, "email": None}
 
+# ========================================================
+# 全域頻寬暫停/恢復事件 (單例持久於模組，免疫 Streamlit Rerun 覆蓋)
+# ========================================================
+_GLOBAL_PAUSE_EVENT = threading.Event()
+_GLOBAL_PAUSE_EVENT.set()  # 預設為運行狀態 (未暫停)
+
+def get_pause_event():
+    return _GLOBAL_PAUSE_EVENT
+
+def is_work_paused():
+    return not _GLOBAL_PAUSE_EVENT.is_set()
+
+def pause_all_work():
+    _GLOBAL_PAUSE_EVENT.clear()
+
+def resume_all_work():
+    _GLOBAL_PAUSE_EVENT.set()
+
 
 class GDriveAuthRequired(Exception):
     """尚未授權或 Token 已失效，需使用者重新登入。"""
@@ -515,7 +533,7 @@ class GDriveBackgroundUploadTask:
         self.filename = filename
         self.folder_id = folder_id
         self.skip_if_exists = skip_if_exists
-        self.pause_event = pause_event
+        self.pause_event = pause_event or _GLOBAL_PAUSE_EVENT
         self.progress = 0.0
         self.uploaded_bytes = 0
         self.file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
@@ -564,7 +582,7 @@ def get_or_create_upload_task(file_path, filename, folder_id, skip_if_exists=Fal
     task = _ACTIVE_GDRIVE_UPLOADS.get(filename)
     if task and task.status == "uploading" and task.thread and task.thread.is_alive():
         return task
-    task = GDriveBackgroundUploadTask(file_path, filename, folder_id, skip_if_exists, pause_event)
+    task = GDriveBackgroundUploadTask(file_path, filename, folder_id, skip_if_exists, pause_event or _GLOBAL_PAUSE_EVENT)
     _ACTIVE_GDRIVE_UPLOADS[filename] = task
     task.start()
     return task
