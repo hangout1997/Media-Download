@@ -52,12 +52,45 @@ def resume_work_callback():
 def skip_current_video_callback(next_idx):
     gdrive_service.resume_all_work()
     st.session_state.is_batch_paused = False
+
+    # 1. 立即中斷並停止目前進行中的 Google Drive 雲端上傳
+    curr_url = st.session_state.get('current_processing_url')
+    if curr_url:
+        st.session_state[f"stage_{curr_url}"] = "SKIPPED"
+        curr_file = st.session_state.get(f"stage_file_{curr_url}")
+        curr_name = st.session_state.get(f"stage_name_{curr_url}")
+        if curr_name:
+            gdrive_service.cancel_upload_task(curr_name)
+        # 若未保存本地，安全清理 RAM Disk 暫存
+        local_saved = st.session_state.get(f"saved_local_{curr_name}", False)
+        if not local_saved and curr_file and os.path.exists(curr_file):
+            try:
+                os.remove(curr_file)
+            except Exception:
+                pass
+
+    # 確保停止所有正在上傳的背景線程，秒級釋出頻寬
+    gdrive_service.cancel_all_upload_tasks()
+
+    # 2. 前進至下一部，立即開始下一部影片的下載
     st.session_state.video_batch_idx = next_idx
 
 
 def stop_all_batch_callback():
     gdrive_service.resume_all_work()
     st.session_state.is_batch_paused = False
+    gdrive_service.cancel_all_upload_tasks()
+    curr_url = st.session_state.get('current_processing_url')
+    if curr_url:
+        st.session_state[f"stage_{curr_url}"] = "STOPPED"
+        curr_file = st.session_state.get(f"stage_file_{curr_url}")
+        curr_name = st.session_state.get(f"stage_name_{curr_url}")
+        local_saved = st.session_state.get(f"saved_local_{curr_name}", False)
+        if not local_saved and curr_file and os.path.exists(curr_file):
+            try:
+                os.remove(curr_file)
+            except Exception:
+                pass
     st.session_state.is_video_batch_running = False
     st.session_state.video_batch_queue = []
     st.session_state.video_batch_idx = 0
@@ -2215,6 +2248,20 @@ def finish_output_file(local_temp_or_final_path, filename):
                 st.session_state.pop(f"ready_file_{filename}", None)
                 gc.collect()
                 return True
+
+            elif task.status == "cancelled":
+                st.warning(f"⏹️ 已中斷 Google Drive 雲端上傳：`{filename}`")
+                if os.path.exists(local_temp_or_final_path) and os.path.abspath(local_temp_or_final_path) != os.path.abspath(local_dest_path):
+                    has_local = st.session_state.get(local_saved_key) or os.path.exists(local_dest_path)
+                    if not has_local:
+                        try:
+                            os.remove(local_temp_or_final_path)
+                        except Exception:
+                            pass
+                gdrive_service.remove_upload_task(filename)
+                st.session_state.pop(f"ready_file_{filename}", None)
+                gc.collect()
+                return False
 
             elif task.status == "failed":
                 err = task.error

@@ -427,11 +427,12 @@ def find_existing_file(filename, folder_id):
 # 上傳
 # ========================================================
 def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_callback=None,
-                                   folder_id=None, skip_if_exists=False, pause_event=None):
+                                   folder_id=None, skip_if_exists=False, pause_event=None,
+                                   cancel_event=None):
     """
     將檔案以動態分塊、可續傳方式上傳至 Google Drive 目標資料夾。
-    支援 pause_event 暫停機制（釋出頻寬給使用者線上會議等高優先級任務）。
-    回傳 dict：雲端檔案資訊，另含 'skipped' (bool) 與 'folder_id'。
+    支援 pause_event 暫停機制與 cancel_event 中斷機制。
+    回傳 dict：雲端檔案資訊，另含 'skipped' (bool)、'cancelled' (bool) 與 'folder_id'。
     """
     service = get_gdrive_service()
     folder_id = folder_id or resolve_target_folder_id()
@@ -476,13 +477,22 @@ def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_c
     consecutive_errors = 0
 
     while response is None:
+        if cancel_event and cancel_event.is_set():
+            return {'skipped': True, 'cancelled': True, 'folder_id': folder_id}
         if pause_event:
-            pause_event.wait()
+            while not pause_event.is_set():
+                if cancel_event and cancel_event.is_set():
+                    return {'skipped': True, 'cancelled': True, 'folder_id': folder_id}
+                time.sleep(0.2)
+        if cancel_event and cancel_event.is_set():
+            return {'skipped': True, 'cancelled': True, 'folder_id': folder_id}
         try:
             # num_retries=2 處理短暫 HTTP 狀態重試
             status, response = request.next_chunk(num_retries=2)
             consecutive_errors = 0  # 傳輸成功一個 chunk，重置錯誤計數
         except (TimeoutError, socket.timeout, ssl.SSLError, OSError, ConnectionError, httplib2.HttpLib2Error) as net_err:
+            if cancel_event and cancel_event.is_set():
+                return {'skipped': True, 'cancelled': True, 'folder_id': folder_id}
             consecutive_errors += 1
             if consecutive_errors > max_chunk_retries:
                 raise TimeoutError(f"Google Drive 上傳逾時中斷，連續重試 {max_chunk_retries} 次依然失敗：{net_err}") from net_err
@@ -534,15 +544,21 @@ class GDriveBackgroundUploadTask:
         self.folder_id = folder_id
         self.skip_if_exists = skip_if_exists
         self.pause_event = pause_event or _GLOBAL_PAUSE_EVENT
+        self.cancel_event = threading.Event()
         self.progress = 0.0
         self.uploaded_bytes = 0
         self.file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
         self.speed_mb = 0.0
         self.eta_sec = 0
-        self.status = "uploading"  # uploading, success, skipped, failed
+        self.status = "uploading"  # uploading, success, skipped, cancelled, failed
         self.res = None
         self.error = None
         self.thread = None
+
+    def cancel(self):
+        """發送中斷訊號，立即停止 Google Drive 上傳。"""
+        self.status = "cancelled"
+        self.cancel_event.set()
 
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -564,14 +580,20 @@ class GDriveBackgroundUploadTask:
                 progress_callback=_cb,
                 skip_if_exists=self.skip_if_exists,
                 pause_event=self.pause_event,
+                cancel_event=self.cancel_event,
             )
-            if self.res and self.res.get('skipped'):
+            if self.cancel_event.is_set() or (self.res and self.res.get('cancelled')):
+                self.status = "cancelled"
+            elif self.res and self.res.get('skipped'):
                 self.status = "skipped"
             else:
                 self.status = "success"
         except Exception as e:
-            self.error = e
-            self.status = "failed"
+            if self.cancel_event.is_set():
+                self.status = "cancelled"
+            else:
+                self.error = e
+                self.status = "failed"
 
 
 _ACTIVE_GDRIVE_UPLOADS = {}
@@ -597,6 +619,26 @@ def get_active_upload_task(filename):
         if t.filename == filename and t.status == "uploading":
             return t
     return None
+
+
+def cancel_upload_task(filename=None):
+    """
+    停止指定的背景上傳任務；若 filename 為 None，則停止所有正在進行的背景上傳任務。
+    立即發送中斷訊號，線程秒級安全終止。
+    """
+    if filename:
+        task = _ACTIVE_GDRIVE_UPLOADS.pop(filename, None)
+        if task:
+            task.cancel()
+    else:
+        for k, task in list(_ACTIVE_GDRIVE_UPLOADS.items()):
+            task.cancel()
+        _ACTIVE_GDRIVE_UPLOADS.clear()
+
+
+def cancel_all_upload_tasks():
+    """停止所有背景上傳任務。"""
+    cancel_upload_task(None)
 
 
 def remove_upload_task(filename):
