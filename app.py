@@ -2004,61 +2004,29 @@ def gdrive_precheck_exists(filename):
         return True
     return False
 
-class GDriveBackgroundUploadTask:
-    """非同步 Google Drive 背景上傳任務，讓前台即時互動（儲存本地、立即觀看）與雲端上傳並行執行，互不干擾。"""
-    def __init__(self, file_path, filename, folder_id, skip_if_exists):
-        self.file_path = file_path
-        self.filename = filename
-        self.folder_id = folder_id
-        self.skip_if_exists = skip_if_exists
-        self.progress = 0.0
-        self.uploaded_bytes = 0
-        self.file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-        self.speed_mb = 0.0
-        self.eta_sec = 0
-        self.status = "uploading"  # uploading, success, skipped, failed
-        self.res = None
-        self.error = None
-        self.thread = None
-
-    def start(self):
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-
-    def _run(self):
-        try:
-            def _cb(pct, cur, tot, spd, eta=0):
-                self.progress = pct
-                self.uploaded_bytes = cur
-                self.file_size = tot
-                self.speed_mb = spd
-                self.eta_sec = eta
-
-            self.res = gdrive_service.upload_file_directly_to_gdrive(
-                self.file_path,
-                original_filename=self.filename,
-                folder_id=self.folder_id,
-                progress_callback=_cb,
-                skip_if_exists=self.skip_if_exists,
-                pause_event=_GLOBAL_PAUSE_EVENT,
-            )
-            if self.res and self.res.get('skipped'):
-                self.status = "skipped"
-            else:
-                self.status = "success"
-        except Exception as e:
-            self.error = e
-            self.status = "failed"
-
-_ACTIVE_GDRIVE_UPLOADS = {}
+def _cb_save_local(src_path, dest_path, key):
+    try:
+        if src_path and os.path.exists(src_path):
+            shutil.copy2(src_path, dest_path)
+            st.session_state[key] = True
+    except Exception as e:
+        st.session_state[f"err_{key}"] = str(e)
 
 
-def get_active_upload_task(filename):
-    """查詢是否有相同檔名且正在上傳中（或剛封裝就緒）的背景上傳任務。"""
-    for key, task in list(_ACTIVE_GDRIVE_UPLOADS.items()):
-        if task.filename == filename and task.status == "uploading":
-            return task
-    return None
+def _cb_open_finder(path):
+    try:
+        if path and os.path.exists(path):
+            subprocess.Popen(["open", "-R", path])
+    except Exception:
+        pass
+
+
+def _cb_play_video(path):
+    try:
+        if path and os.path.exists(path):
+            subprocess.Popen(["open", path])
+    except Exception:
+        pass
 
 
 def finish_output_file(local_temp_or_final_path, filename):
@@ -2066,8 +2034,8 @@ def finish_output_file(local_temp_or_final_path, filename):
     完成檔案處理並依據儲存模式分發：
     - 若選擇 '☁️ Google Drive 雲端直送 (Cloud API)'：
       以背景 Thread 異步上傳至 Google Drive 目標資料夾。
-      在上傳同時提供「📥 儲存至本地資料夾」、「📂 在 Finder 顯示」、「🎬 立即播放觀賞」等按鍵，
-      讓使用者能隨時將影片存入本地即時觀賞，完全不影響背景持續進行的雲端上傳。
+      在上傳同時提供「📥 儲存至本地資料夾」、「📂 在 Finder 顯示」、「🎬 立即播放觀賞」等按鍵（採 on_click 即時回呼），
+      讓使用者能隨時將影片存入本地即時觀賞，完全不影響背景持續進行的雲端上傳，且絕不觸發重新下載。
     - 若選擇 '📁 本地硬碟資料夾'：
       檔案直接保留於使用者指定的本機資料夾中。
     """
@@ -2098,18 +2066,16 @@ def finish_output_file(local_temp_or_final_path, filename):
 
         target_folder_id, target_label = gdrive_service.get_target_folder()
 
-        # 3. 取得或啟動背景非同步上傳任務 (背景持續執行，絕不阻塞前台與按鍵響應)
-        task_key = f"{filename}_{local_temp_or_final_path}"
-        task = _ACTIVE_GDRIVE_UPLOADS.get(task_key)
-        if not task or (task.status in ("failed", "success", "skipped") and not (task.thread and task.thread.is_alive())):
-            task = GDriveBackgroundUploadTask(
-                local_temp_or_final_path,
-                filename=filename,
-                folder_id=target_folder_id,
-                skip_if_exists=st.session_state.get('gdrive_skip_dup', True)
-            )
-            _ACTIVE_GDRIVE_UPLOADS[task_key] = task
-            task.start()
+        # 3. 取得或啟動背景非同步上傳任務 (單例持久於 gdrive_service 模組中，免疫 rerun 清空)
+        task = gdrive_service.get_or_create_upload_task(
+            local_temp_or_final_path,
+            filename=filename,
+            folder_id=target_folder_id,
+            skip_if_exists=st.session_state.get('gdrive_skip_dup', True),
+            pause_event=_GLOBAL_PAUSE_EVENT,
+        )
+
+        src_to_copy = local_temp_or_final_path if (local_temp_or_final_path and os.path.exists(local_temp_or_final_path)) else getattr(task, "file_path", None)
 
         # 4. 前端即時互動卡片 (上傳 Google Drive 的同時，讓使用者能儲存至本地並立即觀看)
         with st.container(border=True):
@@ -2117,52 +2083,54 @@ def finish_output_file(local_temp_or_final_path, filename):
             file_sz_mb = task.file_size / 1024 / 1024
             st.caption(f"📁 檔案大小: `{file_sz_mb:.1f} MB` ｜ 本地目標資料夾: `{local_dest_dir}`")
 
-            # 核心互動按鍵：上傳同時可隨時點擊，不影響雲端上傳進度
+            # 核心互動按鍵：使用 on_click 回呼，點擊瞬間 Streamlit 於腳本執行前立即複製完畢，100% 絕不遺失
             c_btn1, c_btn2, c_btn3 = st.columns([1.6, 1.2, 1.2])
 
             with c_btn1:
                 is_saved = st.session_state.get(local_saved_key, False) or os.path.exists(local_dest_path)
                 btn_label = "✅ 本地已儲存" if is_saved else "📥 儲存至本地資料夾"
-                if st.button(btn_label, key=f"btn_save_{filename}", disabled=is_saved, use_container_width=True, help=f"立即複製檔案至上一次儲存的資料夾：\n{local_dest_path}"):
-                    try:
-                        src_to_copy = local_temp_or_final_path if os.path.exists(local_temp_or_final_path) else getattr(task, "file_path", None)
-                        if src_to_copy and os.path.exists(src_to_copy):
-                            shutil.copy2(src_to_copy, local_dest_path)
-                            st.session_state[local_saved_key] = True
-                            st.toast(f"✅ 檔案已成功存入本地資料夾！", icon="💾")
-                        else:
-                            st.error(f"❌ 找不到來源暫存檔案")
-                    except Exception as b_err:
-                        st.error(f"❌ 儲存失敗: {b_err}")
+                st.button(
+                    btn_label,
+                    key=f"btn_save_{filename}",
+                    disabled=is_saved,
+                    on_click=_cb_save_local,
+                    args=(src_to_copy, local_dest_path, local_saved_key),
+                    use_container_width=True,
+                    help=f"立即複製檔案至上一次儲存的資料夾：\n{local_dest_path}"
+                )
 
             with c_btn2:
-                if st.button("📂 在 Finder 顯示", key=f"btn_finder_{filename}", use_container_width=True, help="在 Mac Finder 中定位並高亮選取此影片"):
-                    target_show = local_dest_path if os.path.exists(local_dest_path) else (local_temp_or_final_path if os.path.exists(local_temp_or_final_path) else getattr(task, "file_path", None))
-                    if target_show and os.path.exists(target_show):
-                        try:
-                            subprocess.Popen(["open", "-R", target_show])
-                            st.toast("📂 已在 Finder 中為您高亮選取！", icon="📂")
-                        except Exception as o_err:
-                            st.error(f"開啟失敗: {o_err}")
+                target_show = local_dest_path if os.path.exists(local_dest_path) else src_to_copy
+                st.button(
+                    "📂 在 Finder 顯示",
+                    key=f"btn_finder_{filename}",
+                    on_click=_cb_open_finder,
+                    args=(target_show,),
+                    use_container_width=True,
+                    help="在 Mac Finder 中定位並高亮選取此影片"
+                )
 
             with c_btn3:
-                if st.button("🎬 立即播放觀賞", key=f"btn_play_{filename}", use_container_width=True, help="直接以系統預設播放器 (如 QuickTime / IINA) 立即開啟影片"):
-                    target_play = local_dest_path if os.path.exists(local_dest_path) else (local_temp_or_final_path if os.path.exists(local_temp_or_final_path) else getattr(task, "file_path", None))
-                    if target_play and os.path.exists(target_play):
-                        try:
-                            subprocess.Popen(["open", target_play])
-                            st.toast("🎬 已拉起預設播放器！", icon="🎬")
-                        except Exception as p_err:
-                            st.error(f"播放失敗: {p_err}")
+                target_play = local_dest_path if os.path.exists(local_dest_path) else src_to_copy
+                st.button(
+                    "🎬 立即播放觀賞",
+                    key=f"btn_play_{filename}",
+                    on_click=_cb_play_video,
+                    args=(target_play,),
+                    use_container_width=True,
+                    help="直接以系統預設播放器 (如 QuickTime / IINA) 立即開啟影片"
+                )
 
-            if st.session_state.get(local_saved_key, False):
+            if st.session_state.get(local_saved_key, False) or os.path.exists(local_dest_path):
                 st.success(f"💾 **本地已妥善保存**：`{local_dest_path}`（您可以立即觀賞，雲端上傳不受影響繼續進行中）")
+            elif st.session_state.get(f"err_{local_saved_key}"):
+                st.error(f"❌ 儲存至本地失敗: {st.session_state.get(f'err_{local_saved_key}')}")
 
             # 雲端上傳進度監控
             prog_bar = st.progress(min(1.0, max(0.0, task.progress)))
             status_text = st.empty()
 
-            # 輪詢更新進度 (每次間隔 0.8 秒；使用者隨時點擊上方按鈕均可立即打斷觸發 rerun，不影響背景上傳)
+            # 輪詢更新進度 (每次間隔 0.8 秒；使用者隨時點擊上方按鈕均可立即由 callback 處理，不影響背景上傳)
             while task.status == "uploading":
                 pct_val = min(1.0, max(0.0, task.progress))
                 prog_bar.progress(pct_val)
@@ -2185,16 +2153,17 @@ def finish_output_file(local_temp_or_final_path, filename):
                 folder_link = gdrive_service.get_folder_link(res['folder_id']) if res and res.get('folder_id') else None
                 link_md = f" [🔗 開啟檔案]({link})" if link else ""
                 folder_md = f" ｜ [📂 開啟資料夾]({folder_link})" if folder_link else ""
-                local_note = f"（已同步保留於本地 `{local_dest_path}`）" if st.session_state.get(local_saved_key) else "（本機無殘留）"
+                has_local = st.session_state.get(local_saved_key) or os.path.exists(local_dest_path)
+                local_note = f"（已同步保留於本地 `{local_dest_path}`）" if has_local else "（本機無殘留）"
                 st.success(f"🎉 **雲端直送成功！** `{target_label}{filename}`{link_md}{folder_md} {local_note}")
 
-                # 清理暫存檔 (若已存本地則清理暫存，本地不受影響)
+                # 清理暫存檔 (若已存本地則清理暫存，本地檔案不受影響)
                 if os.path.exists(local_temp_or_final_path) and os.path.abspath(local_temp_or_final_path) != os.path.abspath(local_dest_path):
                     try:
                         os.remove(local_temp_or_final_path)
                     except Exception:
                         pass
-                _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
+                gdrive_service.remove_upload_task(filename)
                 st.session_state.pop(f"ready_file_{filename}", None)
                 gc.collect()
                 return True
@@ -2205,14 +2174,15 @@ def finish_output_file(local_temp_or_final_path, filename):
                 folder_link = gdrive_service.get_folder_link(res['folder_id']) if res and res.get('folder_id') else None
                 link_md = f" [🔗 開啟檔案]({link})" if link else ""
                 folder_md = f" ｜ [📂 開啟資料夾]({folder_link})" if folder_link else ""
-                local_note = f"（已同步保留於本地 `{local_dest_path}`）" if st.session_state.get(local_saved_key) else ""
+                has_local = st.session_state.get(local_saved_key) or os.path.exists(local_dest_path)
+                local_note = f"（已同步保留於本地 `{local_dest_path}`）" if has_local else ""
                 st.info(f"⏭️ 雲端 `{target_label}` 已存在同名檔案，已跳過上傳：`{filename}`{link_md}{folder_md} {local_note}")
                 if os.path.exists(local_temp_or_final_path) and os.path.abspath(local_temp_or_final_path) != os.path.abspath(local_dest_path):
                     try:
                         os.remove(local_temp_or_final_path)
                     except Exception:
                         pass
-                _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
+                gdrive_service.remove_upload_task(filename)
                 st.session_state.pop(f"ready_file_{filename}", None)
                 gc.collect()
                 return True
@@ -2220,7 +2190,7 @@ def finish_output_file(local_temp_or_final_path, filename):
             elif task.status == "failed":
                 err = task.error
                 show_error_log_box(f"❌ Google Drive 雲端直送失敗: {err}", traceback.format_exc(), title="Google Drive API 上傳錯誤")
-                _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
+                gdrive_service.remove_upload_task(filename)
                 st.session_state.pop(f"ready_file_{filename}", None)
                 gc.collect()
                 return False
@@ -2228,6 +2198,15 @@ def finish_output_file(local_temp_or_final_path, filename):
         st.success(f"✅ 下載完成！檔案已儲存至本機: `{local_temp_or_final_path}`")
         gc.collect()
         return True
+
+def _mark_and_finish_output_file(out_path, filename):
+    curr_proc_url = st.session_state.get('current_processing_url')
+    if curr_proc_url:
+        st.session_state[f"stage_{curr_proc_url}"] = "UPLOADING"
+        st.session_state[f"stage_file_{curr_proc_url}"] = out_path
+        st.session_state[f"stage_name_{curr_proc_url}"] = filename
+    return finish_output_file(out_path, filename)
+
 
 def download_media(media_item, force_audio=False):
     title = media_item['title']
@@ -2243,15 +2222,15 @@ def download_media(media_item, force_audio=False):
     is_gdrive = st.session_state.get('storage_destination') == "gdrive_cloud"
 
     # 1. 優先檢查是否有活躍的背景上傳任務（徹底防止使用者點擊按鈕時因 Rerun 重新進入下載流程）：
-    active_task = get_active_upload_task(filename)
+    active_task = gdrive_service.get_active_upload_task(filename)
     if active_task and active_task.file_path and os.path.exists(active_task.file_path):
-        finish_output_file(active_task.file_path, filename)
+        _mark_and_finish_output_file(active_task.file_path, filename)
         return
 
     # 2. 檢查 session_state 中是否已記錄此檔案已完成封裝就緒
     ready_session_path = st.session_state.get(f"ready_file_{filename}")
     if ready_session_path and os.path.exists(ready_session_path) and os.path.getsize(ready_session_path) > 1024 * 1024:
-        finish_output_file(ready_session_path, filename)
+        _mark_and_finish_output_file(ready_session_path, filename)
         return
 
     # 3. 全面防重複下載檢查（跨 RAM Disk 與系統暫存區，只要暫存區已封裝就緒，100% 絕不重複下載）：
@@ -2266,7 +2245,7 @@ def download_media(media_item, force_audio=False):
         if os.path.exists(p) and os.path.getsize(p) > 1024 * 1024:
             where_desc = "RAM Disk 記憶體" if "/Volumes/MediaRAMDisk" in p else "本機暫存區"
             st.success(f"⚡ **檔案已在 {where_desc} 封裝就緒** ({os.path.getsize(p)/1024/1024:.1f} MB)，直接進入雲端/本地分發流程！")
-            finish_output_file(p, filename)
+            _mark_and_finish_output_file(p, filename)
             return
 
     st.info(f"📍 正在處理媒體: **{title}** ({media_type})")
@@ -2319,7 +2298,7 @@ def download_media(media_item, force_audio=False):
                 response.raise_for_status()
                 with open(out_path, "wb") as f:
                     f.write(response.content)
-            finish_output_file(out_path, filename)
+            _mark_and_finish_output_file(out_path, filename)
             return
 
         extra_headers = media_item.get('headers', {})
@@ -2333,7 +2312,7 @@ def download_media(media_item, force_audio=False):
                     download_fast_parallel_hls(c_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
                     if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
                         raise ValueError("封裝後輸出檔案不存在或為空")
-                    finish_output_file(out_path, filename)
+                    _mark_and_finish_output_file(out_path, filename)
                     return
                 except Exception as hls_err:
                     ramdisk_manager.clean_scratch_files()
@@ -2406,7 +2385,7 @@ def download_media(media_item, force_audio=False):
                             break
 
                 if actual_out:
-                    finish_output_file(actual_out, filename)
+                    _mark_and_finish_output_file(actual_out, filename)
                     return
                 else:
                     show_error_log_box("❌ 下載失敗！無法產生影片檔案。", f"Target Output Path: {out_path}", title=f"{platform_name} 下載失敗", url=target_url)
@@ -2508,7 +2487,7 @@ def download_media(media_item, force_audio=False):
             )
 
         if returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            finish_output_file(out_path, filename)
+            _mark_and_finish_output_file(out_path, filename)
         else:
             if os.path.exists(out_path):
                 try:
@@ -3557,23 +3536,37 @@ with tab1:
                 st.session_state.video_batch_idx = idx + 1
                 st.rerun()
 
-            try:
-                st.text(f"正在擷取網頁資訊: {url}")
-                with st.spinner("🔍 尋找影片串流中..."):
-                    media_items = get_media_items(url)
+            st.session_state['current_processing_url'] = url
+            curr_stage = st.session_state.get(f"stage_{url}")
 
-                if not media_items:
-                    st.error(f"❌ 找不到有效的影片串流網址: {url}")
-                else:
-                    for item in media_items:
-                        download_media(item)
+            if curr_stage == "UPLOADING":
+                # 該影片已封裝就緒，正處於背景上傳與前端互動階段。
+                # 使用者在畫面點擊「儲存至本地」、「在 Finder 顯示」、「立即播放」觸發 rerun 時，直接進入此處，100% 絕不重新下載！
+                saved_out = st.session_state.get(f"stage_file_{url}")
+                saved_name = st.session_state.get(f"stage_name_{url}")
+                if saved_out and saved_name:
+                    finish_output_file(saved_out, saved_name)
+                st.session_state[f"stage_{url}"] = "COMPLETED"
+                st.session_state.video_batch_idx = idx + 1
+                st.rerun()
+            else:
+                try:
+                    st.text(f"正在擷取網頁資訊: {url}")
+                    with st.spinner("🔍 尋找影片串流中..."):
+                        media_items = get_media_items(url)
 
-            except Exception as e:
-                show_error_log_box(f"❌ 處理 {url} 時發生錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=url)
+                    if not media_items:
+                        st.error(f"❌ 找不到有效的影片串流網址: {url}")
+                    else:
+                        for item in media_items:
+                            download_media(item)
 
-            # 當前影片處理結束（成功或失敗），前進至下一部
-            st.session_state.video_batch_idx = idx + 1
-            st.rerun()
+                except Exception as e:
+                    show_error_log_box(f"❌ 處理 {url} 時發生錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=url)
+
+                st.session_state[f"stage_{url}"] = "COMPLETED"
+                st.session_state.video_batch_idx = idx + 1
+                st.rerun()
 
 with tab2:
     st.markdown("從本地檔案或線上播放清單提取出純音訊，完全在記憶體內處理，避免硬碟損耗。")

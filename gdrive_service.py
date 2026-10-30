@@ -503,3 +503,85 @@ def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_c
     response['skipped'] = False
     response['folder_id'] = folder_id
     return response
+
+
+# ========================================================
+# 背景非同步上傳任務管理（單例持久化，免疫 Streamlit Rerun 清空）
+# ========================================================
+class GDriveBackgroundUploadTask:
+    """非同步 Google Drive 背景上傳任務，讓前台即時互動（儲存本地、立即觀看）與雲端上傳並行執行，互不干擾。"""
+    def __init__(self, file_path, filename, folder_id, skip_if_exists=False, pause_event=None):
+        self.file_path = file_path
+        self.filename = filename
+        self.folder_id = folder_id
+        self.skip_if_exists = skip_if_exists
+        self.pause_event = pause_event
+        self.progress = 0.0
+        self.uploaded_bytes = 0
+        self.file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        self.speed_mb = 0.0
+        self.eta_sec = 0
+        self.status = "uploading"  # uploading, success, skipped, failed
+        self.res = None
+        self.error = None
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            def _cb(pct, cur, tot, spd, eta=0):
+                self.progress = pct
+                self.uploaded_bytes = cur
+                self.file_size = tot
+                self.speed_mb = spd
+                self.eta_sec = eta
+
+            self.res = upload_file_directly_to_gdrive(
+                self.file_path,
+                original_filename=self.filename,
+                folder_id=self.folder_id,
+                progress_callback=_cb,
+                skip_if_exists=self.skip_if_exists,
+                pause_event=self.pause_event,
+            )
+            if self.res and self.res.get('skipped'):
+                self.status = "skipped"
+            else:
+                self.status = "success"
+        except Exception as e:
+            self.error = e
+            self.status = "failed"
+
+
+_ACTIVE_GDRIVE_UPLOADS = {}
+
+
+def get_or_create_upload_task(file_path, filename, folder_id, skip_if_exists=False, pause_event=None):
+    """取得現有進行中的上傳任務，或建立並啟動新任務（單例保存在模組中，不受 rerun 影響）。"""
+    task = _ACTIVE_GDRIVE_UPLOADS.get(filename)
+    if task and task.status == "uploading" and task.thread and task.thread.is_alive():
+        return task
+    task = GDriveBackgroundUploadTask(file_path, filename, folder_id, skip_if_exists, pause_event)
+    _ACTIVE_GDRIVE_UPLOADS[filename] = task
+    task.start()
+    return task
+
+
+def get_active_upload_task(filename):
+    """查詢是否有相同檔名且正在上傳中的背景任務。"""
+    task = _ACTIVE_GDRIVE_UPLOADS.get(filename)
+    if task and task.status == "uploading" and task.thread and task.thread.is_alive():
+        return task
+    for k, t in list(_ACTIVE_GDRIVE_UPLOADS.items()):
+        if t.filename == filename and t.status == "uploading":
+            return t
+    return None
+
+
+def remove_upload_task(filename):
+    """上傳完成或失敗後移除任務。"""
+    _ACTIVE_GDRIVE_UPLOADS.pop(filename, None)
+
