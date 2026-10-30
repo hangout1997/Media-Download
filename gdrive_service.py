@@ -409,9 +409,10 @@ def find_existing_file(filename, folder_id):
 # 上傳
 # ========================================================
 def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_callback=None,
-                                   folder_id=None, skip_if_exists=False):
+                                   folder_id=None, skip_if_exists=False, pause_event=None):
     """
-    將檔案以 10MB 分塊、可續傳方式上傳至 Google Drive 目標資料夾。
+    將檔案以動態分塊、可續傳方式上傳至 Google Drive 目標資料夾。
+    支援 pause_event 暫停機制（釋出頻寬給使用者線上會議等高優先級任務）。
     回傳 dict：雲端檔案資訊，另含 'skipped' (bool) 與 'folder_id'。
     """
     service = get_gdrive_service()
@@ -457,6 +458,8 @@ def upload_file_directly_to_gdrive(file_path, original_filename=None, progress_c
     consecutive_errors = 0
 
     while response is None:
+        if pause_event:
+            pause_event.wait()
         try:
             # num_retries=2 處理短暫 HTTP 狀態重試
             status, response = request.next_chunk(num_retries=2)

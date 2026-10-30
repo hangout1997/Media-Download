@@ -31,6 +31,10 @@ _GLOBAL_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 }
 
+# ── 全域工作暫停/恢復事件（秒級釋放上/下行頻寬供線上會議等使用）────────────────
+_GLOBAL_PAUSE_EVENT = threading.Event()
+_GLOBAL_PAUSE_EVENT.set()  # 預設為運行狀態 (未暫停)
+
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 DEFAULT_DOWNLOAD_DIR = "/Users/ericcheng/Downloads"
 
@@ -1836,8 +1840,12 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     seg_fail_sample = []
 
     def download_segment(args):
+        # 支援頻寬暫停（使用者隨時暫停/恢復下載，立即釋出頻寬供會議使用）
+        _GLOBAL_PAUSE_EVENT.wait()
         idx, seg_url = args
         for attempt in range(3):
+            # 重試前亦檢查暫停狀態
+            _GLOBAL_PAUSE_EVENT.wait()
             if is_cf_protected:
                 try:
                     r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
@@ -1901,20 +1909,22 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                 speed_x = completed_duration / elapsed
                 mb_downloaded = total_downloaded_bytes / 1024 / 1024
                 speed_mb = mb_downloaded / elapsed
+                is_p = not _GLOBAL_PAUSE_EVENT.is_set()
+                paused_badge = " ｜ ⏸️ **(已暫停-頻寬已釋出，點上方按鈕可恢復)**" if is_p else ""
                 if total_duration > 0:
                     pct = min(1.0, max(0.0, completed_duration / total_duration))
                     status_text.markdown(
                         f"⏳ **{label}進度**: `{pct * 100:.1f}%` "
                         f"({format_time(completed_duration)} / {format_time(total_duration)}) "
                         f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`) "
-                        f"| 線程: `{max_workers}`"
+                        f"| 線程: `{max_workers}`{paused_badge}"
                     )
                 else:
                     pct = completed / total_segments
                     status_text.markdown(
                         f"⏳ **{label}處理中...** 已完成 `{completed}/{total_segments}` "
                         f"(`{mb_downloaded:.1f} MB`) "
-                        f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`)"
+                        f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`){paused_badge}"
                     )
                 progress_bar.progress(pct)
 
@@ -2030,6 +2040,7 @@ class GDriveBackgroundUploadTask:
                 folder_id=self.folder_id,
                 progress_callback=_cb,
                 skip_if_exists=self.skip_if_exists,
+                pause_event=_GLOBAL_PAUSE_EVENT,
             )
             if self.res and self.res.get('skipped'):
                 self.status = "skipped"
@@ -2157,9 +2168,12 @@ def finish_output_file(local_temp_or_final_path, filename):
                 prog_bar.progress(pct_val)
                 cur_mb = task.uploaded_bytes / 1024 / 1024
                 tot_mb = task.file_size / 1024 / 1024
-                eta_str = f" ｜ 預估剩餘: `{format_time(task.eta_sec)}`" if task.eta_sec > 0 else ""
-                speed_note = " 🐢 (家用上傳頻寬受限)" if task.speed_mb < 0.8 else ""
-                status_text.markdown(f"☁️ **Google Drive 雲端直送中**: `{pct_val*100:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB) ｜ 上傳速度: `{task.speed_mb:.2f} MB/s`{speed_note}{eta_str}")
+                if not _GLOBAL_PAUSE_EVENT.is_set():
+                    status_text.markdown(f"⏸️ **Google Drive 雲端直送已暫停 (頻寬已釋出)**: `{pct_val*100:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB) ｜ 點擊上方「▶️ 恢復工作」即可繼續傳輸")
+                else:
+                    eta_str = f" ｜ 預估剩餘: `{format_time(task.eta_sec)}`" if task.eta_sec > 0 else ""
+                    speed_note = " 🐢 (家用上傳頻寬受限)" if task.speed_mb < 0.8 else ""
+                    status_text.markdown(f"☁️ **Google Drive 雲端直送中**: `{pct_val*100:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB) ｜ 上傳速度: `{task.speed_mb:.2f} MB/s`{speed_note}{eta_str}")
                 time.sleep(0.8)
 
             prog_bar.empty()
@@ -3486,19 +3500,38 @@ with tab1:
             st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
             ctrl_box = st.container()
             with ctrl_box:
-                c_title, c_skip, c_stop = st.columns([3, 1.3, 1.1])
+                c_title, c_pause, c_skip, c_stop = st.columns([2.6, 1.3, 1.2, 1.0])
                 with c_title:
                     st.markdown(f"### 📍 批次進度：正在處理第 **{current_num} / {len(queue)}** 部")
                     st.caption(f"🔗 來源網址: `{url}`")
+                with c_pause:
+                    st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+                    is_paused = not _GLOBAL_PAUSE_EVENT.is_set()
+                    if is_paused:
+                        if st.button("▶️ 恢復工作", key=f"resume_btn_{idx}", type="primary", use_container_width=True, help="立即喚醒下載與雲端上傳，繼續進行任務"):
+                            _GLOBAL_PAUSE_EVENT.set()
+                            st.session_state.is_batch_paused = False
+                            st.toast("▶️ 工作已恢復，繼續傳輸！", icon="▶️")
+                            st.rerun()
+                    else:
+                        if st.button("⏸️ 暫停工作", key=f"pause_btn_{idx}", type="secondary", use_container_width=True, help="立即暫停目前下載與雲端上傳，秒級釋出完整網路頻寬供線上會議等使用"):
+                            _GLOBAL_PAUSE_EVENT.clear()
+                            st.session_state.is_batch_paused = True
+                            st.toast("⏸️ 工作已暫停，頻寬已釋出！", icon="⏸️")
+                            st.rerun()
                 with c_skip:
                     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
                     if st.button("⏭️ 中斷並跳過此部", key=f"skip_btn_{idx}", type="secondary", use_container_width=True, help="立即中斷目前影片的下載與轉檔，直接開始清單中的下一部影片"):
+                        _GLOBAL_PAUSE_EVENT.set()
+                        st.session_state.is_batch_paused = False
                         st.session_state.video_batch_idx = idx + 1
                         st.toast(f"⏭️ 已中斷第 {current_num} 部，正在開始下載下一部...", icon="⏭️")
                         st.rerun()
                 with c_stop:
                     st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
                     if st.button("⏹️ 終止全部", key=f"stop_btn_{idx}", type="primary", use_container_width=True, help="立即終止目前的下載並取消剩餘的所有任務"):
+                        _GLOBAL_PAUSE_EVENT.set()
+                        st.session_state.is_batch_paused = False
                         st.session_state.is_video_batch_running = False
                         st.session_state.video_batch_queue = []
                         st.session_state.video_batch_idx = 0
