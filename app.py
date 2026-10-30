@@ -2042,6 +2042,14 @@ class GDriveBackgroundUploadTask:
 _ACTIVE_GDRIVE_UPLOADS = {}
 
 
+def get_active_upload_task(filename):
+    """查詢是否有相同檔名且正在上傳中（或剛封裝就緒）的背景上傳任務。"""
+    for key, task in list(_ACTIVE_GDRIVE_UPLOADS.items()):
+        if task.filename == filename and task.status == "uploading":
+            return task
+    return None
+
+
 def finish_output_file(local_temp_or_final_path, filename):
     """
     完成檔案處理並依據儲存模式分發：
@@ -2052,6 +2060,7 @@ def finish_output_file(local_temp_or_final_path, filename):
     - 若選擇 '📁 本地硬碟資料夾'：
       檔案直接保留於使用者指定的本機資料夾中。
     """
+    st.session_state[f"ready_file_{filename}"] = local_temp_or_final_path
     is_gdrive_mode = st.session_state.get('storage_destination') == "gdrive_cloud"
     if is_gdrive_mode:
         local_dest_dir = st.session_state.get('download_dir', load_download_dir())
@@ -2105,18 +2114,20 @@ def finish_output_file(local_temp_or_final_path, filename):
                 btn_label = "✅ 本地已儲存" if is_saved else "📥 儲存至本地資料夾"
                 if st.button(btn_label, key=f"btn_save_{filename}", disabled=is_saved, use_container_width=True, help=f"立即複製檔案至上一次儲存的資料夾：\n{local_dest_path}"):
                     try:
-                        src_to_copy = local_temp_or_final_path if os.path.exists(local_temp_or_final_path) else None
-                        if src_to_copy:
+                        src_to_copy = local_temp_or_final_path if os.path.exists(local_temp_or_final_path) else getattr(task, "file_path", None)
+                        if src_to_copy and os.path.exists(src_to_copy):
                             shutil.copy2(src_to_copy, local_dest_path)
                             st.session_state[local_saved_key] = True
                             st.toast(f"✅ 檔案已成功存入本地資料夾！", icon="💾")
+                        else:
+                            st.error(f"❌ 找不到來源暫存檔案")
                     except Exception as b_err:
                         st.error(f"❌ 儲存失敗: {b_err}")
 
             with c_btn2:
                 if st.button("📂 在 Finder 顯示", key=f"btn_finder_{filename}", use_container_width=True, help="在 Mac Finder 中定位並高亮選取此影片"):
-                    target_show = local_dest_path if os.path.exists(local_dest_path) else local_temp_or_final_path
-                    if os.path.exists(target_show):
+                    target_show = local_dest_path if os.path.exists(local_dest_path) else (local_temp_or_final_path if os.path.exists(local_temp_or_final_path) else getattr(task, "file_path", None))
+                    if target_show and os.path.exists(target_show):
                         try:
                             subprocess.Popen(["open", "-R", target_show])
                             st.toast("📂 已在 Finder 中為您高亮選取！", icon="📂")
@@ -2125,8 +2136,8 @@ def finish_output_file(local_temp_or_final_path, filename):
 
             with c_btn3:
                 if st.button("🎬 立即播放觀賞", key=f"btn_play_{filename}", use_container_width=True, help="直接以系統預設播放器 (如 QuickTime / IINA) 立即開啟影片"):
-                    target_play = local_dest_path if os.path.exists(local_dest_path) else local_temp_or_final_path
-                    if os.path.exists(target_play):
+                    target_play = local_dest_path if os.path.exists(local_dest_path) else (local_temp_or_final_path if os.path.exists(local_temp_or_final_path) else getattr(task, "file_path", None))
+                    if target_play and os.path.exists(target_play):
                         try:
                             subprocess.Popen(["open", target_play])
                             st.toast("🎬 已拉起預設播放器！", icon="🎬")
@@ -2170,6 +2181,7 @@ def finish_output_file(local_temp_or_final_path, filename):
                     except Exception:
                         pass
                 _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
+                st.session_state.pop(f"ready_file_{filename}", None)
                 gc.collect()
                 return True
 
@@ -2187,6 +2199,7 @@ def finish_output_file(local_temp_or_final_path, filename):
                     except Exception:
                         pass
                 _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
+                st.session_state.pop(f"ready_file_{filename}", None)
                 gc.collect()
                 return True
 
@@ -2194,6 +2207,7 @@ def finish_output_file(local_temp_or_final_path, filename):
                 err = task.error
                 show_error_log_box(f"❌ Google Drive 雲端直送失敗: {err}", traceback.format_exc(), title="Google Drive API 上傳錯誤")
                 _ACTIVE_GDRIVE_UPLOADS.pop(task_key, None)
+                st.session_state.pop(f"ready_file_{filename}", None)
                 gc.collect()
                 return False
     else:
@@ -2206,8 +2220,6 @@ def download_media(media_item, force_audio=False):
     media_url = media_item['url']
     media_type = media_item['type']
     
-    st.info(f"📍 正在處理媒體: **{title}** ({media_type})")
-    
     if force_audio:
         ext = "mp3"
     else:
@@ -2216,7 +2228,19 @@ def download_media(media_item, force_audio=False):
     filename = f"{title}.{ext}"
     is_gdrive = st.session_state.get('storage_destination') == "gdrive_cloud"
 
-    # 全面防重複下載檢查（跨 RAM Disk 與系統暫存區，只要暫存區已封裝就緒，100% 絕不重複下載）：
+    # 1. 優先檢查是否有活躍的背景上傳任務（徹底防止使用者點擊按鈕時因 Rerun 重新進入下載流程）：
+    active_task = get_active_upload_task(filename)
+    if active_task and active_task.file_path and os.path.exists(active_task.file_path):
+        finish_output_file(active_task.file_path, filename)
+        return
+
+    # 2. 檢查 session_state 中是否已記錄此檔案已完成封裝就緒
+    ready_session_path = st.session_state.get(f"ready_file_{filename}")
+    if ready_session_path and os.path.exists(ready_session_path) and os.path.getsize(ready_session_path) > 1024 * 1024:
+        finish_output_file(ready_session_path, filename)
+        return
+
+    # 3. 全面防重複下載檢查（跨 RAM Disk 與系統暫存區，只要暫存區已封裝就緒，100% 絕不重複下載）：
     clean_tmp_name = f"gdrive_tmp_{re.sub(r'[\/\\:\*\?\"<>\|]', '_', filename)}"
 
     cand_ready_paths = []
@@ -2230,6 +2254,8 @@ def download_media(media_item, force_audio=False):
             st.success(f"⚡ **檔案已在 {where_desc} 封裝就緒** ({os.path.getsize(p)/1024/1024:.1f} MB)，直接進入雲端/本地分發流程！")
             finish_output_file(p, filename)
             return
+
+    st.info(f"📍 正在處理媒體: **{title}** ({media_type})")
 
     if is_gdrive:
         if gdrive_precheck_exists(filename):

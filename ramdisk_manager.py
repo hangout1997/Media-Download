@@ -161,14 +161,17 @@ def unmount_ramdisk():
     return False, "⚠️ 卸載 RAM Disk 時可能仍有檔案開啟，請稍後重試。"
 
 
-def clean_scratch_files():
-    """清理 RAM Disk 內的所有暫存檔案，保留磁區結構。"""
+def clean_scratch_files(preserve_mp4=True):
+    """清理 RAM Disk 內的切片中繼暫存檔案，保留已封裝的 MP4 與正在上傳的檔案。"""
     if not is_ramdisk_mounted():
         return 0
     cleaned = 0
     try:
         for fname in os.listdir(MOUNT_POINT):
             if fname.startswith("."):
+                continue
+            # 保護已完成封裝的 MP4/成品或以 gdrive_tmp_ 開頭的檔案不被誤刪
+            if preserve_mp4 and (fname.endswith(".mp4") or fname.endswith(".mkv") or "gdrive_tmp_" in fname):
                 continue
             fpath = os.path.join(MOUNT_POINT, fname)
             try:
