@@ -1828,7 +1828,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
             raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
 
-        # ── 封裝前空間防護 (Zero-ENOSPC Safe Guard) ──────────────────────────
+        # ── 封裝前空間防護 (Zero-ENOSPC Safe Guard: 零 SSD 磨損原則) ──────────────────────────
         actual_ts_size = os.path.getsize(tmp_ts_path) if (tmp_ts_path and os.path.exists(tmp_ts_path)) else 0
         try:
             import ramdisk_manager
@@ -1837,18 +1837,9 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                 _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage()
                 needed_output_space = actual_ts_size + 250 * 1024 * 1024
                 if free_ram < needed_output_space:
-                    # 策略 1: 若 tmp_ts 本身佔用了 RAM Disk，將 tmp_ts 移動到本機 SSD /tmp，秒級釋出 RAM Disk 全量空間給 MP4 封裝
-                    if "/Volumes/MediaRAMDisk" in tmp_ts_path:
-                        ssd_tmp_ts = os.path.join(tempfile.gettempdir(), os.path.basename(tmp_ts_path))
-                        shutil.move(tmp_ts_path, ssd_tmp_ts)
-                        tmp_ts_path = ssd_tmp_ts
-                        _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage()
-
-                    # 策略 2: 若釋出後 RAM Disk 剩餘空間仍不足以容納成品 (例如影片超過 6GB)，輸出路徑安全降級至本機暫存
-                    if free_ram < needed_output_space:
-                        out_path = os.path.join(tempfile.gettempdir(), os.path.basename(out_path))
+                    raise ValueError(f"RAM Disk 容量不足以封裝輸出 MP4 (實際切片 {actual_ts_size/1024/1024/1024:.2f} GB，剩餘僅 {free_ram/1024/1024/1024:.2f} GB)，為保護 SSD 零磨損已自動安全跳過。")
         except Exception:
-            pass
+            raise
 
         ffmpeg_cmd = [
             "ffmpeg", "-y",

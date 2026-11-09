@@ -119,9 +119,166 @@ def stop_all_batch_callback():
                 os.remove(curr_file)
             except Exception:
                 pass
+    skipped = st.session_state.get('skipped_ramdisk_files', [])
+    success = st.session_state.get('successful_downloads', [])
+    queue = st.session_state.get('video_batch_queue', [])
+    total_tasks = len(queue) if queue else (len(skipped) + len(success))
+    if skipped or success:
+        st.session_state.last_batch_summary = {
+            "total_count": total_tasks,
+            "skipped_items": list(skipped),
+            "success_items": list(success),
+            "stopped_early": True
+        }
     st.session_state.is_video_batch_running = False
     st.session_state.video_batch_queue = []
     st.session_state.video_batch_idx = 0
+
+
+# ── RAM Disk 空間防護例外與任務報告系統（零 SSD 磨損原則）──────────
+class RAMDiskSpaceExceededError(Exception):
+    """當影片切片或封裝預估/實際體積超出 RAM Disk 容量時拋出，嚴格禁止降級使用 SSD 暫存（零 SSD 磨損原則）"""
+    def __init__(self, title, url, needed_bytes=0, free_bytes=0, reason=""):
+        self.title = title
+        self.url = url
+        self.needed_bytes = needed_bytes
+        self.free_bytes = free_bytes
+        self.reason = reason
+        super().__init__(reason)
+
+
+def record_ramdisk_skipped_item(title, url, needed_bytes=0, free_bytes=0, duration=0, reason=""):
+    """記錄因 RAM Disk 空間不足而跳過的檔案資訊，以便在任務結束時彙整報告"""
+    if "skipped_ramdisk_files" not in st.session_state:
+        st.session_state.skipped_ramdisk_files = []
+
+    # 避免同一任務重複記錄相同網址或檔案
+    for item in st.session_state.skipped_ramdisk_files:
+        if (url and item.get("url") == url) or (title and item.get("title") == title):
+            return
+
+    try:
+        dur_str = format_time(duration) if duration and duration > 0 else "未知"
+    except Exception:
+        dur_str = f"{int(duration)} 秒" if duration and duration > 0 else "未知"
+
+    needed_str = f"{needed_bytes / (1024**3):.2f} GB" if needed_bytes > 0 else "超過上限"
+    free_str = f"{free_bytes / (1024**3):.2f} GB" if free_bytes > 0 else "0 GB"
+
+    st.session_state.skipped_ramdisk_files.append({
+        "title": title or "未知標題",
+        "url": url or "",
+        "duration": dur_str,
+        "needed_size": needed_str,
+        "free_size": free_str,
+        "reason": reason,
+        "time": time.strftime("%H:%M:%S")
+    })
+
+
+def record_successful_download(title, filename, out_path, is_gdrive=False):
+    """記錄成功下載與封裝的檔案資訊"""
+    if "successful_downloads" not in st.session_state:
+        st.session_state.successful_downloads = []
+
+    for item in st.session_state.successful_downloads:
+        if item.get("filename") == filename:
+            return
+
+    file_sz = os.path.getsize(out_path) if (out_path and os.path.exists(out_path)) else 0
+    if file_sz >= 1024 ** 3:
+        sz_str = f"{file_sz / (1024**3):.2f} GB"
+    elif file_sz > 0:
+        sz_str = f"{file_sz / (1024**2):.1f} MB"
+    else:
+        sz_str = "未知"
+
+    dest_desc = "Google Drive (雲端直送)" if is_gdrive else f"本機硬碟 ({out_path})"
+
+    st.session_state.successful_downloads.append({
+        "title": title or filename,
+        "filename": filename,
+        "size_str": sz_str,
+        "destination": dest_desc,
+        "time": time.strftime("%H:%M:%S")
+    })
+
+
+def render_download_summary_report(summary_data=None):
+    """渲染下載任務結束總結報告（詳細列出成功清單與因 RAM Disk 空間不足安全跳過的清單）"""
+    if not summary_data:
+        summary_data = st.session_state.get('last_batch_summary')
+    if not summary_data:
+        return
+
+    skipped_items = summary_data.get('skipped_items', [])
+    success_items = summary_data.get('success_items', [])
+    total_count = summary_data.get('total_count', len(skipped_items) + len(success_items))
+    stopped_early = summary_data.get('stopped_early', False)
+
+    with st.container(border=True):
+        st.markdown("### 📋 下載任務結束總結報告")
+        if stopped_early:
+            st.info(f"⏹️ **任務已由使用者手動停止**。共規劃 `{total_count}` 部影片，已處理進度摘要如下：")
+        elif skipped_items:
+            st.warning(
+                f"⚠️ **下載任務已全部處理完畢！** 本次共處理 `{total_count}` 部影片，"
+                f"其中 **{len(success_items)} 部成功**，**{len(skipped_items)} 部因 RAM Disk 容量不足已自動跳過**（100% 保障 SSD 零磨損）。"
+            )
+        else:
+            st.success(f"🎉 **本次任務全數成功完成！** 共 `{total_count}` 部影片，100% 透過 RAM Disk 零硬碟讀寫封裝完畢。")
+
+        # 頂部三指標
+        m_c1, m_c2, m_c3 = st.columns(3)
+        with m_c1:
+            st.metric("處理任務總數", f"{total_count} 部")
+        with m_c2:
+            st.metric("✅ 成功完成", f"{len(success_items)} 部")
+        with m_c3:
+            st.metric("⏭️ 容量不足跳過", f"{len(skipped_items)} 部", delta=f"-{len(skipped_items)}" if skipped_items else "0", delta_color="inverse")
+
+        # ⚠️ 跳過檔案詳細清單
+        if skipped_items:
+            st.divider()
+            st.markdown("#### ⚠️ 因 RAM Disk 容量不足而跳過的檔案（保護 SSD 零磨損）")
+            st.caption("以下影片體積超出當前 RAM Disk 可用容量。為避免降級使用本機 SSD 暫存造成硬碟讀寫損耗，系統已依指示安全跳過：")
+
+            for i, item in enumerate(skipped_items, 1):
+                with st.expander(f"#{i} 🎬 {item.get('title', '未知檔案')} (時長: {item.get('duration', '未知')})", expanded=True):
+                    c1, c2 = st.columns([2, 1])
+                    with c1:
+                        st.markdown(f"**🔗 來源網址**: `{item.get('url', '')}`")
+                        st.markdown(f"**🛡️ 跳過原因**: {item.get('reason', '超出可用容量')}")
+                    with c2:
+                        st.markdown(f"**📦 預估/所需空間**: `{item.get('needed_size', '未知')}`")
+                        st.markdown(f"**💾 當時 RAM Disk 剩餘**: `{item.get('free_size', '未知')}`")
+
+            # 方便複製跳過網址
+            skipped_urls = [it.get('url') for it in skipped_items if it.get('url')]
+            if skipped_urls:
+                st.markdown("**📋 快速複製所有跳過的網址**（可複製至下方再次嘗試或使用 Colab 下載）：")
+                st.code("\n".join(skipped_urls), language="text")
+
+            # 💡 建議方案
+            st.info(
+                "💡 **後續處理建議**：\n\n"
+                "1. **升級 RAM Disk 容量**：可在上方控制列將 RAM Disk 劃分容量加大（例如劃分 10GB）後重新貼上網址下載。\n"
+                "2. **使用 Google Colab 雲端下載**：將「儲存目標位置」切換為 **Google Colab (雲端直存)**，利用 Google 雲端虛擬機 12GB 記憶體與 100GB 硬碟空間下載超長片，完全不佔用本機任何資源！"
+            )
+
+        # ✅ 成功完成清單 (若有)
+        if success_items:
+            with st.expander(f"✅ 查看已成功完成的檔案清單 ({len(success_items)} 部)", expanded=False):
+                for s_i, s_item in enumerate(success_items, 1):
+                    st.markdown(f"**{s_i}.** `{s_item.get('filename')}` ｜ 大小: `{s_item.get('size_str')}` ｜ 儲存至: `{s_item.get('destination')}`")
+
+        # 清除報告按鈕
+        st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+        if st.button("🧹 關閉並清除此報告", key="btn_clear_summary_report", use_container_width=True):
+            st.session_state.last_batch_summary = None
+            st.session_state.skipped_ramdisk_files = []
+            st.session_state.successful_downloads = []
+            st.rerun()
 
 
 
@@ -1945,7 +2102,23 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         # 最終輸出不在 RAM Disk (如 Downloads)，RAM Disk 僅需容納 TS 暫存檔
         required_ram_bytes = int(est_needed_bytes * 1.1 + 300 * 1024 * 1024)
 
-    scratch_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_ram_bytes)
+    if ramdisk_manager.is_ramdisk_mounted():
+        tot, used, free_ram, pct = ramdisk_manager.get_ramdisk_usage()
+        if free_ram < required_ram_bytes:
+            ramdisk_manager.clean_scratch_files(preserve_mp4=True, max_age_seconds=300)
+            tot, used, free_ram, pct = ramdisk_manager.get_ramdisk_usage()
+            if free_ram < required_ram_bytes:
+                # 空間不足：堅決跳過，嚴格禁止降級使用 SSD 暫存（零 SSD 磨損原則）
+                raise RAMDiskSpaceExceededError(
+                    title=label,
+                    url=m3u8_url,
+                    needed_bytes=required_ram_bytes,
+                    free_bytes=free_ram,
+                    reason=f"串流切片與封裝預估需 {required_ram_bytes/(1024**3):.2f} GB，超出 RAM Disk 剩餘可用容量 ({free_ram/(1024**3):.2f} GB)"
+                )
+        scratch_dir = ramdisk_manager.MOUNT_POINT
+    else:
+        scratch_dir = tempfile.gettempdir()
 
     # 建立中繼 TS 暫存檔（直接落盤於 RAM Disk，徹底避免 Python 堆疊記憶體暴增）
     tmp_ts = None
@@ -1953,9 +2126,17 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     try:
         tmp_ts = tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir)
         tmp_ts_path = tmp_ts.name
-    except Exception:
-        tmp_ts = tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=tempfile.gettempdir())
-        tmp_ts_path = tmp_ts.name
+    except OSError as e:
+        if ramdisk_manager.is_ramdisk_mounted() and scratch_dir == ramdisk_manager.MOUNT_POINT:
+            _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage()
+            raise RAMDiskSpaceExceededError(
+                title=label,
+                url=m3u8_url,
+                needed_bytes=required_ram_bytes,
+                free_bytes=free_ram,
+                reason="RAM Disk 無法建立中繼 TS 暫存檔 (磁碟空間不足)"
+            )
+        raise
 
     # ── 滑動視窗串流寫入 (Sliding Window Streamer) ──────────────────────────
     # 不在 Python 記憶體全量囤積 bytes（徹底防止 8GB 記憶體膨脹與 OS Swap 災難）
@@ -2051,7 +2232,21 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                 while next_write_idx in pending_segments:
                     chunk = pending_segments.pop(next_write_idx)
                     if len(chunk) > 0:
-                        tmp_ts.write(chunk)
+                        try:
+                            tmp_ts.write(chunk)
+                        except OSError as write_err:
+                            if getattr(write_err, 'errno', None) == 28 or "No space left" in str(write_err):
+                                for rem_f in futures:
+                                    rem_f.cancel()
+                                _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage() if ramdisk_manager.is_ramdisk_mounted() else (0, 0, 0, 0)
+                                raise RAMDiskSpaceExceededError(
+                                    title=label,
+                                    url=m3u8_url,
+                                    needed_bytes=total_downloaded_bytes,
+                                    free_bytes=free_ram,
+                                    reason="切片串流寫入中途 RAM Disk 空間耗盡 (No space left on device)"
+                                )
+                            raise
                     del chunk
                     next_write_idx += 1
 
@@ -2103,7 +2298,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
         status_text.markdown("⚡ **多線程切片串流寫入完成，正在透過 FFmpeg 無損封裝為 MP4...**")
 
-        # ── 封裝前空間防護 (Zero-ENOSPC Safe Guard) ──────────────────────────
+        # ── 封裝前空間防護 (Zero-ENOSPC Safe Guard: 零 SSD 磨損原則) ──────────────────────────
         actual_ts_size = os.path.getsize(tmp_ts_path) if (tmp_ts_path and os.path.exists(tmp_ts_path)) else 0
         is_target_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
 
@@ -2111,19 +2306,14 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage()
             needed_output_space = actual_ts_size + 250 * 1024 * 1024
             if free_ram < needed_output_space:
-                # 策略 1: 若 tmp_ts 本身佔用了 RAM Disk，將 tmp_ts 移動到本機 SSD /tmp，秒級釋出 RAM Disk 全量空間給 MP4 封裝
-                if "/Volumes/MediaRAMDisk" in tmp_ts_path:
-                    ssd_tmp_ts = os.path.join(tempfile.gettempdir(), os.path.basename(tmp_ts_path))
-                    status_text.markdown("⚡ **RAM Disk 空間吃緊，正在安全轉移中繼暫存檔至本機以騰出極速封裝空間...**")
-                    shutil.move(tmp_ts_path, ssd_tmp_ts)
-                    tmp_ts_path = ssd_tmp_ts
-                    _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage()
-
-                # 策略 2: 若釋出後 RAM Disk 剩餘空間仍不足以容納成品 (例如影片超過 6GB)，輸出路徑安全降級至本機暫存
-                if free_ram < needed_output_space:
-                    ssd_out_path = os.path.join(tempfile.gettempdir(), os.path.basename(out_path))
-                    st.warning(f"⚠️ 影片實際體積龐大 ({actual_ts_size/1024/1024/1024:.2f} GB)，超出 RAM Disk 總可用空間。已自動轉為本機高速暫存封裝，確保 100% 成功不中斷。")
-                    out_path = ssd_out_path
+                # 絕不降級轉移至 SSD！直接拋出例外安全跳過該檔案，落實 100% 零 SSD 磨損
+                raise RAMDiskSpaceExceededError(
+                    title=label,
+                    url=m3u8_url,
+                    needed_bytes=needed_output_space,
+                    free_bytes=free_ram,
+                    reason=f"TS 切片實際體積 ({actual_ts_size/1024/1024/1024:.2f} GB) 加上 MP4 封裝空間超過 RAM Disk 剩餘可用容量 ({free_ram/1024/1024/1024:.2f} GB)"
+                )
 
         ffmpeg_cmd = [
             "ffmpeg", "-y",
@@ -2140,7 +2330,17 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                     os.remove(out_path)
                 except Exception:
                     pass
-            raise ValueError(f"FFmpeg 無損封裝失敗: {proc.stderr.decode('utf-8', errors='ignore')}")
+            err_raw = proc.stderr.decode('utf-8', errors='ignore')
+            if "No space left on device" in err_raw or "code: -28" in err_raw:
+                _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage() if ramdisk_manager.is_ramdisk_mounted() else (0, 0, 0, 0)
+                raise RAMDiskSpaceExceededError(
+                    title=label,
+                    url=m3u8_url,
+                    needed_bytes=actual_ts_size,
+                    free_bytes=free_ram,
+                    reason="FFmpeg 封裝時 RAM Disk 空間不足 (No space left on device)"
+                )
+            raise ValueError(f"FFmpeg 無損封裝失敗: {err_raw}")
 
         proc.stdout = None
         proc.stderr = None
@@ -2222,6 +2422,12 @@ def finish_output_file(local_temp_or_final_path, filename):
     """
     st.session_state[f"ready_file_{filename}"] = local_temp_or_final_path
     is_gdrive_mode = st.session_state.get('storage_destination') == "gdrive_cloud"
+    record_successful_download(
+        title=filename,
+        filename=filename,
+        out_path=local_temp_or_final_path,
+        is_gdrive=is_gdrive_mode
+    )
     if is_gdrive_mode:
         local_dest_dir = st.session_state.get('download_dir', load_download_dir())
         os.makedirs(local_dest_dir, exist_ok=True)
@@ -2454,19 +2660,31 @@ def download_media(media_item, force_audio=False):
         total_dur = get_media_duration(media_url, headers=extra_headers) if ("m3u8" in media_url or not force_audio) else 0
         # 線上 1080p 長片/電影平均碼率約 4000-6000 kbps (約 550-750 KB/s)，以 600 KB/s 保守估算
         est_size_bytes = int(total_dur * 600 * 1024) if total_dur and total_dur > 0 else 0
-        # RAM Disk 僅需存放最終 MP4 檔案 (含 400MB 安全緩衝)，中繼 TS 若空間吃緊會自動轉移至 SSD
-        required_free = (est_size_bytes + 400 * 1024 * 1024) if est_size_bytes > 0 else (1024 * 1024 * 1024)
+        # 當最終輸出 MP4 與中繼 TS 同在 RAM Disk 時，需要 2.2x 空間
+        required_free = int(est_size_bytes * 2.2 + 300 * 1024 * 1024) if est_size_bytes > 0 else (1024 * 1024 * 1024)
+
+        if ramdisk_manager.is_ramdisk_mounted():
+            _, _, ram_free, _ = ramdisk_manager.get_ramdisk_usage()
+            if est_size_bytes > 0 and ram_free < required_free:
+                web_url = media_item.get('webpage_url') or media_url
+                dur_text = format_time(total_dur) if total_dur else "未知"
+                reason_desc = f"預估需 {required_free/(1024**3):.2f} GB 記憶體空間 (TS+MP4)，超過目前 RAM Disk 剩餘可用容量 ({ram_free/(1024**3):.2f} GB)"
+                record_ramdisk_skipped_item(
+                    title=title,
+                    url=web_url,
+                    needed_bytes=required_free,
+                    free_bytes=ram_free,
+                    duration=total_dur,
+                    reason=reason_desc
+                )
+                st.warning(f"⏭️ 影片「{title}」（片長約 {dur_text}）{reason_desc}。為避免 SSD 寫入損耗，已自動跳過此部。")
+                return
 
         temp_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_free)
         out_path = os.path.join(temp_dir, clean_tmp_name)
 
         _, _tgt_label = gdrive_service.get_target_folder()
         is_ram = ramdisk_manager.is_ramdisk_mounted() and temp_dir == ramdisk_manager.MOUNT_POINT
-        if ramdisk_manager.is_ramdisk_mounted() and not is_ram:
-            dur_text = format_time(total_dur) if total_dur else "未知"
-            est_gb = (est_size_bytes / (1024 ** 3)) if est_size_bytes else 0
-            _, _, ram_free, _ = ramdisk_manager.get_ramdisk_usage()
-            st.warning(f"⚠️ 影片片長約 {dur_text}，預估容量約 {est_gb:.1f} GB，超出目前 RAM Disk 剩餘可用空間 ({ram_free/1024/1024/1024:.1f} GB)。已自動切換至本機暫存封裝，確保下載不中斷。")
         storage_note = "🚀 RAM Disk 純記憶體封裝" if is_ram else "本機暫存封裝"
         st.info(f"☁️ 檔案將在{storage_note}後，**直接直送至 Google Drive `{_tgt_label}{filename}`**（不保留於本機）")
     else:
@@ -2505,10 +2723,28 @@ def download_media(media_item, force_audio=False):
                 try:
                     if c_idx > 0:
                         st.info(f"🔄 嘗試切換至備用串流線路 ({c_idx+1}/{len(cand_m3u8s)}): `{c_url}`")
-                    final_out_path = download_fast_parallel_hls(c_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
+                    final_out_path = download_fast_parallel_hls(c_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label=title)
                     if not (final_out_path and os.path.exists(final_out_path) and os.path.getsize(final_out_path) > 0):
                         raise ValueError("封裝後輸出檔案不存在或為空")
                     _mark_and_finish_output_file(final_out_path, filename)
+                    return
+                except RAMDiskSpaceExceededError as ram_err:
+                    if out_path and os.path.exists(out_path):
+                        try:
+                            os.remove(out_path)
+                        except Exception:
+                            pass
+                    ramdisk_manager.clean_scratch_files(preserve_mp4=False)
+                    web_url = media_item.get('webpage_url') or media_url
+                    record_ramdisk_skipped_item(
+                        title=title,
+                        url=web_url,
+                        needed_bytes=ram_err.needed_bytes,
+                        free_bytes=ram_err.free_bytes,
+                        duration=total_dur if 'total_dur' in locals() else 0,
+                        reason=ram_err.reason
+                    )
+                    st.warning(f"⏭️ 影片「{title}」因 RAM Disk 空間不足已安全跳過（{ram_err.reason}）。絕不降級使用 SSD 暫存，貫徹 100% 零硬碟磨損。")
                     return
                 except Exception as hls_err:
                     if out_path and os.path.exists(out_path):
@@ -2517,10 +2753,6 @@ def download_media(media_item, force_audio=False):
                         except Exception:
                             pass
                     ramdisk_manager.clean_scratch_files()
-                    if is_gdrive and "/Volumes/MediaRAMDisk" in out_path:
-                        temp_dir = tempfile.gettempdir()
-                        out_path = os.path.join(temp_dir, clean_tmp_name)
-                        st.info(f"🔄 偵測到 RAM Disk 空間吃緊或多線程中斷，已自動將標準下載路徑切換至本機暫存: `{temp_dir}`")
                     if c_idx == len(cand_m3u8s) - 1:
                         st.warning(f"⚠️ 多線程下載失敗 ({hls_err})，降級使用標準 FFmpeg 串流處理...")
 
@@ -3702,6 +3934,9 @@ with tab1:
             st.session_state.video_batch_queue = urls
             st.session_state.video_batch_idx = 0
             st.session_state.is_video_batch_running = True
+            st.session_state.skipped_ramdisk_files = []
+            st.session_state.successful_downloads = []
+            st.session_state.last_batch_summary = None
             st.rerun()
 
     # ── 佇列下載控制器 (支援即時中斷、跳過當前並開始下一部) ──────────────────
@@ -3710,11 +3945,21 @@ with tab1:
         idx = st.session_state.get('video_batch_idx', 0)
 
         if idx >= len(queue):
+            skipped = st.session_state.get('skipped_ramdisk_files', [])
+            success = st.session_state.get('successful_downloads', [])
+            total_tasks = len(queue)
+            st.session_state.last_batch_summary = {
+                "total_count": total_tasks,
+                "skipped_items": list(skipped),
+                "success_items": list(success),
+                "stopped_early": False
+            }
             st.session_state.is_video_batch_running = False
             st.session_state.video_batch_queue = []
             st.session_state.video_batch_idx = 0
-            st.balloons()
-            st.success("🎉 所有下載任務處理完畢！")
+            if not skipped:
+                st.balloons()
+            st.rerun()
         else:
             current_num = idx + 1
             url = queue[idx]
@@ -3819,6 +4064,10 @@ with tab1:
                 st.session_state[f"stage_{url}"] = "COMPLETED"
                 st.session_state.video_batch_idx = idx + 1
                 st.rerun()
+
+    # ── 渲染任務結束總結報告（包含成功明細與因 RAM Disk 容量不足跳過之報告）──
+    if not st.session_state.get('is_video_batch_running', False):
+        render_download_summary_report()
 
 with tab2:
     st.markdown("從本地檔案或線上播放清單提取出純音訊，完全在記憶體內處理，避免硬碟損耗。")
