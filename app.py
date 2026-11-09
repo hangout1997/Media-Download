@@ -19,6 +19,19 @@ import gdrive_service
 import gdrive_bridge
 import media_converter
 import ramdisk_manager
+import importlib
+
+# 自動熱重載自訂子模組，確保前端每次 Rerun / 重新整理時永遠套用最新程式碼
+if 'gdrive_service' in sys.modules:
+    try:
+        importlib.reload(gdrive_service)
+    except Exception:
+        pass
+if 'ramdisk_manager' in sys.modules:
+    try:
+        importlib.reload(ramdisk_manager)
+    except Exception:
+        pass
 
 # ── 全域共用 Session（跨任務複用 TCP 連線池 + DNS 快取）──────────────────────
 _global_session = requests.Session()
