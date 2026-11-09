@@ -18,8 +18,8 @@ def get_system_total_ram_gb():
 
 
 _total_ram = get_system_total_ram_gb()
-# 24GB 記憶體建議配置 6GB RAM Disk，保留 18GB 予系統與應用程式，防止系統記憶體壓力紅燈與 Swap
-DEFAULT_SIZE_GB = 6 if _total_ram >= 24 else (4 if _total_ram >= 16 else 3)
+# 24GB 記憶體建議配置 10GB RAM Disk，保留 14GB 予系統與應用程式，防止系統記憶體壓力紅燈與 Swap
+DEFAULT_SIZE_GB = 10 if _total_ram >= 24 else (6 if _total_ram >= 16 else 4)
 
 # 模組內部紀錄關聯的 ramdisk 裝置 (例如 /dev/disk4)
 _associated_device = None

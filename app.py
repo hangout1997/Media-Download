@@ -3460,8 +3460,8 @@ with col_ram2:
                     st.error(msg)
                 st.rerun()
     else:
-        default_size = 6 if sys_ram_gb >= 24 else (4 if sys_ram_gb >= 16 else 3)
-        size_options = [4, 6, 8, 12] if sys_ram_gb >= 24 else ([4, 6] if sys_ram_gb >= 16 else [2, 4])
+        default_size = 10 if sys_ram_gb >= 24 else (6 if sys_ram_gb >= 16 else 4)
+        size_options = [6, 8, 10, 12] if sys_ram_gb >= 24 else ([4, 6, 8] if sys_ram_gb >= 16 else [2, 4])
         selected_size = st.selectbox("劃分大小", size_options, index=size_options.index(default_size) if default_size in size_options else 0, format_func=lambda x: f"{x} GB 記憶體")
         btn_c1, btn_c2 = st.columns([3, 1])
         with btn_c1:
