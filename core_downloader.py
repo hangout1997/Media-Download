@@ -1693,7 +1693,38 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     else:
         max_workers = min(max_workers, total_segments)
 
-    segments_data = [b""] * total_segments
+    # ── 智慧決定 TS 中繼暫存目錄（優先 RAM Disk，100% 零 SSD 寫入）──────────
+    if scratch_dir is None:
+        try:
+            import ramdisk_manager
+            if total_duration > 0:
+                est_needed_bytes = int(total_duration * 350 * 1024)
+            else:
+                est_needed_bytes = int(total_segments * 2.5 * 1024 * 1024)
+
+            is_out_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
+            if is_out_on_ram:
+                required_ram_bytes = int(est_needed_bytes * 1.5 + 200 * 1024 * 1024)
+            else:
+                required_ram_bytes = int(est_needed_bytes + 200 * 1024 * 1024)
+
+            scratch_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_ram_bytes)
+        except Exception:
+            scratch_dir = tempfile.gettempdir()
+
+    tmp_ts = None
+    tmp_ts_path = None
+    try:
+        tmp_ts = tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir)
+        tmp_ts_path = tmp_ts.name
+    except Exception:
+        tmp_ts = tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=tempfile.gettempdir())
+        tmp_ts_path = tmp_ts.name
+
+    # ── 滑動視窗串流寫入 (Sliding Window Streamer) ──────────────────────────
+    pending_segments = {}
+    next_write_idx = 0
+    valid_count = 0
 
     is_cf_protected = any(k in m3u8_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"]) or "missav" in req_headers.get("Referer", "") or "missav" in req_headers.get("Origin", "")
     seg_fail_sample = []
@@ -1739,67 +1770,58 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     completed_duration = 0.0
     total_downloaded_bytes = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(download_segment, (i, url)): i
-                   for i, url in enumerate(segment_urls)}
-        for f in as_completed(futures):
-            idx, content = f.result()
-            segments_data[idx] = content
-            completed += 1
-            completed_duration += segment_durations[idx]
-            total_downloaded_bytes += len(content)
-
-            # 早期熔斷保護：若前 20 個切片全數失敗且無一成功，判定來源 CDN 徹底阻擋當前節點，立即中斷切換備援線路
-            if completed >= 20 and sum(1 for c in segments_data if len(c) > 0) == 0:
-                for rem_f in futures:
-                    rem_f.cancel()
-                fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
-                raise ValueError(f"切片下載成功率不足 (前 {completed} 個切片全數遭來源阻擋，觸發線路熔斷備援){fail_diag}。")
-
-            now = time.time()
-            if now - last_update_time >= 0.25 or completed == total_segments:
-                last_update_time = now
-                elapsed = max(0.1, now - t0)
-                speed_x = completed_duration / elapsed
-                mb_downloaded = total_downloaded_bytes / 1024 / 1024
-                speed_mb = mb_downloaded / elapsed
-                if total_duration > 0:
-                    pct = min(1.0, max(0.0, completed_duration / total_duration))
-                else:
-                    pct = completed / total_segments
-                if progress_cb:
-                    progress_cb(pct, completed_duration, total_duration, speed_mb, speed_x)
-
-    valid_count = sum(1 for c in segments_data if len(c) > 0)
-    if total_segments > 0 and valid_count < total_segments * 0.7:
-        fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
-        raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
-
-    if scratch_dir is None:
-        try:
-            import ramdisk_manager
-            is_out_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
-            if is_out_on_ram:
-                _, _, ram_free, _ = ramdisk_manager.get_ramdisk_usage()
-                if ram_free >= (total_downloaded_bytes * 2 + 200 * 1024 * 1024):
-                    scratch_dir = ramdisk_manager.MOUNT_POINT
-                else:
-                    scratch_dir = tempfile.gettempdir()
-            else:
-                scratch_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=total_downloaded_bytes + 200 * 1024 * 1024)
-        except Exception:
-            scratch_dir = tempfile.gettempdir()
-
-    tmp_ts_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir) as tmp_ts:
-            tmp_ts_path = tmp_ts.name
-            for chunk in segments_data:
-                if chunk:
-                    tmp_ts.write(chunk)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(download_segment, (i, url)): i
+                       for i, url in enumerate(segment_urls)}
+            for f in as_completed(futures):
+                idx, content = f.result()
+                completed += 1
+                completed_duration += segment_durations[idx]
+                content_len = len(content)
+                total_downloaded_bytes += content_len
 
-        del segments_data
-        gc.collect()
+                if content_len > 0:
+                    valid_count += 1
+
+                pending_segments[idx] = content
+
+                while next_write_idx in pending_segments:
+                    chunk = pending_segments.pop(next_write_idx)
+                    if len(chunk) > 0:
+                        tmp_ts.write(chunk)
+                    del chunk
+                    next_write_idx += 1
+
+                # 早期熔斷保護：若前 20 個切片全數失敗且無一成功，判定來源 CDN 徹底阻擋當前節點，立即中斷切換備援線路
+                if completed >= 20 and valid_count == 0:
+                    for rem_f in futures:
+                        rem_f.cancel()
+                    fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
+                    raise ValueError(f"切片下載成功率不足 (前 {completed} 個切片全數遭來源阻擋，觸發線路熔斷備援){fail_diag}。")
+
+                now = time.time()
+                if now - last_update_time >= 0.25 or completed == total_segments:
+                    last_update_time = now
+                    elapsed = max(0.1, now - t0)
+                    speed_x = completed_duration / elapsed
+                    mb_downloaded = total_downloaded_bytes / 1024 / 1024
+                    speed_mb = mb_downloaded / elapsed
+                    if total_duration > 0:
+                        pct = min(1.0, max(0.0, completed_duration / total_duration))
+                    else:
+                        pct = completed / total_segments
+                    if progress_cb:
+                        progress_cb(pct, completed_duration, total_duration, speed_mb, speed_x)
+
+        tmp_ts.flush()
+        tmp_ts.close()
+        tmp_ts = None
+        pending_segments.clear()
+
+        if total_segments > 0 and valid_count < total_segments * 0.7:
+            fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
+            raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
 
         ffmpeg_cmd = [
             "ffmpeg", "-y",
@@ -1821,11 +1843,18 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             clean_err = " | ".join(err_lines[-3:]) if err_lines else err_raw[-300:]
             raise ValueError(f"FFmpeg 無損封裝失敗: {clean_err}")
     finally:
+        if tmp_ts:
+            try:
+                tmp_ts.close()
+            except Exception:
+                pass
         try:
             if tmp_ts_path and os.path.exists(tmp_ts_path):
                 os.remove(tmp_ts_path)
         except Exception:
             pass
+        pending_segments.clear()
+        gc.collect()
 
     return out_path
 

@@ -1894,9 +1894,36 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     progress_bar = st.progress(0.0)
     status_text = st.empty()
 
-    # ── 全量 RAM 模式：切片全部存入記憶體，封裝時一次性寫入，零磁碟 I/O ──────
-    # 24G RAM 環境下，2h 影片約佔 2–4 GB，完全在記憶體範圍內
-    segments_data = [b""] * total_segments
+    # ── 智慧決定 TS 中繼暫存目錄（優先 RAM Disk，100% 零 SSD 寫入）──────────
+    if total_duration > 0:
+        est_needed_bytes = int(total_duration * 350 * 1024)
+    else:
+        est_needed_bytes = int(total_segments * 2.5 * 1024 * 1024)
+
+    is_out_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
+    if is_out_on_ram:
+        required_ram_bytes = int(est_needed_bytes * 1.5 + 200 * 1024 * 1024)
+    else:
+        required_ram_bytes = int(est_needed_bytes + 200 * 1024 * 1024)
+
+    scratch_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_ram_bytes)
+
+    # 建立中繼 TS 暫存檔（直接落盤於 RAM Disk，徹底避免 Python 堆疊記憶體暴增）
+    tmp_ts = None
+    tmp_ts_path = None
+    try:
+        tmp_ts = tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir)
+        tmp_ts_path = tmp_ts.name
+    except Exception:
+        tmp_ts = tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=tempfile.gettempdir())
+        tmp_ts_path = tmp_ts.name
+
+    # ── 滑動視窗串流寫入 (Sliding Window Streamer) ──────────────────────────
+    # 不在 Python 記憶體全量囤積 bytes（徹底防止 8GB 記憶體膨脹與 OS Swap 災難）
+    # 僅在記憶體保留亂序抵達的少數切片 (~16-32 個，約 30-80 MB)，按順序直接寫入 RAM Disk 並即時釋放！
+    pending_segments = {}
+    next_write_idx = 0
+    valid_count = 0
 
     is_cf_protected = any(k in m3u8_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"]) or "missav" in req_headers.get("Referer", "") or "missav" in req_headers.get("Origin", "")
     seg_fail_sample = []
@@ -1947,80 +1974,75 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     completed_duration = 0.0
     total_downloaded_bytes = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(download_segment, (i, url)): i
-                   for i, url in enumerate(segment_urls)}
-        for f in as_completed(futures):
-            idx, content = f.result()
-            segments_data[idx] = content
-            completed += 1
-            completed_duration += segment_durations[idx]
-            total_downloaded_bytes += len(content)
-
-            # 早期熔斷保護：若前 20 個切片全數失敗且無一成功，判定來源 CDN 徹底阻擋當前節點，立即中斷切換備援線路
-            if completed >= 20 and sum(1 for c in segments_data if len(c) > 0) == 0:
-                for rem_f in futures:
-                    rem_f.cancel()
-                fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
-                raise ValueError(f"切片下載成功率不足 (前 {completed} 個切片全數遭來源阻擋，觸發線路熔斷備援){fail_diag}。")
-
-            now = time.time()
-            if now - last_update_time >= 0.25 or completed == total_segments:
-                last_update_time = now
-                elapsed = max(0.1, now - t0)
-                speed_x = completed_duration / elapsed
-                mb_downloaded = total_downloaded_bytes / 1024 / 1024
-                speed_mb = mb_downloaded / elapsed
-                is_p = not _GLOBAL_PAUSE_EVENT.is_set()
-                paused_badge = " ｜ ⏸️ **(已暫停-頻寬已釋出，點上方按鈕可恢復)**" if is_p else ""
-                if total_duration > 0:
-                    pct = min(1.0, max(0.0, completed_duration / total_duration))
-                    status_text.markdown(
-                        f"⏳ **{label}進度**: `{pct * 100:.1f}%` "
-                        f"({format_time(completed_duration)} / {format_time(total_duration)}) "
-                        f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`) "
-                        f"| 線程: `{max_workers}`{paused_badge}"
-                    )
-                else:
-                    pct = completed / total_segments
-                    status_text.markdown(
-                        f"⏳ **{label}處理中...** 已完成 `{completed}/{total_segments}` "
-                        f"(`{mb_downloaded:.1f} MB`) "
-                        f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`){paused_badge}"
-                    )
-                progress_bar.progress(pct)
-
-    valid_count = sum(1 for c in segments_data if len(c) > 0)
-    if total_segments > 0 and valid_count < total_segments * 0.7:
-        fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
-        raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
-
-    status_text.markdown("⚡ **多線程切片下載完成，正在無損封裝為 MP4...**")
-
-    # 智慧選擇 TS 中繼暫存目錄：
-    # 若 out_path 位於 RAM Disk，檢查 RAM Disk 是否足以容納 (TS 暫存 + MP4 成品)
-    # 若空間充裕，兩者皆在 RAM Disk（100% 零 SSD 磨損）；
-    # 若不足以容納雙倍，將 TS 暫存置於系統暫存 (SSD)，保留 RAM Disk 專門存放最終 MP4！
-    is_out_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
-    if is_out_on_ram:
-        _, _, ram_free, _ = ramdisk_manager.get_ramdisk_usage()
-        if ram_free >= (total_downloaded_bytes * 2 + 200 * 1024 * 1024):
-            scratch_dir = ramdisk_manager.MOUNT_POINT
-        else:
-            scratch_dir = tempfile.gettempdir()
-    else:
-        scratch_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=total_downloaded_bytes + 200 * 1024 * 1024)
-
-    tmp_ts_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".ts", delete=False, dir=scratch_dir) as tmp_ts:
-            tmp_ts_path = tmp_ts.name
-            for chunk in segments_data:
-                if chunk:
-                    tmp_ts.write(chunk)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(download_segment, (i, url)): i
+                       for i, url in enumerate(segment_urls)}
+            for f in as_completed(futures):
+                idx, content = f.result()
+                completed += 1
+                completed_duration += segment_durations[idx]
+                content_len = len(content)
+                total_downloaded_bytes += content_len
 
-        del segments_data
-        gc.collect()
+                if content_len > 0:
+                    valid_count += 1
+
+                # 存入滑動緩衝區
+                pending_segments[idx] = content
+
+                # 順序連續就即時寫入 RAM Disk，並立刻從記憶體剔除
+                while next_write_idx in pending_segments:
+                    chunk = pending_segments.pop(next_write_idx)
+                    if len(chunk) > 0:
+                        tmp_ts.write(chunk)
+                    del chunk
+                    next_write_idx += 1
+
+                # 早期熔斷保護：若前 20 個切片全數失敗且無一成功，判定來源 CDN 徹底阻擋當前節點，立即中斷切換備援線路
+                if completed >= 20 and valid_count == 0:
+                    for rem_f in futures:
+                        rem_f.cancel()
+                    fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
+                    raise ValueError(f"切片下載成功率不足 (前 {completed} 個切片全數遭來源阻擋，觸發線路熔斷備援){fail_diag}。")
+
+                now = time.time()
+                if now - last_update_time >= 0.25 or completed == total_segments:
+                    last_update_time = now
+                    elapsed = max(0.1, now - t0)
+                    speed_x = completed_duration / elapsed
+                    mb_downloaded = total_downloaded_bytes / 1024 / 1024
+                    speed_mb = mb_downloaded / elapsed
+                    is_p = not _GLOBAL_PAUSE_EVENT.is_set()
+                    paused_badge = " ｜ ⏸️ **(已暫停-頻寬已釋出，點上方按鈕可恢復)**" if is_p else ""
+                    if total_duration > 0:
+                        pct = min(1.0, max(0.0, completed_duration / total_duration))
+                        status_text.markdown(
+                            f"⏳ **{label}進度**: `{pct * 100:.1f}%` "
+                            f"({format_time(completed_duration)} / {format_time(total_duration)}) "
+                            f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`) "
+                            f"| 線程: `{max_workers}`{paused_badge}"
+                        )
+                    else:
+                        pct = completed / total_segments
+                        status_text.markdown(
+                            f"⏳ **{label}處理中...** 已完成 `{completed}/{total_segments}` "
+                            f"(`{mb_downloaded:.1f} MB`) "
+                            f"| 速度: `{speed_x:.2f}x` (`{speed_mb:.2f} MB/s`){paused_badge}"
+                        )
+                    progress_bar.progress(pct)
+
+        # 確保關閉暫存檔
+        tmp_ts.flush()
+        tmp_ts.close()
+        tmp_ts = None
+        pending_segments.clear()
+
+        if total_segments > 0 and valid_count < total_segments * 0.7:
+            fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
+            raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
+
+        status_text.markdown("⚡ **多線程切片串流寫入完成，正在透過 FFmpeg 無損封裝為 MP4...**")
 
         ffmpeg_cmd = [
             "ffmpeg", "-y",
@@ -2040,11 +2062,18 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         gc.collect()
 
     finally:
+        if tmp_ts:
+            try:
+                tmp_ts.close()
+            except Exception:
+                pass
         try:
             if tmp_ts_path and os.path.exists(tmp_ts_path):
                 os.remove(tmp_ts_path)
         except Exception:
             pass
+        pending_segments.clear()
+        gc.collect()
 
     progress_bar.empty()
     status_text.empty()
@@ -2310,7 +2339,8 @@ def download_media(media_item, force_audio=False):
         return
 
     # 3. 全面防重複下載檢查（跨 RAM Disk 與系統暫存區，只要暫存區已封裝就緒，100% 絕不重複下載）：
-    clean_tmp_name = f"gdrive_tmp_{re.sub(r'[\/\\:\*\?\"<>\|]', '_', filename)}"
+    clean_sub_filename = re.sub(r'[\/\\:\*\?\"<>\|]', '_', filename)
+    clean_tmp_name = f"gdrive_tmp_{clean_sub_filename}"
 
     cand_ready_paths = []
     if ramdisk_manager.is_ramdisk_mounted():
@@ -2937,12 +2967,25 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
         else:
             show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=video_path)
 
+def force_os_memory_trim():
+    """強制 macOS 系統底層釋放 Python 進程中已回收但未返還作業系統之虛擬記憶體分頁。"""
+    gc.collect()
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None)
+        if hasattr(libc, "malloc_zone_pressure_relief"):
+            libc.malloc_zone_pressure_relief(None, 0)
+    except Exception:
+        pass
+
+
 def release_resources():
     released_info = []
     
-    # 1. 垃圾回收
+    # 1. 垃圾回收與 macOS 記憶體歸還
     collected = gc.collect()
-    released_info.append(f"🧹 已執行 Python 垃圾回收，回收了 {collected} 個物件。")
+    force_os_memory_trim()
+    released_info.append(f"🧹 已執行 Python 垃圾回收 (清理 {collected} 個物件) 並歸還系統分頁 (malloc_zone_pressure_relief)。")
     
     # 2. 清除 Streamlit 快取
     try:
@@ -2984,9 +3027,9 @@ def release_resources():
 
     # 5. 清理 RAM Disk 暫存檔案
     if ramdisk_manager.is_ramdisk_mounted():
-        c_ram = ramdisk_manager.clean_scratch_files()
+        c_ram = ramdisk_manager.clean_all_ramdisk_files()
         if c_ram > 0:
-            released_info.append(f"🚀 已清理 RAM Disk 暫存區中 {c_ram} 個暫存檔案。")
+            released_info.append(f"🚀 已清空 RAM Disk 暫存區中 {c_ram} 個檔案。")
         else:
             released_info.append("🚀 RAM Disk 暫存區已為空。")
 
@@ -3362,16 +3405,24 @@ with col_ram1:
 with col_ram2:
     if ram_mounted:
         st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
-        if st.button("⏏️ 卸載 RAM Disk", use_container_width=True, help="立即歸還記憶體給 macOS 系統"):
-            ok, msg = ramdisk_manager.unmount_ramdisk()
-            if ok:
-                st.session_state.pending_toast = ("✅ 已卸載 RAM Disk 並歸還記憶體", "⏏️")
-            else:
-                st.error(msg)
-            st.rerun()
+        b_c1, b_c2 = st.columns(2)
+        with b_c1:
+            if st.button("🧹 清空暫存", use_container_width=True, help="清空 RAM Disk 內所有暫存與已完成檔案，秒級還原空間"):
+                c = ramdisk_manager.clean_all_ramdisk_files()
+                force_os_memory_trim()
+                st.session_state.pending_toast = (f"✅ 已清空 RAM Disk ({c} 個檔案) 並釋放記憶體！", "🧹")
+                st.rerun()
+        with b_c2:
+            if st.button("⏏️ 卸載", use_container_width=True, help="立即歸還記憶體給 macOS 系統"):
+                ok, msg = ramdisk_manager.unmount_ramdisk()
+                if ok:
+                    st.session_state.pending_toast = ("✅ 已卸載 RAM Disk 並歸還記憶體", "⏏️")
+                else:
+                    st.error(msg)
+                st.rerun()
     else:
-        default_size = 8 if sys_ram_gb >= 24 else (6 if sys_ram_gb >= 16 else 4)
-        size_options = [4, 8, 12, 16] if sys_ram_gb >= 24 else ([4, 8] if sys_ram_gb >= 16 else [2, 4])
+        default_size = 6 if sys_ram_gb >= 24 else (4 if sys_ram_gb >= 16 else 3)
+        size_options = [4, 6, 8, 12] if sys_ram_gb >= 24 else ([4, 6] if sys_ram_gb >= 16 else [2, 4])
         selected_size = st.selectbox("劃分大小", size_options, index=size_options.index(default_size) if default_size in size_options else 0, format_func=lambda x: f"{x} GB 記憶體")
         if st.button(f"🚀 掛載 {selected_size}GB RAM Disk", type="primary", use_container_width=True, help=f"免 root 建立 {selected_size}GB APFS 虛擬記憶體磁碟"):
             with st.spinner(f"正在向 macOS 申請劃分 {selected_size}GB APFS RAM Disk..."):

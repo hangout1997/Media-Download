@@ -18,7 +18,8 @@ def get_system_total_ram_gb():
 
 
 _total_ram = get_system_total_ram_gb()
-DEFAULT_SIZE_GB = 8 if _total_ram >= 24 else (6 if _total_ram >= 16 else 4)
+# 24GB 記憶體建議配置 6GB RAM Disk，保留 18GB 予系統與應用程式，防止系統記憶體壓力紅燈與 Swap
+DEFAULT_SIZE_GB = 6 if _total_ram >= 24 else (4 if _total_ram >= 16 else 3)
 
 # 模組內部紀錄關聯的 ramdisk 裝置 (例如 /dev/disk4)
 _associated_device = None
@@ -161,19 +162,31 @@ def unmount_ramdisk():
     return False, "⚠️ 卸載 RAM Disk 時可能仍有檔案開啟，請稍後重試。"
 
 
-def clean_scratch_files(preserve_mp4=True):
-    """清理 RAM Disk 內的切片中繼暫存檔案，保留已封裝的 MP4 與正在上傳的檔案。"""
+def clean_scratch_files(preserve_mp4=True, max_age_seconds=1800):
+    """
+    清理 RAM Disk 內的切片中繼暫存檔案。
+    - 暫存檔 (.ts, .part, .tmp 等) 一律清理
+    - 已封裝成品 (.mp4, .mkv) 或 gdrive_tmp_ 若 preserve_mp4=True 且未超過 max_age_seconds (預設 30 分鐘) 則保留
+    - 超過 30 分鐘的遺留暫存成品一併清理，防止 RAM Disk 長期未釋放
+    """
     if not is_ramdisk_mounted():
         return 0
+    import time
     cleaned = 0
+    now = time.time()
     try:
         for fname in os.listdir(MOUNT_POINT):
             if fname.startswith("."):
                 continue
-            # 保護已完成封裝的 MP4/成品或以 gdrive_tmp_ 開頭的檔案不被誤刪
-            if preserve_mp4 and (fname.endswith(".mp4") or fname.endswith(".mkv") or "gdrive_tmp_" in fname):
-                continue
             fpath = os.path.join(MOUNT_POINT, fname)
+            is_mp4_or_gdrive = fname.endswith(".mp4") or fname.endswith(".mkv") or "gdrive_tmp_" in fname
+            if preserve_mp4 and is_mp4_or_gdrive:
+                try:
+                    file_age = now - os.path.getmtime(fpath)
+                    if file_age < max_age_seconds:
+                        continue
+                except Exception:
+                    pass
             try:
                 if os.path.isfile(fpath) or os.path.islink(fpath):
                     os.remove(fpath)
@@ -186,6 +199,11 @@ def clean_scratch_files(preserve_mp4=True):
     except Exception:
         pass
     return cleaned
+
+
+def clean_all_ramdisk_files():
+    """強制徹底清空 RAM Disk 內的所有檔案與暫存，秒級釋出全量 RAM 空間。"""
+    return clean_scratch_files(preserve_mp4=False)
 
 
 def get_ramdisk_usage():
@@ -229,15 +247,28 @@ def is_ramdisk_sufficient(required_bytes):
 def get_scratch_dir(min_free_bytes=1024 * 1024 * 1024):
     """
     取得建議的暫存處理目錄：
-    - 若 RAM Disk 已掛載且剩餘空間充裕 (預設 >= 1GB 或指定容量)，優先使用 RAM Disk（100% 零 SSD 磨損）
-    - 若空間不足，自動嘗試 auto_purge_if_full() 清理過期暫存
-    - 若依然空間不足，自動安全降級為系統暫存目錄 (tempfile.gettempdir())，徹底避免 ENOSPC 造成程式崩潰
+    - 若 RAM Disk 尚未掛載，自動嘗試掛載
+    - 若已掛載且剩餘空間充裕，優先使用 RAM Disk（100% 零 SSD 磨損）
+    - 若空間不足，自動清理過期暫存後重試
+    - 若依然空間不足，才安全降級為系統暫存目錄 (tempfile.gettempdir())，徹底避免 ENOSPC 造成程式崩潰
     """
+    if is_macos() and not is_ramdisk_mounted():
+        try:
+            mount_ramdisk()
+        except Exception:
+            pass
+
     if is_ramdisk_mounted():
         auto_purge_if_full()
         _, _, free, _ = get_ramdisk_usage()
         if free >= min_free_bytes:
             return MOUNT_POINT
+        # 空間若仍吃緊，清理過期與非活躍檔案
+        clean_scratch_files(preserve_mp4=True, max_age_seconds=600)
+        _, _, free, _ = get_ramdisk_usage()
+        if free >= min_free_bytes:
+            return MOUNT_POINT
+
     return tempfile.gettempdir()
 
 
