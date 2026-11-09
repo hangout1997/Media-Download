@@ -3399,7 +3399,8 @@ with col_ram1:
     else:
         st.info(
             f"💡 **RAM Disk 未掛載**（系統實體 RAM: {sys_ram_gb}GB）：目前使用 macOS 系統 SSD 暫存。\n\n"
-            f"建議掛載 APFS RAM Disk（1080p 長片或電影推薦 8GB 以上），切片封裝全數在記憶體進行，達成 100% 零硬碟讀寫與極速封裝。"
+            f"建議掛載 APFS RAM Disk（1080p 長片或電影推薦 8GB 以上），切片封裝全數在記憶體進行，達成 100% 零硬碟讀寫與極速封裝。\n\n"
+            f"*(若剛透過終端機或 Rclone 完成掛載，可點右側「🔄」或按 `Cmd + R` 重新整理讀取共用磁碟)*"
         )
 
 with col_ram2:
@@ -3424,13 +3425,18 @@ with col_ram2:
         default_size = 6 if sys_ram_gb >= 24 else (4 if sys_ram_gb >= 16 else 3)
         size_options = [4, 6, 8, 12] if sys_ram_gb >= 24 else ([4, 6] if sys_ram_gb >= 16 else [2, 4])
         selected_size = st.selectbox("劃分大小", size_options, index=size_options.index(default_size) if default_size in size_options else 0, format_func=lambda x: f"{x} GB 記憶體")
-        if st.button(f"🚀 掛載 {selected_size}GB RAM Disk", type="primary", use_container_width=True, help=f"免 root 建立 {selected_size}GB APFS 虛擬記憶體磁碟"):
-            with st.spinner(f"正在向 macOS 申請劃分 {selected_size}GB APFS RAM Disk..."):
-                ok, msg = ramdisk_manager.mount_ramdisk(size_gb=selected_size)
-                if ok:
-                    st.session_state.pending_toast = (f"✅ {selected_size}GB APFS RAM Disk 掛載成功！", "🚀")
-                else:
-                    st.error(msg)
+        btn_c1, btn_c2 = st.columns([3, 1])
+        with btn_c1:
+            if st.button(f"🚀 掛載 {selected_size}GB RAM Disk", type="primary", use_container_width=True, help=f"免 root 建立 {selected_size}GB APFS 虛擬記憶體磁碟"):
+                with st.spinner(f"正在向 macOS 申請劃分 {selected_size}GB APFS RAM Disk..."):
+                    ok, msg = ramdisk_manager.mount_ramdisk(size_gb=selected_size)
+                    if ok:
+                        st.session_state.pending_toast = (f"✅ {selected_size}GB APFS RAM Disk 掛載成功！", "🚀")
+                    else:
+                        st.error(msg)
+                    st.rerun()
+        with btn_c2:
+            if st.button("🔄", help="重新偵測 RAM Disk 掛載狀態", use_container_width=True):
                 st.rerun()
 
 # 3. 系統資源清理控制列 (並排按鈕)
