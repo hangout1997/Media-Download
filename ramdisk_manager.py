@@ -206,6 +206,21 @@ def clean_all_ramdisk_files():
     return clean_scratch_files(preserve_mp4=False)
 
 
+def clean_file_safely(file_path):
+    """安全刪除指定的未完成暫存檔案，防殘留佔用磁碟。"""
+    try:
+        if file_path and os.path.exists(file_path):
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.remove(file_path)
+                return True
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path, ignore_errors=True)
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def get_ramdisk_usage():
     """
     取得 RAM Disk 使用狀況。

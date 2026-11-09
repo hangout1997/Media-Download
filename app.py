@@ -1836,6 +1836,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         raise ValueError(f"伺服器回傳非有效的 m3u8 內容 (可能為網頁阻擋或無效連結): {clean_text[:120]}")
 
     # ── Master Playlist：優先用 RESOLUTION 高度排序，其次 BANDWIDTH ──────────
+    selected_bw = 0
     if "#EXT-X-STREAM-INF" in text:
         sub_playlists = []
         current_inf = {}
@@ -1856,6 +1857,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         if sub_playlists:
             # 優先 RESOLUTION 高度，相同高度再比 BANDWIDTH
             sub_playlists.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            selected_bw = sub_playlists[0][1]
             m3u8_url = sub_playlists[0][2]
             text = fetch_text(m3u8_url)
             clean_sub = text.lstrip('\ufeff \t\r\n')
@@ -1896,15 +1898,18 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     # ── 智慧決定 TS 中繼暫存目錄（優先 RAM Disk，100% 零 SSD 寫入）──────────
     if total_duration > 0:
-        est_needed_bytes = int(total_duration * 350 * 1024)
+        est_rate = (selected_bw / 8) if selected_bw > 0 else (600 * 1024)
+        est_needed_bytes = int(total_duration * est_rate)
     else:
-        est_needed_bytes = int(total_segments * 2.5 * 1024 * 1024)
+        est_needed_bytes = int(total_segments * 3.0 * 1024 * 1024)
 
     is_out_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
     if is_out_on_ram:
-        required_ram_bytes = int(est_needed_bytes * 1.5 + 200 * 1024 * 1024)
+        # 當最終輸出 MP4 也在 RAM Disk 時，封裝期間 TS 與 MP4 兩者同時佔用磁碟，需要 2.2x 空間
+        required_ram_bytes = int(est_needed_bytes * 2.2 + 300 * 1024 * 1024)
     else:
-        required_ram_bytes = int(est_needed_bytes + 200 * 1024 * 1024)
+        # 最終輸出不在 RAM Disk (如 Downloads)，RAM Disk 僅需容納 TS 暫存檔
+        required_ram_bytes = int(est_needed_bytes * 1.1 + 300 * 1024 * 1024)
 
     scratch_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_ram_bytes)
 
@@ -2044,6 +2049,28 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
         status_text.markdown("⚡ **多線程切片串流寫入完成，正在透過 FFmpeg 無損封裝為 MP4...**")
 
+        # ── 封裝前空間防護 (Zero-ENOSPC Safe Guard) ──────────────────────────
+        actual_ts_size = os.path.getsize(tmp_ts_path) if (tmp_ts_path and os.path.exists(tmp_ts_path)) else 0
+        is_target_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
+
+        if is_target_on_ram:
+            _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage()
+            needed_output_space = actual_ts_size + 250 * 1024 * 1024
+            if free_ram < needed_output_space:
+                # 策略 1: 若 tmp_ts 本身佔用了 RAM Disk，將 tmp_ts 移動到本機 SSD /tmp，秒級釋出 RAM Disk 全量空間給 MP4 封裝
+                if "/Volumes/MediaRAMDisk" in tmp_ts_path:
+                    ssd_tmp_ts = os.path.join(tempfile.gettempdir(), os.path.basename(tmp_ts_path))
+                    status_text.markdown("⚡ **RAM Disk 空間吃緊，正在安全轉移中繼暫存檔至本機以騰出極速封裝空間...**")
+                    shutil.move(tmp_ts_path, ssd_tmp_ts)
+                    tmp_ts_path = ssd_tmp_ts
+                    _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage()
+
+                # 策略 2: 若釋出後 RAM Disk 剩餘空間仍不足以容納成品 (例如影片超過 6GB)，輸出路徑安全降級至本機暫存
+                if free_ram < needed_output_space:
+                    ssd_out_path = os.path.join(tempfile.gettempdir(), os.path.basename(out_path))
+                    st.warning(f"⚠️ 影片實際體積龐大 ({actual_ts_size/1024/1024/1024:.2f} GB)，超出 RAM Disk 總可用空間。已自動轉為本機高速暫存封裝，確保 100% 成功不中斷。")
+                    out_path = ssd_out_path
+
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", tmp_ts_path,
@@ -2054,6 +2081,11 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         ]
         proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
+            if out_path and os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
             raise ValueError(f"FFmpeg 無損封裝失敗: {proc.stderr.decode('utf-8', errors='ignore')}")
 
         proc.stdout = None
@@ -2077,6 +2109,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     progress_bar.empty()
     status_text.empty()
+    return out_path
 
 def gdrive_precheck_exists(filename):
     """雲端模式下載前先檢查目標資料夾是否已有同名檔案，有則顯示訊息並回傳 True。"""
@@ -2362,10 +2395,10 @@ def download_media(media_item, force_audio=False):
 
         extra_headers = media_item.get('headers', {})
         total_dur = get_media_duration(media_url, headers=extra_headers) if ("m3u8" in media_url or not force_audio) else 0
-        # 線上 1080p 串流平均碼率約 2000-2600 kbps (約 320 KB/s)
-        est_size_bytes = int(total_dur * 320 * 1024) if total_dur and total_dur > 0 else 0
-        # RAM Disk 僅需存放最終 MP4 檔案 (含 300MB 安全緩衝)，中繼 TS 若空間吃緊會自動轉移至 SSD
-        required_free = (est_size_bytes + 300 * 1024 * 1024) if est_size_bytes > 0 else (1024 * 1024 * 1024)
+        # 線上 1080p 長片/電影平均碼率約 4000-6000 kbps (約 550-750 KB/s)，以 600 KB/s 保守估算
+        est_size_bytes = int(total_dur * 600 * 1024) if total_dur and total_dur > 0 else 0
+        # RAM Disk 僅需存放最終 MP4 檔案 (含 400MB 安全緩衝)，中繼 TS 若空間吃緊會自動轉移至 SSD
+        required_free = (est_size_bytes + 400 * 1024 * 1024) if est_size_bytes > 0 else (1024 * 1024 * 1024)
 
         temp_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_free)
         out_path = os.path.join(temp_dir, clean_tmp_name)
@@ -2415,12 +2448,17 @@ def download_media(media_item, force_audio=False):
                 try:
                     if c_idx > 0:
                         st.info(f"🔄 嘗試切換至備用串流線路 ({c_idx+1}/{len(cand_m3u8s)}): `{c_url}`")
-                    download_fast_parallel_hls(c_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
-                    if not (os.path.exists(out_path) and os.path.getsize(out_path) > 0):
+                    final_out_path = download_fast_parallel_hls(c_url, out_path=out_path, extra_headers=extra_headers, max_workers=16, label="影片")
+                    if not (final_out_path and os.path.exists(final_out_path) and os.path.getsize(final_out_path) > 0):
                         raise ValueError("封裝後輸出檔案不存在或為空")
-                    _mark_and_finish_output_file(out_path, filename)
+                    _mark_and_finish_output_file(final_out_path, filename)
                     return
                 except Exception as hls_err:
+                    if out_path and os.path.exists(out_path):
+                        try:
+                            os.remove(out_path)
+                        except Exception:
+                            pass
                     ramdisk_manager.clean_scratch_files()
                     if is_gdrive and "/Volumes/MediaRAMDisk" in out_path:
                         temp_dir = tempfile.gettempdir()

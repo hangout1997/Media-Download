@@ -1642,6 +1642,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     if not (clean_text.startswith("#EXT") or "#EXTM3U" in clean_text or "#EXT-X-" in clean_text):
         raise ValueError(f"伺服器回傳非有效的 m3u8 內容 (可能為網頁阻擋或無效連結): {clean_text[:120]}")
 
+    selected_bw = 0
     if "#EXT-X-STREAM-INF" in text:
         sub_playlists = []
         current_inf = {}
@@ -1661,6 +1662,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                 current_inf = {}
         if sub_playlists:
             sub_playlists.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            selected_bw = sub_playlists[0][1]
             m3u8_url = sub_playlists[0][2]
             text = fetch_text(m3u8_url)
             clean_sub = text.lstrip('\ufeff \t\r\n')
@@ -1698,15 +1700,18 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         try:
             import ramdisk_manager
             if total_duration > 0:
-                est_needed_bytes = int(total_duration * 350 * 1024)
+                est_rate = (selected_bw / 8) if selected_bw > 0 else (600 * 1024)
+                est_needed_bytes = int(total_duration * est_rate)
             else:
-                est_needed_bytes = int(total_segments * 2.5 * 1024 * 1024)
+                est_needed_bytes = int(total_segments * 3.0 * 1024 * 1024)
 
             is_out_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
             if is_out_on_ram:
-                required_ram_bytes = int(est_needed_bytes * 1.5 + 200 * 1024 * 1024)
+                # 當最終輸出 MP4 也在 RAM Disk 時，封裝期間 TS 與 MP4 兩者同時佔用磁碟，需要 2.2x 空間
+                required_ram_bytes = int(est_needed_bytes * 2.2 + 300 * 1024 * 1024)
             else:
-                required_ram_bytes = int(est_needed_bytes + 200 * 1024 * 1024)
+                # 最終輸出不在 RAM Disk (如 Downloads)，RAM Disk 僅需容納 TS 暫存檔
+                required_ram_bytes = int(est_needed_bytes * 1.1 + 300 * 1024 * 1024)
 
             scratch_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_ram_bytes)
         except Exception:
@@ -1823,6 +1828,28 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
             raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
 
+        # ── 封裝前空間防護 (Zero-ENOSPC Safe Guard) ──────────────────────────
+        actual_ts_size = os.path.getsize(tmp_ts_path) if (tmp_ts_path and os.path.exists(tmp_ts_path)) else 0
+        try:
+            import ramdisk_manager
+            is_target_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
+            if is_target_on_ram:
+                _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage()
+                needed_output_space = actual_ts_size + 250 * 1024 * 1024
+                if free_ram < needed_output_space:
+                    # 策略 1: 若 tmp_ts 本身佔用了 RAM Disk，將 tmp_ts 移動到本機 SSD /tmp，秒級釋出 RAM Disk 全量空間給 MP4 封裝
+                    if "/Volumes/MediaRAMDisk" in tmp_ts_path:
+                        ssd_tmp_ts = os.path.join(tempfile.gettempdir(), os.path.basename(tmp_ts_path))
+                        shutil.move(tmp_ts_path, ssd_tmp_ts)
+                        tmp_ts_path = ssd_tmp_ts
+                        _, _, free_ram, _ = ramdisk_manager.get_ramdisk_usage()
+
+                    # 策略 2: 若釋出後 RAM Disk 剩餘空間仍不足以容納成品 (例如影片超過 6GB)，輸出路徑安全降級至本機暫存
+                    if free_ram < needed_output_space:
+                        out_path = os.path.join(tempfile.gettempdir(), os.path.basename(out_path))
+        except Exception:
+            pass
+
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", tmp_ts_path,
@@ -1833,6 +1860,11 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         ]
         proc = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
+            if out_path and os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
             err_raw = proc.stderr.decode('utf-8', errors='ignore')
             err_lines = [
                 l.strip() for l in err_raw.splitlines()
@@ -1891,7 +1923,7 @@ def download_media_to_path(media_item, out_path, force_audio=False, cookies=None
         m3u8_content = media_item.get('m3u8_content')
         for c_idx, c_url in enumerate(cand_m3u8s):
             try:
-                download_fast_parallel_hls(
+                final_out = download_fast_parallel_hls(
                     c_url,
                     out_path=out_path,
                     extra_headers=extra_headers,
@@ -1901,9 +1933,14 @@ def download_media_to_path(media_item, out_path, force_audio=False, cookies=None
                     scratch_dir=scratch_dir,
                     m3u8_content=m3u8_content if c_idx == 0 else None
                 )
-                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    return out_path
+                if final_out and os.path.exists(final_out) and os.path.getsize(final_out) > 0:
+                    return final_out
             except Exception as hls_err:
+                if out_path and os.path.exists(out_path):
+                    try:
+                        os.remove(out_path)
+                    except Exception:
+                        pass
                 last_hls_err = hls_err
                 if c_idx == len(cand_m3u8s) - 1:
                     _log_info(f"多線程下載備援耗盡: {hls_err}")
