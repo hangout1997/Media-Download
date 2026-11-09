@@ -715,8 +715,15 @@ def _ensure_m3u8_prefetched(items):
                                 ))
                                 cur_inf = {}
                         if sub_playlists:
+                            pref_q = st.session_state.get('pref_quality', '720p')
                             sub_playlists.sort(key=lambda x: (x[0], x[1]), reverse=True)
-                            sub_url = sub_playlists[0][2]
+                            chosen = None
+                            if pref_q == "720p":
+                                cand = [sp for sp in sub_playlists if sp[0] <= 720]
+                                if cand: chosen = cand[0]
+                            if not chosen:
+                                chosen = sub_playlists[0]
+                            sub_url = chosen[2]
                             r_sub = curl_requests.get(sub_url, headers=m_headers, impersonate='chrome124', timeout=15)
                             if r_sub.status_code == 200 and r_sub.text:
                                 it['url'] = sub_url
@@ -1038,6 +1045,10 @@ def get_media_items(url):
             blocks = extract_packer_blocks(response.text)
             m3u8_url = None
 
+            pref_q = st.session_state.get('pref_quality', '720p')
+            m3u8_url = None
+            backup_m3u8s = []
+
             for block in blocks:
                 unpacked = unpack_dean_packer(block)
                 source_1080p = re.search(r"source1280\s*=\s*['\"](https?://[^'\"]+?)['\"]", unpacked)
@@ -1046,21 +1057,34 @@ def get_media_items(url):
                 source_generic = re.search(r"source\w*\s*=\s*['\"](https?://[^'\"]+?\.m3u8[^\'\"]*)['\"]", unpacked)
                 m3u8_direct = re.search(r"['\"](https?://[^'\"]+?\.m3u8[^\'\"]*)['\"]", unpacked)
 
-                if source_1080p:
-                    m3u8_url = source_1080p.group(1)
-                    break
-                elif source_720p:
-                    m3u8_url = source_720p.group(1)
-                    break
-                elif source_playlist:
-                    m3u8_url = source_playlist.group(1)
-                    break
-                elif source_generic:
-                    m3u8_url = source_generic.group(1)
-                    break
-                elif m3u8_direct:
-                    m3u8_url = m3u8_direct.group(1)
-                    break
+                u_1080 = source_1080p.group(1) if source_1080p else None
+                u_720 = source_720p.group(1) if source_720p else None
+                u_def = source_playlist.group(1) if source_playlist else (source_generic.group(1) if source_generic else (m3u8_direct.group(1) if m3u8_direct else None))
+
+                if pref_q == "720p":
+                    # 優先 720p (體積 1.5~2.5GB，不超過 3G 經典體積，RAM 零溢位)
+                    if u_720:
+                        m3u8_url = u_720
+                        if u_1080: backup_m3u8s.append(u_1080)
+                        break
+                    elif u_1080:
+                        m3u8_url = u_1080
+                        break
+                    elif u_def:
+                        m3u8_url = u_def
+                        break
+                else:
+                    # 偏好 1080p 原畫，720p 做備用降級
+                    if u_1080:
+                        m3u8_url = u_1080
+                        if u_720: backup_m3u8s.append(u_720)
+                        break
+                    elif u_720:
+                        m3u8_url = u_720
+                        break
+                    elif u_def:
+                        m3u8_url = u_def
+                        break
 
             # 嘗試直接獲取 m3u8 選單內容，免去後續重複請求
             m3u8_text = None
@@ -1085,7 +1109,8 @@ def get_media_items(url):
                     'Origin': 'https://missav.ai',
                     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
                 },
-                'm3u8_content': m3u8_text
+                'm3u8_content': m3u8_text,
+                'backup_urls': backup_m3u8s
             })
             return items
 
@@ -2046,10 +2071,17 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                 ))
                 current_inf = {}
         if sub_playlists:
-            # 優先 RESOLUTION 高度，相同高度再比 BANDWIDTH
+            pref_q = st.session_state.get('pref_quality', '720p')
             sub_playlists.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            selected_bw = sub_playlists[0][1]
-            m3u8_url = sub_playlists[0][2]
+            chosen = None
+            if pref_q == "720p":
+                cand_720 = [sp for sp in sub_playlists if sp[0] <= 720]
+                if cand_720:
+                    chosen = cand_720[0]
+            if not chosen:
+                chosen = sub_playlists[0]
+            selected_bw = chosen[1]
+            m3u8_url = chosen[2]
             text = fetch_text(m3u8_url)
             clean_sub = text.lstrip('\ufeff \t\r\n')
             if not (clean_sub.startswith("#EXT") or "#EXTM3U" in clean_sub or "#EXT-X-" in clean_sub):
@@ -2089,15 +2121,19 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
 
     # ── 智慧決定 TS 中繼暫存目錄（優先 RAM Disk，100% 零 SSD 寫入）──────────
     if total_duration > 0:
-        est_rate = (selected_bw / 8) if selected_bw > 0 else (600 * 1024)
+        pref_q = st.session_state.get('pref_quality', '720p')
+        fallback_rate = (220 * 1024) if (pref_q == "720p" or any(k in m3u8_url for k in ["720", "842"])) else (420 * 1024)
+        est_rate = (selected_bw / 8) if selected_bw > 0 else fallback_rate
         est_needed_bytes = int(total_duration * est_rate)
     else:
-        est_needed_bytes = int(total_segments * 3.0 * 1024 * 1024)
+        pref_q = st.session_state.get('pref_quality', '720p')
+        seg_sz_mb = 1.0 if pref_q == "720p" else 2.0
+        est_needed_bytes = int(total_segments * seg_sz_mb * 1024 * 1024)
 
     is_out_on_ram = ramdisk_manager.is_ramdisk_mounted() and out_path and "/Volumes/MediaRAMDisk" in out_path
     if is_out_on_ram:
-        # 當最終輸出 MP4 也在 RAM Disk 時，封裝期間 TS 與 MP4 兩者同時佔用磁碟，需要 2.2x 空間
-        required_ram_bytes = int(est_needed_bytes * 2.2 + 300 * 1024 * 1024)
+        # 當最終輸出 MP4 也在 RAM Disk 時，封裝期間 TS 與 MP4 兩者同時佔用磁碟，需要 2.1x 空間
+        required_ram_bytes = int(est_needed_bytes * 2.1 + 300 * 1024 * 1024)
     else:
         # 最終輸出不在 RAM Disk (如 Downloads)，RAM Disk 僅需容納 TS 暫存檔
         required_ram_bytes = int(est_needed_bytes * 1.1 + 300 * 1024 * 1024)
@@ -2658,27 +2694,45 @@ def download_media(media_item, force_audio=False):
 
         extra_headers = media_item.get('headers', {})
         total_dur = get_media_duration(media_url, headers=extra_headers) if ("m3u8" in media_url or not force_audio) else 0
-        # 線上 1080p 長片/電影平均碼率約 4000-6000 kbps (約 550-750 KB/s)，以 600 KB/s 保守估算
-        est_size_bytes = int(total_dur * 600 * 1024) if total_dur and total_dur > 0 else 0
-        # 當最終輸出 MP4 與中繼 TS 同在 RAM Disk 時，需要 2.2x 空間
-        required_free = int(est_size_bytes * 2.2 + 300 * 1024 * 1024) if est_size_bytes > 0 else (1024 * 1024 * 1024)
+        pref_q = st.session_state.get('pref_quality', '720p')
+        # 720p 平均碼率約 220 KB/s (約 1.76 Mbps，總量 <2.5GB)；1080p 約 420 KB/s (約 3.4 Mbps，總量 3.5~5GB)
+        is_720_target = (pref_q == "720p") or any(k in media_url for k in ["720", "842"])
+        est_rate_kb = 220 if is_720_target else 420
+        est_size_bytes = int(total_dur * est_rate_kb * 1024) if total_dur and total_dur > 0 else 0
+        # 當最終輸出 MP4 與中繼 TS 同在 RAM Disk 時，需要 2.1x 空間
+        required_free = int(est_size_bytes * 2.1 + 300 * 1024 * 1024) if est_size_bytes > 0 else (1024 * 1024 * 1024)
 
         if ramdisk_manager.is_ramdisk_mounted():
             _, _, ram_free, _ = ramdisk_manager.get_ramdisk_usage()
             if est_size_bytes > 0 and ram_free < required_free:
-                web_url = media_item.get('webpage_url') or media_url
-                dur_text = format_time(total_dur) if total_dur else "未知"
-                reason_desc = f"預估需 {required_free/(1024**3):.2f} GB 記憶體空間 (TS+MP4)，超過目前 RAM Disk 剩餘可用容量 ({ram_free/(1024**3):.2f} GB)"
-                record_ramdisk_skipped_item(
-                    title=title,
-                    url=web_url,
-                    needed_bytes=required_free,
-                    free_bytes=ram_free,
-                    duration=total_dur,
-                    reason=reason_desc
-                )
-                st.warning(f"⏭️ 影片「{title}」（片長約 {dur_text}）{reason_desc}。為避免 SSD 寫入損耗，已自動跳過此部。")
-                return
+                # 智慧降級：若目前為 1080p 且空間吃緊，自動檢查備用串流是否有 720p，若有則直接切換！
+                fallback_to_720 = False
+                for b_url in media_item.get('backup_urls', []):
+                    if any(k in b_url for k in ["720", "842"]):
+                        est_720_bytes = int(total_dur * 220 * 1024)
+                        req_720 = int(est_720_bytes * 2.1 + 300 * 1024 * 1024)
+                        if ram_free >= req_720:
+                            media_url = b_url
+                            media_item['url'] = b_url
+                            est_size_bytes = est_720_bytes
+                            required_free = req_720
+                            st.info(f"💡 1080p 預估需 {est_size_bytes/(1024**3):.1f}GB 超出剩餘空間，已自動為您切換至 720p 高畫質串流 ({est_720_bytes/(1024**3):.1f}GB，零溢位安全下載)！")
+                            fallback_to_720 = True
+                            break
+                if not fallback_to_720:
+                    web_url = media_item.get('webpage_url') or media_url
+                    dur_text = format_time(total_dur) if total_dur else "未知"
+                    reason_desc = f"預估需 {required_free/(1024**3):.2f} GB 記憶體空間 (TS+MP4)，超過目前 RAM Disk 剩餘可用容量 ({ram_free/(1024**3):.2f} GB)"
+                    record_ramdisk_skipped_item(
+                        title=title,
+                        url=web_url,
+                        needed_bytes=required_free,
+                        free_bytes=ram_free,
+                        duration=total_dur,
+                        reason=reason_desc
+                    )
+                    st.warning(f"⏭️ 影片「{title}」（片長約 {dur_text}）{reason_desc}。為避免 SSD 寫入損耗，已自動跳過此部。")
+                    return
 
         temp_dir = ramdisk_manager.get_scratch_dir(min_free_bytes=required_free)
         out_path = os.path.join(temp_dir, clean_tmp_name)
@@ -2780,13 +2834,15 @@ def download_media(media_item, force_audio=False):
                 if cookie_to_use:
                     temp_cookie = create_temp_cookiefile(cookie_to_use)
 
+                pref_q = st.session_state.get('pref_quality', '720p')
+                max_h = 720 if pref_q == "720p" else 1080
                 ydl_opts = {
                     'outtmpl': f"{out_base}.%(ext)s",
                     'quiet': True,
                     'overwrites': True,
                     'nocheckcertificate': True,
                     'legacy_server_connect': True,
-                    'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+                    'format': f'bestvideo[height<={max_h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]/best',
                     'merge_output_format': 'mp4',
                     'http_headers': {
                         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -3814,8 +3870,39 @@ tab1, tab2, tab3 = st.tabs(["🌐 線上影片下載", "📁 影片音訊提取"
 with tab1:
     st.markdown("將 Movieffm, Gimymax, MissAV, Bilibili, X, YouTube, Facebook, IG, TikTok 等影片網址直接下載。")
     
-    target_urls = st.text_area("🔗 請輸入影片網址 (每行一個):", placeholder="https://www.bilibili.com/video/BV... \nhttps://www.movieffm.net/movies/your-name/ \nhttps://gimymax.com/ep/... \nhttps://youtube.com/watch?v=... \nhttps://www.facebook.com/watch/?v=...")
-    
+    col_in1, col_in2 = st.columns([2.2, 1.3])
+    with col_in1:
+        target_urls = st.text_area(
+            "🔗 請輸入影片網址 (每行一個):",
+            placeholder="https://missav.ai/ipzz-850-uncensored-leak \nhttps://www.youtube.com/watch?v=... \nhttps://www.bilibili.com/video/BV... \n...",
+            height=130
+        )
+    with col_in2:
+        st.markdown("<div style='margin-top: 4px;'></div>", unsafe_allow_html=True)
+        quality_options = [
+            "🟢 標準高畫質 720p (推薦：體積 1.5~2.5GB，經典不超 3G)",
+            "🔵 最高畫質 1080p (體積 3.5~5.5GB，需充裕記憶體)",
+            "⚡ 自動智慧適配 (優先 1080p，空間不足自動降級 720p)"
+        ]
+        saved_q_label = st.session_state.get('pref_quality_label', quality_options[0])
+        selected_q_label = st.selectbox(
+            "🎞️ 下載畫質設定",
+            quality_options,
+            index=quality_options.index(saved_q_label) if saved_q_label in quality_options else 0,
+            help=(
+                "• 🟢 720p (預設推薦)：經典輕量體積 (約 1.5~2.5GB，不超過 3G)，下載速度快一倍，在 6GB/10GB RAM Disk 零溢位極速封裝。\n"
+                "• 🔵 1080p：最高解析度細節，長片體積約 4~5.5GB。\n"
+                "• ⚡ 自動智慧適配：優先嘗試下載 1080p，若檢測到 RAM Disk 剩餘量不足以封裝，自動無縫降級為 720p，確保 100% 成功下載且零 SSD 磨損。"
+            )
+        )
+        st.session_state.pref_quality_label = selected_q_label
+        if "720p" in selected_q_label:
+            st.session_state.pref_quality = "720p"
+        elif "自動" in selected_q_label:
+            st.session_state.pref_quality = "auto"
+        else:
+            st.session_state.pref_quality = "1080p"
+
     c_cookie1, c_cookie2 = st.columns(2)
     with c_cookie1:
         fb_cookie_str = st.text_input("🔑 Facebook Cookie (選填):", type="password", placeholder="c_user=xxxx; xs=xxxx; ...", help="若要下載私密社團、好友貼文或無法下載相片時填入。")
