@@ -413,14 +413,34 @@ def get_folder_link(folder_id):
 
 
 def find_existing_file(filename, folder_id):
-    """在目標資料夾中尋找同名檔案，回傳檔案資訊或 None。"""
+    """在目標資料夾中尋找同名檔案，回傳檔案資訊或 None (支援精確檔名與番號智慧查詢)。"""
     q = f"name = '{_q_escape(filename)}' and '{_q_escape(folder_id)}' in parents and trashed = false"
     res = execute_with_retry(lambda s: s.files().list(
         q=q, spaces='drive', fields='files(id, name, size, webViewLink)', pageSize=1,
         supportsAllDrives=True, includeItemsFromAllDrives=True,
     ))
     files = res.get('files', [])
-    return files[0] if files else None
+    if files:
+        return files[0]
+
+    # 番號前綴智慧備援比對 (例如 IPZZ-850, CAWD-676)
+    import re
+    code_m = re.search(r'([A-Za-z0-9]{2,10}-\d{2,6})', filename, re.IGNORECASE)
+    if code_m:
+        code = code_m.group(1).upper()
+        q_code = f"name contains '{_q_escape(code)}' and '{_q_escape(folder_id)}' in parents and trashed = false"
+        res_code = execute_with_retry(lambda s: s.files().list(
+            q=q_code, spaces='drive', fields='files(id, name, size, webViewLink)', pageSize=5,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ))
+        for f in res_code.get('files', []):
+            try:
+                # 確保為正常成品影片檔案 (大於 50MB)
+                if int(f.get('size', 0)) > 50 * 1024 * 1024:
+                    return f
+            except Exception:
+                pass
+    return None
 
 
 # ========================================================

@@ -2404,20 +2404,79 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     status_text.empty()
     return out_path
 
-def gdrive_precheck_exists(filename):
-    """雲端模式下載前先檢查目標資料夾是否已有同名檔案，有則顯示訊息並回傳 True。"""
-    if not st.session_state.get('gdrive_skip_dup', True):
-        return False
-    try:
-        folder_id = gdrive_service.resolve_target_folder_id()
-        existing = gdrive_service.find_existing_file(filename, folder_id)
-    except Exception:
-        return False
-    if existing:
-        _, label = gdrive_service.get_target_folder()
-        link = existing.get('webViewLink')
-        link_md = f" [🔗 開啟檔案]({link})" if link else ""
-        st.success(f"⏭️ 雲端 `{label}` 已存在，自動跳過: `{filename}`{link_md}")
+def check_any_target_file_exists(filename, title=""):
+    """
+    全方位檢查目標儲存位置是否已經存在該檔案 (支援精確匹配與番號智慧匹配)：
+    1. 本地下載目標資料夾 (download_dir)
+    2. Rclone 掛載目錄 (/Users/ericcheng/GDrive/Download, /Users/ericcheng/GDrive)
+    3. Google Drive 雲端目錄 (若使用雲端模式且已認證)
+    4. RAM Disk 與系統快顯暫存區中的就緒成品
+    """
+    import re
+    # 提取番號 (例如 IPZZ-850, CAWD-676)
+    code_match = re.search(r'([A-Za-z0-9]{2,10}-\d{2,6})', (filename or "") + " " + (title or ""), re.IGNORECASE)
+    code = code_match.group(1).upper() if code_match else None
+
+    # A. 搜尋本地與掛載目錄候選清單
+    configured_dir = st.session_state.get('download_dir', load_download_dir())
+    cand_dirs = [
+        configured_dir,
+        "/Users/ericcheng/GDrive/Download",
+        "/Users/ericcheng/GDrive",
+        os.path.expanduser("~/Downloads")
+    ]
+    seen_dirs = set()
+    unique_cand_dirs = []
+    for d in cand_dirs:
+        if d and d not in seen_dirs:
+            seen_dirs.add(d)
+            unique_cand_dirs.append(d)
+
+    for d in unique_cand_dirs:
+        if not (d and os.path.exists(d) and os.path.isdir(d)):
+            continue
+        try:
+            for f in os.listdir(d):
+                if f.startswith('.'):
+                    continue
+                f_path = os.path.join(d, f)
+                # 1. 精確比對檔名
+                if f == filename or f.replace('_', ' ') == filename.replace('_', ' '):
+                    if os.path.isfile(f_path) and os.path.getsize(f_path) > 1024 * 1024:
+                        return True, f"目錄 `{d}`", f_path
+                # 2. 番號前綴智慧比對
+                if code and f.upper().startswith(code) and any(f.lower().endswith(ext) for ext in ['.mp4', '.mkv', '.mov', '.ts']):
+                    if os.path.isfile(f_path):
+                        sz = os.path.getsize(f_path)
+                        if sz > 50 * 1024 * 1024:
+                            return True, f"目錄 `{d}` (番號 `{code}` 吻合，大小 {sz/1024/1024/1024:.2f}GB)", f_path
+        except Exception:
+            pass
+
+    # B. 若為 Google Drive 雲端模式且已授權，檢查雲端目標資料夾
+    is_gdrive_mode = st.session_state.get('storage_destination') == "gdrive_cloud"
+    if is_gdrive_mode and gdrive_service.is_authenticated():
+        try:
+            folder_id = gdrive_service.resolve_target_folder_id()
+            existing = gdrive_service.find_existing_file(filename, folder_id)
+            if existing:
+                _, label = gdrive_service.get_target_folder()
+                link = existing.get('webViewLink', '')
+                sz_bytes = int(existing.get('size', 0))
+                sz_str = f" ({sz_bytes/1024/1024/1024:.2f}GB)" if sz_bytes > 0 else ""
+                return True, f"Google Drive 雲端 `{label}`{sz_str}", link
+        except Exception:
+            pass
+
+    return False, "", ""
+
+
+def gdrive_precheck_exists(filename, title=""):
+    """雲端模式下載前檢查是否已有檔案，支援全覆蓋與番號智慧比對。"""
+    exists, where_desc, link = check_any_target_file_exists(filename, title=title)
+    if exists:
+        link_md = f" [🔗 開啟連結]({link})" if (link and link.startswith("http")) else ""
+        st.success(f"⏭️ **檔案已存在於 {where_desc}，自動跳過下載**: `{filename}`{link_md}")
         return True
     return False
 
@@ -2657,6 +2716,16 @@ def download_media(media_item, force_audio=False):
     
     filename = f"{title}.{ext}"
     is_gdrive = st.session_state.get('storage_destination') == "gdrive_cloud"
+
+    # 0. 第一時間全覆蓋檢查目標儲存位置是否已有同名或同番號檔案 (100% 避免重複下載)：
+    exists, where_desc, matched_loc = check_any_target_file_exists(filename, title=title)
+    if exists:
+        link_md = f" [🔗 開啟連結]({matched_loc})" if (matched_loc and matched_loc.startswith("http")) else ""
+        st.success(f"⏭️ **目標位置已存在同名/同番號檔案，自動跳過下載**: `{filename}`\n\n*(存在於: {where_desc})*{link_md}")
+        curr_proc_url = st.session_state.get('current_processing_url')
+        if curr_proc_url:
+            st.session_state[f"stage_{curr_proc_url}"] = "COMPLETED"
+        return
 
     # 1. 優先檢查是否有活躍的背景上傳任務（徹底防止使用者點擊按鈕時因 Rerun 重新進入下載流程）：
     active_task = gdrive_service.get_active_upload_task(filename)
