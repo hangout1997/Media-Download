@@ -34,6 +34,32 @@ _GLOBAL_HEADERS = {
 # ── 全域工作暫停/恢復事件（秒級釋放上/下行頻寬供線上會議等使用，單例持久化）────────────────
 _GLOBAL_PAUSE_EVENT = gdrive_service.get_pause_event()
 
+# ── 全域下載任務即時取消/中斷信號（防止刷新網頁遺留孤兒下載線程）───────────
+_DOWNLOAD_ABORT_EVENT = threading.Event()
+_ACTIVE_DOWNLOAD_LOCK = threading.Lock()
+_ACTIVE_DOWNLOAD_INFO = {"active": False, "title": "", "time": 0}
+
+
+def abort_active_download():
+    """強制秒級中斷當前所有正在進行的切片下載、轉檔與封裝。"""
+    _DOWNLOAD_ABORT_EVENT.set()
+    with _ACTIVE_DOWNLOAD_LOCK:
+        _ACTIVE_DOWNLOAD_INFO["active"] = False
+        _ACTIVE_DOWNLOAD_INFO["title"] = ""
+    # 若處於暫停狀態一併喚醒，避免線程卡死在 pause wait()
+    if not _GLOBAL_PAUSE_EVENT.is_set():
+        _GLOBAL_PAUSE_EVENT.set()
+    # 取消所有雲端上傳
+    try:
+        gdrive_service.cancel_all_upload_tasks()
+    except Exception:
+        pass
+    # 徹底清除 RAM Disk 上的未完成暫存
+    try:
+        ramdisk_manager.clean_scratch_files(preserve_mp4=False)
+    except Exception:
+        pass
+
 
 def is_work_paused():
     return gdrive_service.is_work_paused()
@@ -50,6 +76,7 @@ def resume_work_callback():
 
 
 def skip_current_video_callback(next_idx):
+    abort_active_download()
     gdrive_service.resume_all_work()
     st.session_state.is_batch_paused = False
 
@@ -77,6 +104,7 @@ def skip_current_video_callback(next_idx):
 
 
 def stop_all_batch_callback():
+    abort_active_download()
     gdrive_service.resume_all_work()
     st.session_state.is_batch_paused = False
     gdrive_service.cancel_all_upload_tasks()
@@ -1791,6 +1819,12 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     """平行 HLS 下載引擎（全量 RAM 模式：24G RAM，最大化速度，零磁碟 I/O，自動過濾賭博貼片廣告）。"""
     from curl_cffi import requests as curl_requests
 
+    _DOWNLOAD_ABORT_EVENT.clear()
+    with _ACTIVE_DOWNLOAD_LOCK:
+        _ACTIVE_DOWNLOAD_INFO["active"] = True
+        _ACTIVE_DOWNLOAD_INFO["title"] = label
+        _ACTIVE_DOWNLOAD_INFO["time"] = time.time()
+
     req_headers = dict(_GLOBAL_HEADERS)
     if extra_headers:
         req_headers.update(extra_headers)
@@ -1934,12 +1968,20 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
     seg_fail_sample = []
 
     def download_segment(args):
+        if _DOWNLOAD_ABORT_EVENT.is_set():
+            return -1, b""
         # 支援頻寬暫停（使用者隨時暫停/恢復下載，立即釋出頻寬供會議使用）
         _GLOBAL_PAUSE_EVENT.wait()
+        if _DOWNLOAD_ABORT_EVENT.is_set():
+            return -1, b""
         idx, seg_url = args
         for attempt in range(3):
+            if _DOWNLOAD_ABORT_EVENT.is_set():
+                return -1, b""
             # 重試前亦檢查暫停狀態
             _GLOBAL_PAUSE_EVENT.wait()
+            if _DOWNLOAD_ABORT_EVENT.is_set():
+                return -1, b""
             if is_cf_protected:
                 try:
                     r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
@@ -1984,7 +2026,16 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             futures = {executor.submit(download_segment, (i, url)): i
                        for i, url in enumerate(segment_urls)}
             for f in as_completed(futures):
+                if _DOWNLOAD_ABORT_EVENT.is_set():
+                    for rem_f in futures:
+                        rem_f.cancel()
+                    raise InterruptedError("下載任務已由使用者強制中斷。")
+
                 idx, content = f.result()
+                if _DOWNLOAD_ABORT_EVENT.is_set():
+                    for rem_f in futures:
+                        rem_f.cancel()
+                    raise InterruptedError("下載任務已由使用者強制中斷。")
                 completed += 1
                 completed_duration += segment_durations[idx]
                 content_len = len(content)
@@ -2043,6 +2094,9 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         tmp_ts = None
         pending_segments.clear()
 
+        if _DOWNLOAD_ABORT_EVENT.is_set():
+            raise InterruptedError("下載任務已由使用者強制中斷。")
+
         if total_segments > 0 and valid_count < total_segments * 0.7:
             fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
             raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
@@ -2094,6 +2148,9 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
         gc.collect()
 
     finally:
+        with _ACTIVE_DOWNLOAD_LOCK:
+            _ACTIVE_DOWNLOAD_INFO["active"] = False
+            _ACTIVE_DOWNLOAD_INFO["title"] = ""
         if tmp_ts:
             try:
                 tmp_ts.close()
@@ -3491,6 +3548,7 @@ with col_res1:
 with col_res2:
     if st.button("♻️ 釋放所有資源並關閉", type="primary", use_container_width=True):
         with st.spinner("正在釋放系統資源與關閉程式中..."):
+            abort_active_download()
             ramdisk_manager.unmount_ramdisk()
             info = release_resources()
             for msg in info:
@@ -3501,6 +3559,21 @@ with col_res2:
             import signal
             time.sleep(1.2)
             os.kill(os.getpid(), signal.SIGTERM)
+
+# ── 孤兒背景下載任務監控與緊急停止 ───────────────────────────────────────
+if _ACTIVE_DOWNLOAD_INFO.get("active"):
+    st.error(
+        f"🚨 **偵測到後台目前有正在執行的下載任務**：`{_ACTIVE_DOWNLOAD_INFO.get('title', '未知影片')}`\n\n"
+        f"*(若您剛剛重新整理了網頁，後台多線程可能仍在繼續下載佔用頻寬與記憶體)*"
+    )
+    col_ab1, col_ab2 = st.columns([3, 1.2])
+    with col_ab1:
+        st.caption("💡 點擊右側按鈕可發送即時中斷信號，秒級銷毀下載線程並清理暫存空間。")
+    with col_ab2:
+        if st.button("🛑 強制停止背景下載", type="primary", use_container_width=True, key="abort_orphan_task_btn"):
+            abort_active_download()
+            st.session_state.pending_toast = ("🛑 已強制終止背景下載任務並清除暫存！", "🛑")
+            st.rerun()
 
 st.divider()
 
