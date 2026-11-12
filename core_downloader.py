@@ -20,6 +20,7 @@ import tempfile
 import gc
 import traceback
 import urllib.parse
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import yt_dlp
 
@@ -316,6 +317,35 @@ def check_m3u8_accessible(m3u8_url, headers=None, timeout=3.0):
     return False
 
 
+def _decode_movieffm_url(raw_u):
+    """解碼 Movieffm/Mvffm 加密串流網址 (支援 Base64、Urlencode 與原生 HTTP 網址)"""
+    if not raw_u or not isinstance(raw_u, str):
+        return ""
+    u = raw_u.strip().replace(r'\/', '/')
+    if u.startswith(('http://', 'https://')):
+        return u
+    try:
+        pad = len(u) % 4
+        padded = u + ('=' * (4 - pad) if pad else '')
+        b = base64.b64decode(padded)
+        dec = urllib.parse.unquote(b.decode('utf-8', errors='ignore'))
+        if dec.startswith(('http://', 'https://')):
+            return dec
+    except Exception:
+        pass
+    try:
+        u_unq = urllib.parse.unquote(u)
+        pad = len(u_unq) % 4
+        padded = u_unq + ('=' * (4 - pad) if pad else '')
+        b = base64.b64decode(padded)
+        dec = urllib.parse.unquote(b.decode('utf-8', errors='ignore'))
+        if dec.startswith(('http://', 'https://')):
+            return dec
+    except Exception:
+        pass
+    return u
+
+
 def get_media_items(url, cookies=None):
     url = normalize_input_url(url)
     items = []
@@ -371,11 +401,25 @@ def get_media_items(url, cookies=None):
         items = []
         
         # 策略 A: 解析 videourls JSON 陣列
-        match = re.search(r'videourls\s*:\s*(\[\s*(?:\[.*?\]|\{.*?\})\s*\])', html_content, re.DOTALL)
+        match = re.search(r'videourls\s*[:=]\s*(\[\s*(?:\[.*?\]|\{.*?\})\s*\])', html_content, re.DOTALL)
         if match:
             try:
                 clean_json = match.group(1).replace(r'\/', '/')
                 data = json.loads(clean_json)
+
+                # 全域解碼所有 videourls 中的加密 URL (相容 Movieffm 最新 Base64/Urlencode 加密)
+                def _normalize_entry_url(ent):
+                    if isinstance(ent, dict) and "url" in ent:
+                        ent["url"] = _decode_movieffm_url(ent.get("url"))
+                    return ent
+
+                if isinstance(data, list):
+                    for sub in data:
+                        if isinstance(sub, list):
+                            for it in sub:
+                                _normalize_entry_url(it)
+                        elif isinstance(sub, dict):
+                            _normalize_entry_url(sub)
                 
                 # 情況 1: 2D 陣列 (電視劇 / 連續劇，外層是多條播放來源線路 FLV 1, FLV 2..., 內層是該線路下的各集)
                 if len(data) > 0 and isinstance(data[0], list):
@@ -533,6 +577,11 @@ def get_media_items(url, cookies=None):
                                 chosen_movie_url = cand_url
                                 break
 
+                    # 若檢測仍然皆未回應，但已有候選網址，則直接採用候選首選並附帶備援（避免過於嚴格的探測阻擋下載）
+                    if not chosen_movie_url and valid_candidates:
+                        chosen_movie_url = valid_candidates[0]
+                        backup_movie_urls = [c for c in valid_candidates[1:] if c != chosen_movie_url]
+
                     if chosen_movie_url:
                         items.append({
                             'url': chosen_movie_url,
@@ -548,7 +597,7 @@ def get_media_items(url, cookies=None):
             except Exception as e:
                 print(f"Error parsing Movieffm videourls: {e}")
 
-        # 策略 B: 正規表達式全局搜尋 m3u8 作為備援
+        # 策略 B: 正規表達式全局搜尋 m3u8 作為備援 (包含明文與 Base64 串流字串)
         if not items:
             m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html_content)
             for m_url in m3u8_matches:
@@ -565,6 +614,24 @@ def get_media_items(url, cookies=None):
                         }
                     })
                     break
+
+        if not items:
+            b64_cands = re.findall(r'["\']([a-zA-Z0-9+/=]{20,})["\']', html_content)
+            for cand in b64_cands:
+                dec_u = _decode_movieffm_url(cand)
+                if dec_u and dec_u.startswith(('http://', 'https://')) and '.m3u8' in dec_u:
+                    if check_m3u8_accessible(dec_u, headers=headers):
+                        items.append({
+                            'url': dec_u,
+                            'title': title,
+                            'ext': 'mp4',
+                            'type': 'video',
+                            'headers': {
+                                'Referer': url,
+                                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+                            }
+                        })
+                        break
 
         if not items:
             raise ValueError("無法從 Movieffm 頁面中解析出有效的影片串流網址 (m3u8)。所有提供之播放線路均無法連線或伺服器已失效。")

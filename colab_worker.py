@@ -180,12 +180,19 @@ def run():
 
             # 優先使用 Mac 本地預解析串流 (100% 免疫雲端被 WAF/Cloudflare 403 阻擋)
             items = None
-            if raw_url in resolved_map:
-                items = resolved_map[raw_url]
-                print("⚡ 使用本機預解析串流 (成功免疫 Cloudflare 403 阻擋)")
-            elif url in resolved_map:
-                items = resolved_map[url]
-                print("⚡ 使用本機預解析串流 (成功免疫 Cloudflare 403 阻擋)")
+            cand_keys = [
+                raw_url,
+                url,
+                raw_url.rstrip('/'),
+                raw_url.rstrip('/') + '/',
+                url.rstrip('/'),
+                url.rstrip('/') + '/'
+            ]
+            for ck in cand_keys:
+                if ck in resolved_map:
+                    items = resolved_map[ck]
+                    print(f"⚡ 使用本機預解析串流 (匹配 key: {ck}) (成功免疫 Cloudflare 403 阻擋)")
+                    break
 
             if not items:
                 try:

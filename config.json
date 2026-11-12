@@ -1,6 +1,6 @@
 {
   "download_dir": "/Users/ericcheng/Downloads/Video downloads",
-  "storage_destination": "gdrive_cloud",
+  "storage_destination": "colab_cloud",
   "gdrive_skip_duplicates": true,
   "gdrive_folder_id": null,
   "gdrive_folder_label": "/Download/"
