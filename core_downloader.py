@@ -1895,7 +1895,7 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
             fail_diag = f" (切片連線回傳: {'; '.join(seg_fail_sample)})" if seg_fail_sample else ""
             raise ValueError(f"切片下載成功率不足 (成功 {valid_count}/{total_segments})，來源伺服器防護阻擋了切片連線{fail_diag}。")
 
-        # ── 封裝前空間防護 (Zero-ENOSPC Safe Guard: 零 SSD 磨損原則) ──────────────────────────
+        # ── 封裝前空間防護 (Zero-ENOSPC Safe Guard: 零 SSD 磨損原則，僅在具備 ramdisk_manager 之 Mac 本地環境生效) ──────
         actual_ts_size = os.path.getsize(tmp_ts_path) if (tmp_ts_path and os.path.exists(tmp_ts_path)) else 0
         try:
             import ramdisk_manager
@@ -1905,8 +1905,12 @@ def download_fast_parallel_hls(m3u8_url, out_path=None, extra_headers=None, max_
                 needed_output_space = actual_ts_size + 250 * 1024 * 1024
                 if free_ram < needed_output_space:
                     raise ValueError(f"RAM Disk 容量不足以封裝輸出 MP4 (實際切片 {actual_ts_size/1024/1024/1024:.2f} GB，剩餘僅 {free_ram/1024/1024/1024:.2f} GB)，為保護 SSD 零磨損已自動安全跳過。")
-        except Exception:
+        except (ImportError, ModuleNotFoundError):
+            pass
+        except ValueError:
             raise
+        except Exception:
+            pass
 
         ffmpeg_cmd = [
             "ffmpeg", "-y",

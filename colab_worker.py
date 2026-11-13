@@ -18,6 +18,22 @@ import shutil
 import re
 import traceback
 
+# 初始化虛擬 ramdisk_manager (免除雲端 Linux/Colab 環境缺失 macOS 本地模組之例外)
+if 'ramdisk_manager' not in sys.modules:
+    try:
+        import ramdisk_manager
+    except Exception:
+        import types
+        import tempfile
+        _dummy_ram = types.ModuleType('ramdisk_manager')
+        _dummy_ram.is_ramdisk_mounted = lambda: False
+        _dummy_ram.get_scratch_dir = lambda min_free_bytes=0: tempfile.gettempdir()
+        _dummy_ram.get_ramdisk_usage = lambda: (0, 0, 0, 0)
+        _dummy_ram.clean_scratch_files = lambda *a, **kw: None
+        _dummy_ram.clean_all_ramdisk_files = lambda: 0
+        _dummy_ram.MOUNT_POINT = '/Volumes/MediaRAMDisk'
+        sys.modules['ramdisk_manager'] = _dummy_ram
+
 def get_drive_base():
     candidates = ['/content/drive/MyDrive', '/content/drive/我的雲端硬碟']
     for c in candidates:
