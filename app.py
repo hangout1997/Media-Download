@@ -523,32 +523,150 @@ def choose_folder_dialog(current_dir):
 
     return None
 
-def create_temp_cookiefile(fb_cookie_str):
-    if not fb_cookie_str:
+def create_temp_cookiefile(cookie_str, domain=".facebook.com"):
+    if not cookie_str or not str(cookie_str).strip():
         return None
     import tempfile
     import os
-    # Parse cookies
+    raw = str(cookie_str).strip()
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="ytdlp_cookies_")
+
+    # 若使用者直接貼上 Netscape cookies.txt 格式，原樣寫入
+    if "# Netscape HTTP Cookie File" in raw or any(line.count("\t") >= 6 for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")):
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            if "# Netscape HTTP Cookie File" not in raw:
+                f.write("# Netscape HTTP Cookie File\n")
+            f.write(raw + "\n")
+        return path
+
+    # Parse semicolon-separated Cookie header string
     cookie_dict = {}
-    items = fb_cookie_str.split(';')
-    for item in items:
+    for item in raw.split(';'):
         item = item.strip()
         if not item:
             continue
         parts = item.split('=', 1)
         if len(parts) == 2:
             cookie_dict[parts[0].strip()] = parts[1].strip()
-            
+
     if not cookie_dict:
+        os.close(fd)
+        try:
+            os.remove(path)
+        except Exception:
+            pass
         return None
-        
-    fd, path = tempfile.mkstemp(suffix=".txt", prefix="fb_cookies_")
+
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
         f.write("# Netscape HTTP Cookie File\n")
         f.write("# This file is generated automatically by Media Downloader\n")
         for k, v in cookie_dict.items():
-            f.write(f".facebook.com\tTRUE\t/\tTRUE\t0\t{k}\t{v}\n")
+            f.write(f"{domain}\tTRUE\t/\tTRUE\t0\t{k}\t{v}\n")
     return path
+
+
+def _is_youtube_url(url_str):
+    u = (url_str or "").lower()
+    return any(d in u for d in ["youtube.com", "youtu.be", "googlevideo.com"])
+
+
+def run_ytdlp_with_youtube_auth(target_url, base_opts, action_fn):
+    """
+    執行 yt-dlp 操作，針對 YouTube「Sign in to confirm you're not a bot」驗證阻擋，
+    依使用者設定或自動讀取本機瀏覽器 Cookies (Chrome/Brave/Edge/Firefox/Safari) 重試。
+    """
+    import copy
+    import yt_dlp
+
+    if not _is_youtube_url(target_url):
+        with yt_dlp.YoutubeDL(base_opts) as ydl:
+            return action_fn(ydl)
+
+    auth_mode = st.session_state.get('yt_auth_mode', 'auto')
+    yt_cookie_str = (st.session_state.get('yt_cookie') or '').strip()
+
+    def _run_with_opts(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return action_fn(ydl)
+
+    def _opts_with_cookies(browser=None, cookiefile_path=None):
+        o = copy.deepcopy(base_opts)
+        # 帶入 Cookies 時移除強制 android/ios client，讓 yt-dlp 使用支援 cookies 的預設/web client
+        if 'extractor_args' in o and 'youtube' in o['extractor_args']:
+            o['extractor_args'] = copy.deepcopy(o['extractor_args'])
+            o['extractor_args'].pop('youtube', None)
+            if not o['extractor_args']:
+                o.pop('extractor_args', None)
+        if browser:
+            o['cookiesfrombrowser'] = (browser,)
+        if cookiefile_path:
+            o['cookiefile'] = cookiefile_path
+        return o
+
+    # 1. 手動 Cookie 模式
+    if auth_mode == 'cookie':
+        if not yt_cookie_str:
+            raise ValueError("您已選擇「手動貼上 YouTube Cookie」，但尚未填入 Cookie 內容。")
+        cf = create_temp_cookiefile(yt_cookie_str, domain=".youtube.com")
+        try:
+            return _run_with_opts(_opts_with_cookies(cookiefile_path=cf))
+        finally:
+            if cf and os.path.exists(cf):
+                try:
+                    os.remove(cf)
+                except Exception:
+                    pass
+
+    # 2. 指定本機瀏覽器模式
+    if auth_mode in ('chrome', 'safari', 'edge', 'firefox', 'brave'):
+        return _run_with_opts(_opts_with_cookies(browser=auth_mode))
+
+    # 3. 自動模式：若本輪已有成功過的瀏覽器，優先直接帶入；否則先裸連，遇到 bot 驗證再依序嘗試本機瀏覽器
+    cached_browser = st.session_state.get('yt_auto_detected_browser')
+    if cached_browser:
+        try:
+            return _run_with_opts(_opts_with_cookies(browser=cached_browser))
+        except Exception:
+            st.session_state.pop('yt_auto_detected_browser', None)
+
+    try:
+        return _run_with_opts(base_opts)
+    except Exception as first_err:
+        err_lower = str(first_err).lower()
+        if not any(k in err_lower for k in ["not a bot", "sign in to confirm", "confirm you’re not a bot", "confirm you're not a bot"]):
+            raise
+
+        # 若有填手動 YouTube Cookie，優先用它重試
+        if yt_cookie_str:
+            cf = create_temp_cookiefile(yt_cookie_str, domain=".youtube.com")
+            try:
+                return _run_with_opts(_opts_with_cookies(cookiefile_path=cf))
+            except Exception:
+                pass
+            finally:
+                if cf and os.path.exists(cf):
+                    try:
+                        os.remove(cf)
+                    except Exception:
+                        pass
+
+        # 依序嘗試本機已登入 YouTube 的瀏覽器
+        browser_errors = []
+        for browser in ('chrome', 'brave', 'edge', 'firefox', 'safari'):
+            try:
+                res = _run_with_opts(_opts_with_cookies(browser=browser))
+                st.session_state['yt_auto_detected_browser'] = browser
+                return res
+            except Exception as b_err:
+                browser_errors.append(f"{browser}: {b_err}")
+
+        raise ValueError(
+            "YouTube 要求登入驗證（Sign in to confirm you're not a bot），且自動讀取本機瀏覽器 Cookie 未成功。\n\n"
+            "💡 **解決方式（擇一）**：\n"
+            "1. 確認您已在 **Chrome / Safari / Edge / Firefox** 登入 YouTube，並在上方「🔑 YouTube 驗證」選擇該瀏覽器（若跳出 macOS 鑰匙圈授權視窗請按「允許」）。\n"
+            "2. 或在「🔑 YouTube 驗證」選擇「手動貼上 Cookie」，貼入瀏覽器匯出的 `cookies.txt` 內容。\n\n"
+            f"嘗試瀏覽器紀錄: {' | '.join(browser_errors[:3])}"
+        )
 
 def cn_to_an(cn_str):
     if cn_str.isdigit():
@@ -1510,9 +1628,8 @@ def get_media_items(url):
             
         try:
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    
+                info = run_ytdlp_with_youtube_auth(url, ydl_opts, lambda ydl: ydl.extract_info(url, download=False))
+                if True:
                     # 處理可能的多個 entry (例如 Instagram Carousel 或 YouTube 播放清單)
                     entries = info.get('entries', [info])
                     
@@ -3095,8 +3212,7 @@ def download_media(media_item, force_audio=False):
                     ydl_opts['http_headers']['Referer'] = 'https://www.bilibili.com/'
 
                 with st.spinner(f"⏳ 正在透過 yt-dlp 下載 {platform_name} 1080p 高清影片..."):
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([target_url])
+                    run_ytdlp_with_youtube_auth(target_url, ydl_opts, lambda ydl: ydl.download([target_url]))
 
                 actual_out = None
                 if os.path.exists(out_path):
@@ -3424,8 +3540,7 @@ def extract_local_audio(video_path, audio_format, title=None, headers=None):
                 ydl_opts['http_headers']['Referer'] = 'https://www.bilibili.com/'
 
             with st.spinner("⏳ 正在透過 yt-dlp 從線上網址提取高品質音訊..."):
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([video_path])
+                run_ytdlp_with_youtube_auth(video_path, ydl_opts, lambda ydl: ydl.download([video_path]))
             
             matched_file = None
             if os.path.exists(expected_out_path):
@@ -4152,6 +4267,40 @@ with tab1:
     with c_cookie2:
         bili_cookie_str = st.text_input("🔑 Bilibili Cookie (選填):", type="password", placeholder="SESSDATA=xxxx; buvid3=xxxx; ...", help="若下載 Bilibili 遇 412 風控限制、番劇或需大會員/高畫質時填入。")
         st.session_state.bili_cookie = bili_cookie_str
+
+    yt_auth_labels = {
+        "auto": "🤖 自動 (遇 Bot 驗證時自動讀取本機 Chrome/瀏覽器)",
+        "chrome": "🌐 本機 Chrome 登入狀態 (推薦)",
+        "safari": "🧭 本機 Safari 登入狀態",
+        "edge": "🔷 本機 Edge 登入狀態",
+        "firefox": "🦊 本機 Firefox 登入狀態",
+        "brave": "🦁 本機 Brave 登入狀態",
+        "cookie": "📝 手動貼上 YouTube Cookie / cookies.txt",
+    }
+    yt_auth_keys = list(yt_auth_labels.keys())
+    c_yt1, c_yt2 = st.columns([1.2, 1.8])
+    with c_yt1:
+        cur_yt_mode = st.session_state.get("yt_auth_mode", "auto")
+        cur_yt_idx = yt_auth_keys.index(cur_yt_mode) if cur_yt_mode in yt_auth_keys else 0
+        sel_yt_mode = st.selectbox(
+            "🔑 YouTube 驗證 (解決 Bot 阻擋):",
+            options=yt_auth_keys,
+            index=cur_yt_idx,
+            format_func=lambda k: yt_auth_labels[k],
+            help="當 YouTube 回報 'Sign in to confirm you're not a bot' 時，自動或指定讀取您本機瀏覽器已登入的 YouTube Cookie。"
+        )
+        st.session_state.yt_auth_mode = sel_yt_mode
+    with c_yt2:
+        if sel_yt_mode == "cookie":
+            yt_cookie_input = st.text_area(
+                "📋 貼上 YouTube Cookie (支援瀏覽器匯出之 Netscape cookies.txt 或 Cookie 字串):",
+                value=st.session_state.get("yt_cookie", ""),
+                height=68,
+                placeholder="# Netscape HTTP Cookie File ... 或 SAPISID=...; SID=..."
+            )
+            st.session_state.yt_cookie = yt_cookie_input
+        else:
+            st.caption("💡 若選擇自動或本機瀏覽器，遇 YouTube Bot 驗證時會直接沿用您瀏覽器已登入的帳號（首次讀取 Chrome 可能跳出 macOS 鑰匙圈授權，請點「允許」）。")
     
     # 即時計算目前已輸入的有效網址數量
     current_urls = [url.strip() for url in target_urls.split('\n') if url.strip()]
@@ -4442,8 +4591,8 @@ with tab2:
             
             try:
                 with st.spinner("🔍 正在解析線上網址/播放清單..."):
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(input_path, download=False)
+                    info = run_ytdlp_with_youtube_auth(input_path, ydl_opts, lambda ydl: ydl.extract_info(input_path, download=False))
+                    if True:
                         if 'entries' in info:
                             for entry in info['entries']:
                                 if not entry:
