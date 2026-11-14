@@ -166,15 +166,15 @@ def unpack_dean_packer(packed_js):
     return packed_code
 
 def normalize_input_url(url_str):
-    url_str = url_str.strip()
+    url_str = url_str.strip().strip("'\"").strip("`").strip()
     if not url_str:
         return url_str
     if url_str.startswith("http://") or url_str.startswith("https://"):
         return url_str
     if os.path.exists(url_str):
         return url_str
-    # 若包含常見影音平台網域但漏填 https:// (例如 missav.ai/..., youtube.com/...)
-    if any(domain in url_str.lower() for domain in [".com", ".ai", ".tv", ".ws", ".net", ".org", ".me", ".co", "youtube", "facebook", "instagram", "tiktok", "twitter", "missav", "movieffm", "mvffm"]):
+    # 若包含常見影音平台網域但漏填 https:// (例如 missav.ai/..., youtube.com/..., youtu.be/...)
+    if any(domain in url_str.lower() for domain in [".com", ".ai", ".tv", ".ws", ".net", ".org", ".me", ".co", ".be", "youtube", "youtu.be", "facebook", "instagram", "tiktok", "twitter", "missav", "movieffm", "mvffm"]):
         return "https://" + url_str.lstrip('/')
     # 若輸入的是 MissAV / 平台番號與代碼 (例如 JD-054791cdbc62ac51e7c79c59f86b72960)
     if re.match(r'^[a-zA-Z0-9\-_]{5,}$', url_str):

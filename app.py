@@ -135,13 +135,17 @@ def stop_all_batch_callback():
                 pass
     skipped = st.session_state.get('skipped_ramdisk_files', [])
     success = st.session_state.get('successful_downloads', [])
+    failed = st.session_state.get('failed_downloads', [])
+    skipped_existing = st.session_state.get('skipped_existing_files', [])
     queue = st.session_state.get('video_batch_queue', [])
-    total_tasks = len(queue) if queue else (len(skipped) + len(success))
-    if skipped or success:
+    total_tasks = len(queue) if queue else (len(skipped) + len(success) + len(failed) + len(skipped_existing))
+    if skipped or success or failed or skipped_existing:
         st.session_state.last_batch_summary = {
             "total_count": total_tasks,
             "skipped_items": list(skipped),
             "success_items": list(success),
+            "failed_items": list(failed),
+            "skipped_existing_items": list(skipped_existing),
             "stopped_early": True
         }
     st.session_state.is_video_batch_running = False
@@ -218,8 +222,43 @@ def record_successful_download(title, filename, out_path, is_gdrive=False):
     })
 
 
+def record_failed_download(url, title="", reason=""):
+    """記錄下載失敗的網址與錯誤原因，避免被 st.rerun() 洗掉後誤報全數成功"""
+    if "failed_downloads" not in st.session_state:
+        st.session_state.failed_downloads = []
+
+    for item in st.session_state.failed_downloads:
+        if url and item.get("url") == url and item.get("reason") == reason:
+            return
+
+    st.session_state.failed_downloads.append({
+        "title": title or url or "未知項目",
+        "url": url or "",
+        "reason": reason or "未知錯誤",
+        "time": time.strftime("%H:%M:%S")
+    })
+
+
+def record_skipped_existing_item(url, filename, where_desc="", matched_loc=""):
+    """記錄因目標位置或跨資料夾已存在同名檔案而自動跳過的項目"""
+    if "skipped_existing_files" not in st.session_state:
+        st.session_state.skipped_existing_files = []
+
+    for item in st.session_state.skipped_existing_files:
+        if item.get("filename") == filename:
+            return
+
+    st.session_state.skipped_existing_files.append({
+        "filename": filename,
+        "url": url or "",
+        "where_desc": where_desc or "目標資料夾",
+        "matched_loc": matched_loc or "",
+        "time": time.strftime("%H:%M:%S")
+    })
+
+
 def render_download_summary_report(summary_data=None):
-    """渲染下載任務結束總結報告（詳細列出成功清單與因 RAM Disk 空間不足安全跳過的清單）"""
+    """渲染下載任務結束總結報告（詳細列出成功、失敗、已存在跳過與 RAM Disk 容量不足跳過清單）"""
     if not summary_data:
         summary_data = st.session_state.get('last_batch_summary')
     if not summary_data:
@@ -227,29 +266,71 @@ def render_download_summary_report(summary_data=None):
 
     skipped_items = summary_data.get('skipped_items', [])
     success_items = summary_data.get('success_items', [])
-    total_count = summary_data.get('total_count', len(skipped_items) + len(success_items))
+    failed_items = summary_data.get('failed_items', [])
+    skipped_existing_items = summary_data.get('skipped_existing_items', [])
+    total_count = summary_data.get('total_count', len(skipped_items) + len(success_items) + len(failed_items) + len(skipped_existing_items))
     stopped_early = summary_data.get('stopped_early', False)
 
     with st.container(border=True):
         st.markdown("### 📋 下載任務結束總結報告")
         if stopped_early:
             st.info(f"⏹️ **任務已由使用者手動停止**。共規劃 `{total_count}` 部影片，已處理進度摘要如下：")
-        elif skipped_items:
+        elif failed_items:
+            st.error(
+                f"❌ **下載任務結束，但有 `{len(failed_items)}` 部影片失敗！** 本次共處理 `{total_count}` 部影片："
+                f"成功 **{len(success_items)} 部**、失敗 **{len(failed_items)} 部**"
+                + (f"、已存在跳過 **{len(skipped_existing_items)} 部**" if skipped_existing_items else "")
+                + (f"、RAM Disk 跳過 **{len(skipped_items)} 部**" if skipped_items else "")
+                + "。"
+            )
+        elif skipped_items or skipped_existing_items:
             st.warning(
                 f"⚠️ **下載任務已全部處理完畢！** 本次共處理 `{total_count}` 部影片，"
-                f"其中 **{len(success_items)} 部成功**，**{len(skipped_items)} 部因 RAM Disk 容量不足已自動跳過**（100% 保障 SSD 零磨損）。"
+                f"其中 **{len(success_items)} 部成功**"
+                + (f"、**{len(skipped_existing_items)} 部因已存在自動跳過**" if skipped_existing_items else "")
+                + (f"、**{len(skipped_items)} 部因 RAM Disk 容量不足已自動跳過**" if skipped_items else "")
+                + "。"
             )
+        elif len(success_items) > 0:
+            is_local = st.session_state.get('storage_destination', 'local') == 'local'
+            mode_note = "已儲存至本機指定資料夾" if is_local else "100% 透過 RAM Disk 零硬碟讀寫封裝完畢"
+            st.success(f"🎉 **本次任務全數成功完成！** 共 `{len(success_items)}` 部影片，{mode_note}。")
         else:
-            st.success(f"🎉 **本次任務全數成功完成！** 共 `{total_count}` 部影片，100% 透過 RAM Disk 零硬碟讀寫封裝完畢。")
+            st.warning(f"⚠️ **任務已結束，但沒有任何檔案被下載或儲存**（共處理 `{total_count}` 個項目）。請檢查輸入網址或上方設定。")
 
-        # 頂部三指標
-        m_c1, m_c2, m_c3 = st.columns(3)
+        # 頂部指標
+        m_c1, m_c2, m_c3, m_c4 = st.columns(4)
         with m_c1:
             st.metric("處理任務總數", f"{total_count} 部")
         with m_c2:
             st.metric("✅ 成功完成", f"{len(success_items)} 部")
         with m_c3:
-            st.metric("⏭️ 容量不足跳過", f"{len(skipped_items)} 部", delta=f"-{len(skipped_items)}" if skipped_items else "0", delta_color="inverse")
+            st.metric("❌ 下載失敗", f"{len(failed_items)} 部")
+        with m_c4:
+            st.metric("⏭️ 跳過 (已存在/容量)", f"{len(skipped_existing_items) + len(skipped_items)} 部")
+
+        # ❌ 失敗詳細清單
+        if failed_items:
+            st.divider()
+            st.markdown("#### ❌ 下載失敗項目與錯誤原因")
+            for f_i, f_item in enumerate(failed_items, 1):
+                with st.expander(f"#{f_i} ❌ {f_item.get('title', '未知項目')}", expanded=True):
+                    if f_item.get('url'):
+                        st.markdown(f"**🔗 來源網址**: `{f_item.get('url')}`")
+                    st.code(f_item.get('reason', '未知錯誤'), language="text")
+
+            failed_urls = [it.get('url') for it in failed_items if it.get('url')]
+            if failed_urls:
+                st.markdown("**📋 快速複製失敗的網址**：")
+                st.code("\n".join(failed_urls), language="text")
+
+        # ⏭️ 已存在跳過清單
+        if skipped_existing_items:
+            st.divider()
+            with st.expander(f"⏭️ 查看因已存在而自動跳過的檔案 ({len(skipped_existing_items)} 部)", expanded=True):
+                for e_i, e_item in enumerate(skipped_existing_items, 1):
+                    loc_str = f" ｜ 實際位置: `{e_item.get('matched_loc')}`" if e_item.get('matched_loc') else ""
+                    st.markdown(f"**{e_i}.** `{e_item.get('filename')}` ｜ 存在於: {e_item.get('where_desc')}{loc_str}")
 
         # ⚠️ 跳過檔案詳細清單
         if skipped_items:
@@ -292,6 +373,8 @@ def render_download_summary_report(summary_data=None):
             st.session_state.last_batch_summary = None
             st.session_state.skipped_ramdisk_files = []
             st.session_state.successful_downloads = []
+            st.session_state.failed_downloads = []
+            st.session_state.skipped_existing_files = []
             st.rerun()
 
 
@@ -550,15 +633,15 @@ def unpack_dean_packer(packed_js):
     return packed_code
 
 def normalize_input_url(url_str):
-    url_str = url_str.strip()
+    url_str = url_str.strip().strip("'\"").strip("`").strip()
     if not url_str:
         return url_str
     if url_str.startswith("http://") or url_str.startswith("https://"):
         return url_str
     if os.path.exists(url_str):
         return url_str
-    # 若包含常見影音平台網域但漏填 https:// (例如 missav.ai/..., youtube.com/...)
-    if any(domain in url_str.lower() for domain in [".com", ".ai", ".tv", ".ws", ".net", ".org", ".me", ".co", "youtube", "facebook", "instagram", "tiktok", "twitter", "missav", "movieffm", "mvffm"]):
+    # 若包含常見影音平台網域但漏填 https:// (例如 missav.ai/..., youtube.com/..., youtu.be/...)
+    if any(domain in url_str.lower() for domain in [".com", ".ai", ".tv", ".ws", ".net", ".org", ".me", ".co", ".be", "youtube", "youtu.be", "facebook", "instagram", "tiktok", "twitter", "missav", "movieffm", "mvffm"]):
         return "https://" + url_str.lstrip('/')
     # 若輸入的是 MissAV / 平台番號與代碼 (例如 JD-054791cdbc62ac51e7c79c59f86b72960)
     if re.match(r'^[a-zA-Z0-9\-_]{5,}$', url_str):
@@ -2803,6 +2886,7 @@ def download_media(media_item, force_audio=False):
         link_md = f" [🔗 開啟連結]({matched_loc})" if (matched_loc and matched_loc.startswith("http")) else ""
         st.success(f"⏭️ **目標位置已存在同名/同番號檔案，自動跳過下載**: `{filename}`\n\n*(存在於: {where_desc})*{link_md}")
         curr_proc_url = st.session_state.get('current_processing_url')
+        record_skipped_existing_item(curr_proc_url or media_item.get('webpage_url') or media_url, filename, where_desc=where_desc, matched_loc=matched_loc)
         if curr_proc_url:
             st.session_state[f"stage_{curr_proc_url}"] = "COMPLETED"
         return
@@ -2899,12 +2983,14 @@ def download_media(media_item, force_audio=False):
                 f"目標路徑: {downloads_dir}\n原因: {write_err}\n\n💡 建議：若為外接硬碟 (如 Windows NTFS)，macOS 預設為唯讀模式無法直接寫入。\n請至上方將儲存路徑切換為 Mac 本機資料夾 (如 Downloads)，或使用支援 macOS 寫入的磁碟格式 (如 APFS、exFAT)。",
                 title="目錄寫入權限錯誤 (Read-only)"
             )
+            record_failed_download(st.session_state.get('current_processing_url') or media_url, title=title, reason=f"目標目錄無寫入權限 ({downloads_dir}): {write_err}")
             return
         os.makedirs(downloads_dir, exist_ok=True)
         out_path = os.path.join(downloads_dir, filename)
         
         if os.path.exists(out_path):
             st.success(f"⏭️ 檔案已存在，自動跳過: `{filename}`")
+            record_skipped_existing_item(st.session_state.get('current_processing_url') or media_url, filename, where_desc=f"目錄 `{downloads_dir}`", matched_loc=out_path)
             return
         st.info(f"📍 檔案將以 {ext.upper()} 格式儲存至本機: `{out_path}`")
     
@@ -3023,10 +3109,12 @@ def download_media(media_item, force_audio=False):
                             break
 
                 if actual_out:
-                    _mark_and_finish_output_file(actual_out, filename)
+                    actual_filename = os.path.basename(actual_out) if not is_gdrive else filename
+                    _mark_and_finish_output_file(actual_out, actual_filename)
                     return
                 else:
                     show_error_log_box("❌ 下載失敗！無法產生影片檔案。", f"Target Output Path: {out_path}", title=f"{platform_name} 下載失敗", url=target_url)
+                    record_failed_download(st.session_state.get('current_processing_url') or target_url, title=title, reason=f"{platform_name} 下載失敗：無法產生影片檔案 ({out_path})")
                     return
             except Exception as yt_err:
                 err_str = str(yt_err)
@@ -3035,6 +3123,7 @@ def download_media(media_item, force_audio=False):
                     show_error_log_box(friendly_msg, traceback.format_exc(), title="Bilibili 412 風控限制", url=target_url)
                 else:
                     show_error_log_box(f"❌ {platform_name} 下載失敗: {yt_err}", traceback.format_exc(), title=f"{platform_name} 下載詳細錯誤日誌", url=target_url)
+                record_failed_download(st.session_state.get('current_processing_url') or target_url, title=title, reason=f"{platform_name} 下載失敗: {err_str}")
                 return
             finally:
                 if temp_cookie and os.path.exists(temp_cookie):
@@ -3052,6 +3141,7 @@ def download_media(media_item, force_audio=False):
                 f"錯誤傳入的 Input: '{media_url}'\n說明: 該輸入非有效的 HTTP/HTTPS 網址，且本機找不到此檔案。請確認輸入的網址格式（需包含 http:// 或 https://）或本機檔案是否存在。",
                 url=media_url
             )
+            record_failed_download(st.session_state.get('current_processing_url') or media_url, title=title, reason=f"無效的媒體網址或檔案路徑: {media_url}")
             return
 
         if is_valid_url:
@@ -3062,6 +3152,7 @@ def download_media(media_item, force_audio=False):
                 except Exception:
                     friendly_msg = f"❌ 影片伺服器網域失效：主機名稱 `{parsed_host}` 在網際網路上不存在 (DNS 解析失敗)。\n\n💡 **原因與建議**：該影片來源伺服器已被官方下線或 CDN 網域已過期失效。\n若您是在 Movieffm / Gimy 等影音網站觀看，請回到該網頁**切換其他播放線路**（如 FLV 2、FLV 3、線路 B、海外線路等）再進行下載。"
                     show_error_log_box(friendly_msg, f"Target Host: {parsed_host}\nTarget URL: {media_url}\nError: [Errno 8] nodename nor servname provided, or not known", title="DNS 無效與伺服器已下線診斷", url=media_url)
+                    record_failed_download(st.session_state.get('current_processing_url') or media_url, title=title, reason=f"DNS 解析失敗: {parsed_host}")
                     return
 
         headers_arg = []
@@ -3146,6 +3237,7 @@ def download_media(media_item, force_audio=False):
                 show_error_log_box(friendly_msg, stderr_log, title="唯讀磁碟寫入錯誤 (Read-only file system)", url=media_url)
             else:
                 show_error_log_box("❌ FFmpeg 下載失敗！", stderr_log, url=media_url)
+            record_failed_download(st.session_state.get('current_processing_url') or media_url, title=title, reason=f"FFmpeg 下載失敗 (code={returncode}): {stderr_log[-300:] if stderr_log else ''}")
         
         gc.collect()
     except Exception as e:
@@ -3156,6 +3248,7 @@ def download_media(media_item, force_audio=False):
             show_error_log_box(friendly_msg, traceback.format_exc(), title="DNS 解析與連線錯誤日誌", url=media_url)
         else:
             show_error_log_box(f"❌ 發生例外錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=media_url)
+        record_failed_download(st.session_state.get('current_processing_url') or media_url, title=title, reason=f"例外錯誤: {err_str}")
         st.caption("Note: 如果看到找不到指令的錯誤，請確認系統已安裝 FFmpeg (`brew install ffmpeg`)。")
     finally:
         # 若中途被中斷（使用者跳過）或下載失敗，清理未完成的殘留暫存檔以釋放空間
@@ -4179,6 +4272,8 @@ with tab1:
             st.session_state.is_video_batch_running = True
             st.session_state.skipped_ramdisk_files = []
             st.session_state.successful_downloads = []
+            st.session_state.failed_downloads = []
+            st.session_state.skipped_existing_files = []
             st.session_state.last_batch_summary = None
             st.rerun()
 
@@ -4190,17 +4285,21 @@ with tab1:
         if idx >= len(queue):
             skipped = st.session_state.get('skipped_ramdisk_files', [])
             success = st.session_state.get('successful_downloads', [])
+            failed = st.session_state.get('failed_downloads', [])
+            skipped_existing = st.session_state.get('skipped_existing_files', [])
             total_tasks = len(queue)
             st.session_state.last_batch_summary = {
                 "total_count": total_tasks,
                 "skipped_items": list(skipped),
                 "success_items": list(success),
+                "failed_items": list(failed),
+                "skipped_existing_items": list(skipped_existing),
                 "stopped_early": False
             }
             st.session_state.is_video_batch_running = False
             st.session_state.video_batch_queue = []
             st.session_state.video_batch_idx = 0
-            if not skipped:
+            if not skipped and not failed and len(success) > 0:
                 st.balloons()
             st.rerun()
         else:
@@ -4297,12 +4396,14 @@ with tab1:
 
                     if not media_items:
                         st.error(f"❌ 找不到有效的影片串流網址: {url}")
+                        record_failed_download(url, reason="找不到有效的影片串流網址")
                     else:
                         for item in media_items:
                             download_media(item)
 
                 except Exception as e:
                     show_error_log_box(f"❌ 處理 {url} 時發生錯誤: {e}", traceback.format_exc(), title="Exception 堆疊追蹤資訊", url=url)
+                    record_failed_download(url, reason=str(e))
 
                 st.session_state[f"stage_{url}"] = "COMPLETED"
                 st.session_state.video_batch_idx = idx + 1
