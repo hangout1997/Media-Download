@@ -570,10 +570,24 @@ def _is_youtube_url(url_str):
     return any(d in u for d in ["youtube.com", "youtu.be", "googlevideo.com"])
 
 
+def _get_available_yt_browsers():
+    """偵測本機實際存在 Cookies 資料庫的瀏覽器，避免對未使用的瀏覽器報錯"""
+    home = os.path.expanduser("~")
+    candidates = [
+        ("chrome", ("chrome",), os.path.join(home, "Library/Application Support/Google/Chrome/Default/Cookies")),
+        ("comet", ("chrome", os.path.join(home, "Library/Application Support/Comet/Default")), os.path.join(home, "Library/Application Support/Comet/Default/Cookies")),
+        ("brave", ("brave",), os.path.join(home, "Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies")),
+        ("edge", ("edge",), os.path.join(home, "Library/Application Support/Microsoft Edge/Default/Cookies")),
+        ("firefox", ("firefox",), os.path.join(home, "Library/Application Support/Firefox/Profiles")),
+        ("safari", ("safari",), os.path.join(home, "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")),
+    ]
+    return [(name, cfb_arg) for name, cfb_arg, check_path in candidates if os.path.exists(check_path)]
+
+
 def run_ytdlp_with_youtube_auth(target_url, base_opts, action_fn):
     """
     執行 yt-dlp 操作，針對 YouTube「Sign in to confirm you're not a bot」驗證阻擋，
-    依使用者設定或自動讀取本機瀏覽器 Cookies (Chrome/Brave/Edge/Firefox/Safari) 重試。
+    依使用者設定或自動讀取本機瀏覽器 Cookies 重試。
     """
     import copy
     import yt_dlp
@@ -589,7 +603,7 @@ def run_ytdlp_with_youtube_auth(target_url, base_opts, action_fn):
         with yt_dlp.YoutubeDL(opts) as ydl:
             return action_fn(ydl)
 
-    def _opts_with_cookies(browser=None, cookiefile_path=None):
+    def _opts_with_cookies(cfb_arg=None, cookiefile_path=None):
         o = copy.deepcopy(base_opts)
         # 帶入 Cookies 時移除強制 android/ios client，讓 yt-dlp 使用支援 cookies 的預設/web client
         if 'extractor_args' in o and 'youtube' in o['extractor_args']:
@@ -597,8 +611,8 @@ def run_ytdlp_with_youtube_auth(target_url, base_opts, action_fn):
             o['extractor_args'].pop('youtube', None)
             if not o['extractor_args']:
                 o.pop('extractor_args', None)
-        if browser:
-            o['cookiesfrombrowser'] = (browser,)
+        if cfb_arg:
+            o['cookiesfrombrowser'] = cfb_arg
         if cookiefile_path:
             o['cookiefile'] = cookiefile_path
         return o
@@ -618,16 +632,24 @@ def run_ytdlp_with_youtube_auth(target_url, base_opts, action_fn):
                     pass
 
     # 2. 指定本機瀏覽器模式
-    if auth_mode in ('chrome', 'safari', 'edge', 'firefox', 'brave'):
-        return _run_with_opts(_opts_with_cookies(browser=auth_mode))
+    browser_map = {
+        "chrome": ("chrome",),
+        "comet": ("chrome", os.path.expanduser("~/Library/Application Support/Comet/Default")),
+        "safari": ("safari",),
+        "edge": ("edge",),
+        "firefox": ("firefox",),
+        "brave": ("brave",),
+    }
+    if auth_mode in browser_map:
+        return _run_with_opts(_opts_with_cookies(cfb_arg=browser_map[auth_mode]))
 
-    # 3. 自動模式：若本輪已有成功過的瀏覽器，優先直接帶入；否則先裸連，遇到 bot 驗證再依序嘗試本機瀏覽器
-    cached_browser = st.session_state.get('yt_auto_detected_browser')
-    if cached_browser:
+    # 3. 自動模式：若本輪已有成功過的瀏覽器，優先直接帶入；否則先裸連，遇到 bot 驗證再依序嘗試本機實際存在 Cookies 的瀏覽器
+    cached_cfb = st.session_state.get('yt_auto_detected_cfb')
+    if cached_cfb:
         try:
-            return _run_with_opts(_opts_with_cookies(browser=cached_browser))
+            return _run_with_opts(_opts_with_cookies(cfb_arg=cached_cfb))
         except Exception:
-            st.session_state.pop('yt_auto_detected_browser', None)
+            st.session_state.pop('yt_auto_detected_cfb', None)
 
     try:
         return _run_with_opts(base_opts)
@@ -650,22 +672,24 @@ def run_ytdlp_with_youtube_auth(target_url, base_opts, action_fn):
                     except Exception:
                         pass
 
-        # 依序嘗試本機已登入 YouTube 的瀏覽器
+        # 依序嘗試本機實際存在 Cookies 的瀏覽器
+        available_browsers = _get_available_yt_browsers()
         browser_errors = []
-        for browser in ('chrome', 'brave', 'edge', 'firefox', 'safari'):
+        for b_name, cfb_arg in available_browsers:
             try:
-                res = _run_with_opts(_opts_with_cookies(browser=browser))
-                st.session_state['yt_auto_detected_browser'] = browser
+                res = _run_with_opts(_opts_with_cookies(cfb_arg=cfb_arg))
+                st.session_state['yt_auto_detected_cfb'] = cfb_arg
                 return res
             except Exception as b_err:
-                browser_errors.append(f"{browser}: {b_err}")
+                browser_errors.append(f"{b_name}: {b_err}")
 
         raise ValueError(
             "YouTube 要求登入驗證（Sign in to confirm you're not a bot），且自動讀取本機瀏覽器 Cookie 未成功。\n\n"
-            "💡 **解決方式（擇一）**：\n"
-            "1. 確認您已在 **Chrome / Safari / Edge / Firefox** 登入 YouTube，並在上方「🔑 YouTube 驗證」選擇該瀏覽器（若跳出 macOS 鑰匙圈授權視窗請按「允許」）。\n"
-            "2. 或在「🔑 YouTube 驗證」選擇「手動貼上 Cookie」，貼入瀏覽器匯出的 `cookies.txt` 內容。\n\n"
-            f"嘗試瀏覽器紀錄: {' | '.join(browser_errors[:3])}"
+            "💡 **最快的解決方式（擇一）**：\n"
+            "1. **用「手動貼上 YouTube Cookie」**（最穩）：在您平常看 YouTube 的瀏覽器（如 Comet）安裝「Get cookies.txt LOCALLY」擴充功能，於 YouTube 頁面匯出後貼到上方。\n"
+            "2. **打開 Google Chrome 並登入一次 YouTube**：您的 Mac 已安裝 Chrome 但尚未建立設定檔；只要開啟 Chrome 登入 YouTube 後，本程式就能自動讀取。\n"
+            "3. **若使用 VPN（如 Surfshark）**：YouTube 常封鎖 VPN 節點 IP，可嘗試暫停 VPN 或切換節點後再下載。\n\n"
+            f"已偵測並嘗試的瀏覽器: {' | '.join(browser_errors) if browser_errors else '本機找不到已建立的 Chrome/Brave/Edge/Firefox/Safari Cookies 資料庫'}"
         )
 
 def cn_to_an(cn_str):
@@ -4269,7 +4293,8 @@ with tab1:
         st.session_state.bili_cookie = bili_cookie_str
 
     yt_auth_labels = {
-        "auto": "🤖 自動 (遇 Bot 驗證時自動讀取本機 Chrome/瀏覽器)",
+        "auto": "🤖 自動 (遇 Bot 驗證時自動讀取本機瀏覽器)",
+        "comet": "☄️ 本機 Comet 登入狀態",
         "chrome": "🌐 本機 Chrome 登入狀態 (推薦)",
         "safari": "🧭 本機 Safari 登入狀態",
         "edge": "🔷 本機 Edge 登入狀態",
