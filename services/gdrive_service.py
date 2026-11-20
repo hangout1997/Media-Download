@@ -27,17 +27,23 @@ FOLDER_MIME = 'application/vnd.google-apps.folder'
 DEFAULT_FOLDER_NAME = "Download"
 
 # 以 token 檔案 mtime 與 generation 為 key 快取 service / 帳號資訊，避免每次 Streamlit rerun 都打 API
-_cache_lock = threading.Lock()
-_api_lock = threading.Lock()
-_thread_local = threading.local()
-_cache_generation = 0
-_account_cache = {"key": None, "email": None}
+if "_cache_lock" not in globals():
+    _cache_lock = threading.Lock()
+if "_api_lock" not in globals():
+    _api_lock = threading.Lock()
+if "_thread_local" not in globals():
+    _thread_local = threading.local()
+if "_cache_generation" not in globals():
+    _cache_generation = 0
+if "_account_cache" not in globals():
+    _account_cache = {"key": None, "email": None}
 
 # ========================================================
-# 全域頻寬暫停/恢復事件 (單例持久於模組，免疫 Streamlit Rerun 覆蓋)
+# 全域頻寬暫停/恢復事件 (單例持久於模組，免疫 Streamlit Rerun / reload 覆蓋)
 # ========================================================
-_GLOBAL_PAUSE_EVENT = threading.Event()
-_GLOBAL_PAUSE_EVENT.set()  # 預設為運行狀態 (未暫停)
+if "_GLOBAL_PAUSE_EVENT" not in globals():
+    _GLOBAL_PAUSE_EVENT = threading.Event()
+    _GLOBAL_PAUSE_EVENT.set()  # 預設為運行狀態 (未暫停)
 
 
 def get_pause_event():
@@ -618,7 +624,8 @@ class GDriveBackgroundUploadTask:
                 self.status = "failed"
 
 
-_ACTIVE_GDRIVE_UPLOADS = {}
+if "_ACTIVE_GDRIVE_UPLOADS" not in globals():
+    _ACTIVE_GDRIVE_UPLOADS = {}
 
 
 def get_or_create_upload_task(file_path, filename, folder_id, skip_if_exists=False, pause_event=None):

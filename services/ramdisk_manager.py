@@ -24,7 +24,8 @@ _total_ram = get_system_total_ram_gb()
 DEFAULT_SIZE_GB = 10 if _total_ram >= 24 else (6 if _total_ram >= 16 else 4)
 
 # 模組內部紀錄關聯的 ramdisk 裝置 (例如 /dev/disk4)
-_associated_device = None
+if "_associated_device" not in globals():
+    _associated_device = None
 
 
 def is_macos():
