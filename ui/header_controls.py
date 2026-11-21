@@ -227,6 +227,10 @@ def render_header_controls():
     )
 
     if st.session_state.storage_destination in ("gdrive_cloud", "colab_cloud"):
+        cred_path = gdrive_service.get_credentials_path()
+        is_auth = gdrive_service.is_authenticated()
+        user_email = gdrive_service.get_connected_account_email() if is_auth else None
+
         if st.session_state.storage_destination == "colab_cloud":
             col_c1, col_c2 = st.columns([3, 1])
             with col_c1:
@@ -241,30 +245,32 @@ def render_header_controls():
                     unsafe_allow_html=True,
                 )
 
-            hb_col1, hb_col2 = st.columns([5, 1])
-            with hb_col1:
-                hb = gdrive_bridge.get_worker_heartbeat()
-                if hb.get("online"):
-                    st.success(
-                        f"🟢 **雲端工作節點在線中**：{hb.get('message')}，可直接輸入網址下載！"
-                    )
-                else:
-                    st.warning(
-                        f"🟡 **雲端工作節點目前離線** ({hb.get('message')})\n\n"
-                        f"👉 若已在 Colab 執行模式一，可點擊右側「🔄 刷新狀態」；或點擊右上角「🚀 開啟 Colab 筆記本」重新點擊模式一即可。"
-                    )
-            with hb_col2:
-                st.markdown("<div style='margin-top: 4px;'></div>", unsafe_allow_html=True)
-                if st.button(
-                    "🔄 刷新狀態",
-                    use_container_width=True,
-                    help="重新檢查 Colab Worker 心跳",
-                ):
-                    st.rerun()
-
-        cred_path = gdrive_service.get_credentials_path()
-        is_auth = gdrive_service.is_authenticated()
-        user_email = gdrive_service.get_connected_account_email() if is_auth else None
+            if is_auth and user_email:
+                hb_col1, hb_col2 = st.columns([5, 1])
+                with hb_col1:
+                    hb = gdrive_bridge.get_worker_heartbeat()
+                    if hb.get("online"):
+                        st.success(
+                            f"🟢 **雲端工作節點在線中**：{hb.get('message')}，可直接輸入網址下載！"
+                        )
+                    else:
+                        st.warning(
+                            f"🟡 **雲端工作節點目前離線** ({hb.get('message')})\n\n"
+                            f"👉 若已在 Colab 執行模式一，可點擊右側「🔄 刷新狀態」；或點擊右上角「🚀 開啟 Colab 筆記本」重新點擊模式一即可。"
+                        )
+                with hb_col2:
+                    st.markdown("<div style='margin-top: 4px;'></div>", unsafe_allow_html=True)
+                    if st.button(
+                        "🔄 刷新狀態",
+                        use_container_width=True,
+                        help="重新檢查 Colab Worker 心跳",
+                    ):
+                        st.rerun()
+            else:
+                st.warning(
+                    "⚠️ **本機 Google Drive 授權已過期或尚未登入**，無法讀取 Colab 雲端節點心跳。\n\n"
+                    "👉 請先點擊下方「🔑 授權連接 Google Drive」重新登入，登入後即可自動恢復連線！"
+                )
 
         if is_auth and user_email:
             target_id, target_label = gdrive_service.get_target_folder()

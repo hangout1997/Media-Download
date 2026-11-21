@@ -150,7 +150,16 @@ def _load_creds(refresh=True):
             with open(TOKEN_FILE, 'w', encoding='utf-8') as token:
                 token.write(creds.to_json())
         except Exception as e:
-            print(f"Token refresh failed: {e}")
+            err_str = str(e)
+            print(f"Token refresh failed: {err_str}")
+            if "invalid_grant" in err_str.lower():
+                try:
+                    if os.path.exists(TOKEN_FILE):
+                        os.remove(TOKEN_FILE)
+                except Exception:
+                    pass
+                _account_cache["key"] = None
+                _account_cache["email"] = None
             return None
     return creds if creds and creds.valid else None
 
@@ -258,6 +267,8 @@ def execute_with_retry(request_factory, max_retries=3, delay=1.0):
                 service = get_gdrive_service(force_new=(attempt > 0))
                 request = request_factory(service)
                 return request.execute(num_retries=2)
+            except GDriveAuthRequired:
+                raise
             except Exception as e:
                 last_err = e
                 err_str = str(e).lower()
