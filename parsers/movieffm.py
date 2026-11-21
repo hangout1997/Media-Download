@@ -233,12 +233,13 @@ def parse_movieffm(url):
                         )
                         if cand_u and cand_u != chosen_ep_url and cand_u not in backup_ep_urls:
                             backup_ep_urls.append(cand_u)
-                    for src_list in data:
-                        cand_u = _find_ep_in_source(
-                            src_list, target_ep_num, chosen_raw_name, idx
-                        )
-                        if cand_u and cand_u != chosen_ep_url and cand_u not in backup_ep_urls:
-                            backup_ep_urls.append(cand_u)
+                    if not valid_sources:
+                        for src_list in data:
+                            cand_u = _find_ep_in_source(
+                                src_list, target_ep_num, chosen_raw_name, idx
+                            )
+                            if cand_u and cand_u != chosen_ep_url and cand_u not in backup_ep_urls:
+                                backup_ep_urls.append(cand_u)
 
                     items.append({
                         "url": chosen_ep_url,

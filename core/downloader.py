@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import urllib.parse
 
 import requests
 import yt_dlp
@@ -219,6 +220,7 @@ def download_media_to_path(
 
     # 2. HLS / m3u8 多線程切片下載
     last_hls_err = None
+    hls_error_summary = []
     if "m3u8" in media_url and not force_audio:
         cand_m3u8s = [media_url] + [
             u for u in media_item.get("backup_urls", []) if u != media_url
@@ -266,8 +268,12 @@ def download_media_to_path(
                     except Exception:
                         pass
                 last_hls_err = hls_err
+                host_label = urllib.parse.urlparse(c_url).netloc or c_url
+                hls_error_summary.append(f"[{host_label}] {hls_err}")
                 if c_idx == len(cand_m3u8s) - 1:
-                    _log(f"多線程下載備援耗盡: {hls_err}")
+                    _log(
+                        f"多線程下載備援耗盡 ({len(hls_error_summary)} 條線路): {hls_error_summary[0]}"
+                    )
 
         is_cf_protected = (
             any(k in media_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"])
@@ -484,6 +490,19 @@ def download_media_to_path(
         )
     ]
     actual_err = " | ".join(err_lines[-4:]) if err_lines else stderr[-300:]
+    if hls_error_summary:
+        summary_text = " | ".join(hls_error_summary[:3])
+        if len(hls_error_summary) > 3:
+            summary_text += f" ...（共 {len(hls_error_summary)} 條線路皆失敗）"
+        err_msg = (
+            f"多線程 HLS 下載失敗 ({summary_text})，且 FFmpeg 備援亦失敗: {actual_err}"
+        )
+        if "403" in summary_text or "403" in actual_err:
+            err_msg += (
+                "\n💡 提示：來源串流 CDN 回傳 403 Forbidden（常見於封鎖 Google Colab 雲端機房 IP）。"
+                "建議將儲存目標切換為『☁️ Google Drive 雲端直送（本機下載自動同步）』或『📁 本機硬碟資料夾』以家用 IP 下載。"
+            )
+        raise RuntimeError(err_msg)
     if last_hls_err:
         raise RuntimeError(
             f"多線程 HLS 下載失敗 ({last_hls_err})，且 FFmpeg 備援亦失敗: {actual_err}"

@@ -230,6 +230,17 @@ def download_fast_parallel_hls(
             req_headers["Sec-Fetch-Mode"] = "cors"
             req_headers["Sec-Fetch-Site"] = "cross-site"
 
+        is_cf_domain = (
+            any(k in m3u8_url for k in ["surrit", "ppqrrs", "play-cdn", "bfikun"])
+            or "missav" in req_headers.get("Referer", "")
+            or "missav" in req_headers.get("Origin", "")
+        )
+        no_ref_headers = {
+            k: v
+            for k, v in req_headers.items()
+            if k.lower() not in ("referer", "origin")
+        }
+
         session = get_global_session()
         thread_local = threading.local()
 
@@ -240,10 +251,13 @@ def download_fast_parallel_hls(
 
         def fetch_text(target_url):
             err_details = []
+            got_403 = False
             try:
                 r = get_curl_session().get(target_url, headers=req_headers, timeout=30)
                 if r.status_code == 200 and r.text:
                     return r.text
+                if r.status_code == 403:
+                    got_403 = True
                 err_details.append(f"curl_cffi HTTP {r.status_code}")
             except Exception as e:
                 err_details.append(f"curl_cffi: {e}")
@@ -251,9 +265,21 @@ def download_fast_parallel_hls(
                 r = session.get(target_url, headers=req_headers, timeout=30)
                 if r.status_code == 200 and r.text:
                     return r.text
+                if r.status_code == 403:
+                    got_403 = True
                 err_details.append(f"requests HTTP {r.status_code}")
             except Exception as e:
                 err_details.append(f"requests: {e}")
+            if got_403 and not is_cf_domain:
+                try:
+                    r = get_curl_session().get(
+                        target_url, headers=no_ref_headers, timeout=30
+                    )
+                    if r.status_code == 200 and r.text:
+                        return r.text
+                    err_details.append(f"curl_cffi(no-ref) HTTP {r.status_code}")
+                except Exception as e:
+                    err_details.append(f"curl_cffi(no-ref): {e}")
             diag = "; ".join(err_details)
             raise ValueError(f"無法讀取 m3u8 串流選單 ({target_url}): {diag}")
 
@@ -453,6 +479,7 @@ def download_fast_parallel_hls(
                 if abort_event is not None and abort_event.is_set():
                     return -1, b""
 
+                seg_got_403 = False
                 if is_cf_protected:
                     try:
                         r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
@@ -468,7 +495,9 @@ def download_fast_parallel_hls(
                     r = session.get(seg_url, headers=req_headers, timeout=15)
                     if r.status_code == 200 and len(r.content) > 0:
                         return idx, r.content
-                    elif r.status_code != 200 and len(seg_fail_sample) < 3:
+                    if r.status_code == 403:
+                        seg_got_403 = True
+                    if r.status_code != 200 and len(seg_fail_sample) < 3:
                         seg_fail_sample.append(f"requests HTTP {r.status_code}")
                 except Exception as e:
                     if len(seg_fail_sample) < 3:
@@ -478,11 +507,28 @@ def download_fast_parallel_hls(
                     r = get_curl_session().get(seg_url, headers=req_headers, timeout=20)
                     if r.status_code == 200 and len(r.content) > 0:
                         return idx, r.content
-                    elif r.status_code != 200 and len(seg_fail_sample) < 3:
+                    if r.status_code == 403:
+                        seg_got_403 = True
+                    if r.status_code != 200 and len(seg_fail_sample) < 3:
                         seg_fail_sample.append(f"curl_cffi HTTP {r.status_code}")
                 except Exception as e:
                     if len(seg_fail_sample) < 3:
                         seg_fail_sample.append(f"curl_cffi: {e}")
+
+                if seg_got_403 and not is_cf_protected:
+                    try:
+                        r = get_curl_session().get(
+                            seg_url, headers=no_ref_headers, timeout=20
+                        )
+                        if r.status_code == 200 and len(r.content) > 0:
+                            return idx, r.content
+                        elif r.status_code != 200 and len(seg_fail_sample) < 3:
+                            seg_fail_sample.append(
+                                f"curl_cffi(no-ref) HTTP {r.status_code}"
+                            )
+                    except Exception as e:
+                        if len(seg_fail_sample) < 3:
+                            seg_fail_sample.append(f"curl_cffi(no-ref): {e}")
 
                 if attempt < 2:
                     time.sleep(0.5 * (2 ** attempt))
