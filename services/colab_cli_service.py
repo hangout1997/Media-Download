@@ -312,15 +312,20 @@ def main():
                     log=f"下載中 {int(pct * 100)}% ({speed_mb:.2f} MB/s)",
                 )
 
+            res_path = None
             try:
-                if only_audio:
-                    ok, err = cd.extract_audio_to_path(item, local_temp_path, cookies=cookies, progress_cb=_prog)
-                else:
-                    ok, err = cd.download_media_to_path(item, local_temp_path, cookies=cookies, progress_cb=_prog)
+                res_path = cd.download_media_to_path(
+                    item,
+                    out_path=local_temp_path,
+                    force_audio=only_audio,
+                    cookies=cookies,
+                    progress_cb=_prog,
+                    scratch_dir=work_dir,
+                )
 
-                if not ok or not os.path.exists(local_temp_path) or os.path.getsize(local_temp_path) == 0:
-                    failed_items.append({"url": url, "title": filename, "error": err or "下載後檔案為空"})
-                    emit("log", log=f"❌ 下載失敗: {filename} ({err})")
+                if not res_path or not os.path.exists(res_path) or os.path.getsize(res_path) == 0:
+                    failed_items.append({"url": url, "title": filename, "error": "下載後檔案不存在或大小為 0"})
+                    emit("log", log=f"❌ 下載失敗: {filename} (檔案為空)")
                     continue
 
                 def _up_prog(up_pct):
@@ -328,18 +333,19 @@ def main():
                     emit("status", current_item=filename, pct=overall, log=f"☁️ 直傳 Google Drive {int(up_pct * 100)}%")
 
                 emit("status", current_item=filename, pct=((idx - 1) + 0.85) / total_urls, log=f"☁️ 正在直傳 Google Drive: {filename}")
-                upload_to_drive(drive_service, folder_id, local_temp_path, filename, on_upload_progress=_up_prog)
+                upload_to_drive(drive_service, folder_id, res_path, filename, on_upload_progress=_up_prog)
                 success_files.append(filename)
                 emit("status", current_item=filename, pct=idx / total_urls, log=f"✅ 已直存雲端: {filename}")
             except Exception as e:
                 failed_items.append({"url": url, "title": filename, "error": traceback.format_exc()})
                 emit("log", log=f"❌ 處理例外: {filename} ({e})")
             finally:
-                if os.path.exists(local_temp_path):
-                    try:
-                        os.remove(local_temp_path)
-                    except Exception:
-                        pass
+                for p in {local_temp_path, res_path}:
+                    if p and os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
 
     if failed_items and not success_files:
         emit("failed", log=f"全部 {len(failed_items)} 個項目失敗", error=json.dumps(failed_items, ensure_ascii=False, indent=2))

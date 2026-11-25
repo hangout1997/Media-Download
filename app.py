@@ -14,8 +14,9 @@ import gdrive_service
 import media_converter  # noqa: F401
 import ramdisk_manager
 
+from services import colab_cli_service
 # 自動熱重載自訂子模組，確保前端每次 Rerun / 重新整理時永遠套用最新程式碼
-for _mod in (gdrive_service, ramdisk_manager):
+for _mod in (gdrive_service, ramdisk_manager, colab_cli_service):
     if _mod.__name__ in sys.modules:
         try:
             importlib.reload(_mod)
