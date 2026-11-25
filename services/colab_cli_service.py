@@ -456,7 +456,7 @@ def run_media_task_via_colab_cli(
         # 4. 遠端執行並即時串流進度
         _emit_prog("Colab VM 開始執行下載任務...", 0.08, 0.0, "遠端執行中")
         proc = subprocess.Popen(
-            [colab_bin, "exec", "-s", session_name, "-f", runner_path],
+            [colab_bin, "exec", "-s", session_name, "--timeout", "1800", "-f", runner_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
