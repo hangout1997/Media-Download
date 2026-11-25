@@ -7,6 +7,7 @@ Google Colab CLI Headless 派發服務
 
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -19,13 +20,27 @@ from core.macos_utils import BASE_DIR
 EVENT_PREFIX = "@@COLAB_EVENT@@"
 
 
+def _real_home():
+    """取得系統真實使用者家目錄（避免啟動環境覆寫 HOME 導致 macOS Keychain 讀取不到 Colab OAuth Token）。"""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        return os.path.expanduser("~")
+
+
+def _colab_env():
+    env = os.environ.copy()
+    env["HOME"] = _real_home()
+    return env
+
+
 def find_colab_bin():
     """尋找本機安裝的 `colab` 執行檔路徑（相容 GUI/venv 啟動時 PATH 缺少 ~/.local/bin 的情境）。"""
     found = shutil.which("colab")
     if found:
         return found
     candidates = [
-        os.path.expanduser("~/.local/bin/colab"),
+        os.path.join(_real_home(), ".local/bin/colab"),
         "/opt/homebrew/bin/colab",
         "/usr/local/bin/colab",
     ]
@@ -51,6 +66,7 @@ def get_colab_usage(timeout=20):
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_colab_env(),
         )
         out = (proc.stdout or "") + "\n" + (proc.stderr or "")
         if proc.returncode != 0:
@@ -413,7 +429,7 @@ def run_media_task_via_colab_cli(
         if gpu:
             new_cmd.extend(["--gpu", gpu])
         _emit_prog(f"啟動 Colab 雲端主機 ({session_name})...", 0.03, 0.0, f"執行: {' '.join(new_cmd)}")
-        res_new = subprocess.run(new_cmd, capture_output=True, text=True, timeout=180)
+        res_new = subprocess.run(new_cmd, capture_output=True, text=True, timeout=180, env=_colab_env())
         if res_new.returncode != 0:
             err_msg = (res_new.stderr or res_new.stdout or "").strip()
             return {"status": "failed", "log": "啟動 Colab VM 失敗", "error": err_msg}
@@ -431,6 +447,7 @@ def run_media_task_via_colab_cli(
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env=_colab_env(),
             )
             if res_up.returncode != 0:
                 err_msg = (res_up.stderr or res_up.stdout or "").strip()
@@ -444,6 +461,7 @@ def run_media_task_via_colab_cli(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=_colab_env(),
         )
 
         final_result = None
@@ -497,6 +515,7 @@ def run_media_task_via_colab_cli(
                     capture_output=True,
                     text=True,
                     timeout=60,
+                    env=_colab_env(),
                 )
             except Exception:
                 pass
