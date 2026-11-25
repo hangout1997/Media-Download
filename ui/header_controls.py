@@ -14,7 +14,7 @@ from core.macos_utils import (
     load_download_dir,
     release_system_resources,
 )
-from services import gdrive_bridge, gdrive_service, ramdisk_manager
+from services import colab_cli_service, gdrive_bridge, gdrive_service, ramdisk_manager
 from ui.state import (
     DEST_COLAB,
     DEST_GDRIVE,
@@ -232,45 +232,87 @@ def render_header_controls():
         user_email = gdrive_service.get_connected_account_email() if is_auth else None
 
         if st.session_state.storage_destination == "colab_cloud":
-            col_c1, col_c2 = st.columns([3, 1])
-            with col_c1:
-                st.info(
-                    "🤖 **Google Colab 雲端直存模式**：由 Colab 遠端主機以千兆頻寬極速下載並直接封裝至 Google Drive，本機 0 頻寬消耗！"
-                )
-            with col_c2:
-                st.markdown(
-                    f'<a href="{gdrive_bridge.COLAB_NOTEBOOK_URL}" target="_blank">'
-                    f'<button style="width:100%;margin-top:4px;padding:8px 0;background-color:#F9AB00;color:black;border:none;border-radius:6px;font-weight:bold;cursor:pointer;">'
-                    f"🚀 開啟 Colab 筆記本</button></a>",
-                    unsafe_allow_html=True,
-                )
+            cli_available = colab_cli_service.is_colab_cli_available()
+            if "colab_dispatch_mode" not in st.session_state:
+                st.session_state.colab_dispatch_mode = "cli" if cli_available else "notebook"
 
-            if is_auth and user_email:
-                hb_col1, hb_col2 = st.columns([5, 1])
-                with hb_col1:
-                    hb = gdrive_bridge.get_worker_heartbeat()
-                    if hb.get("online"):
+            mode_options = (
+                ["cli", "notebook"] if cli_available else ["notebook"]
+            )
+            mode_labels = {
+                "cli": "⚡ Colab CLI 全自動派發（免開瀏覽器，跑完自動關機）",
+                "notebook": "📓 傳統 Notebook Worker（手動開啟瀏覽器分頁）",
+            }
+            st.radio(
+                "🔧 **Colab 派發引擎**:",
+                options=mode_options,
+                format_func=lambda k: mode_labels[k],
+                key="colab_dispatch_mode",
+                horizontal=True,
+            )
+
+            if st.session_state.colab_dispatch_mode == "cli" and cli_available:
+                u_col1, u_col2 = st.columns([5, 1])
+                with u_col1:
+                    if "colab_usage_cache" not in st.session_state:
+                        st.session_state.colab_usage_cache = colab_cli_service.get_colab_usage()
+                    usage_info = st.session_state.colab_usage_cache
+                    if usage_info.get("ok"):
+                        bal = usage_info.get("balance")
+                        bal_txt = f"**{bal:.2f}** Compute Units" if bal is not None else "已授權"
                         st.success(
-                            f"🟢 **雲端工作節點在線中**：{hb.get('message')}，可直接輸入網址下載！"
+                            f"⚡ **Colab CLI 已就緒** ｜ 剩餘額度：{bal_txt} ｜ 執行中節點：`{usage_info.get('active_assignments', 0)}`（任務完成將自動釋放 VM）"
                         )
                     else:
                         st.warning(
-                            f"🟡 **雲端工作節點目前離線** ({hb.get('message')})\n\n"
-                            f"👉 若已在 Colab 執行模式一，可點擊右側「🔄 刷新狀態」；或點擊右上角「🚀 開啟 Colab 筆記本」重新點擊模式一即可。"
+                            f"⚠️ **Colab CLI 尚未完成授權或查詢失敗**：`{usage_info.get('error', '')}`\n\n"
+                            "👉 請先於終端機執行 `colab usage` 完成登入授權，或切換為傳統 Notebook 模式。"
                         )
-                with hb_col2:
+                with u_col2:
                     st.markdown("<div style='margin-top: 4px;'></div>", unsafe_allow_html=True)
-                    if st.button(
-                        "🔄 刷新狀態",
-                        use_container_width=True,
-                        help="重新檢查 Colab Worker 心跳",
-                    ):
+                    if st.button("🔄 刷新額度", use_container_width=True, key="btn_refresh_colab_usage"):
+                        st.session_state.colab_usage_cache = colab_cli_service.get_colab_usage()
                         st.rerun()
             else:
-                st.warning(
-                    "⚠️ **本機 Google Drive 授權已過期或尚未登入**，無法讀取 Colab 雲端節點心跳。\n\n"
-                    "👉 請先點擊下方「🔑 授權連接 Google Drive」重新登入，登入後即可自動恢復連線！"
-                )
+                col_c1, col_c2 = st.columns([3, 1])
+                with col_c1:
+                    st.info(
+                        "🤖 **Google Colab 雲端直存模式**：由 Colab 遠端主機以千兆頻寬極速下載並直接封裝至 Google Drive，本機 0 頻寬消耗！"
+                    )
+                with col_c2:
+                    st.markdown(
+                        f'<a href="{gdrive_bridge.COLAB_NOTEBOOK_URL}" target="_blank">'
+                        f'<button style="width:100%;margin-top:4px;padding:8px 0;background-color:#F9AB00;color:black;border:none;border-radius:6px;font-weight:bold;cursor:pointer;">'
+                        f"🚀 開啟 Colab 筆記本</button></a>",
+                        unsafe_allow_html=True,
+                    )
+
+                if is_auth and user_email:
+                    hb_col1, hb_col2 = st.columns([5, 1])
+                    with hb_col1:
+                        hb = gdrive_bridge.get_worker_heartbeat()
+                        if hb.get("online"):
+                            st.success(
+                                f"🟢 **雲端工作節點在線中**：{hb.get('message')}，可直接輸入網址下載！"
+                            )
+                        else:
+                            st.warning(
+                                f"🟡 **雲端工作節點目前離線** ({hb.get('message')})\n\n"
+                                f"👉 若已在 Colab 執行模式一，可點擊右側「🔄 刷新狀態」；或點擊右上角「🚀 開啟 Colab 筆記本」重新點擊模式一即可。"
+                            )
+                    with hb_col2:
+                        st.markdown("<div style='margin-top: 4px;'></div>", unsafe_allow_html=True)
+                        if st.button(
+                            "🔄 刷新狀態",
+                            use_container_width=True,
+                            help="重新檢查 Colab Worker 心跳",
+                        ):
+                            st.rerun()
+                else:
+                    st.warning(
+                        "⚠️ **本機 Google Drive 授權已過期或尚未登入**，無法讀取 Colab 雲端節點心跳。\n\n"
+                        "👉 請先點擊下方「🔑 授權連接 Google Drive」重新登入，登入後即可自動恢復連線！"
+                    )
 
         if is_auth and user_email:
             target_id, target_label = gdrive_service.get_target_folder()

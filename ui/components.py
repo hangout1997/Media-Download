@@ -19,7 +19,7 @@ from core.hls import download_fast_parallel_hls
 from core.http_client import default_log_info, format_time, normalize_input_url
 from core.macos_utils import load_download_dir
 from parsers import ensure_m3u8_prefetched, get_media_items
-from services import gdrive_bridge, gdrive_service
+from services import colab_cli_service, gdrive_bridge, gdrive_service
 from ui.state import (
     cb_open_finder,
     cb_play_video,
@@ -633,6 +633,69 @@ def dispatch_and_monitor_colab_task(urls, only_audio=False):
                 default_log_info(f"{tag}: {u}, 原因: {e}")
 
     noun = "音訊提取任務" if only_audio else "下載任務"
+    use_cli_mode = (
+        st.session_state.get("colab_dispatch_mode", "cli") == "cli"
+        and colab_cli_service.is_colab_cli_available()
+    )
+
+    if use_cli_mode:
+        st.info(f"⚡ 正在透過 **Colab CLI** 自動開機並執行 {len(urls)} 個{noun}（免開瀏覽器，完成後自動關機）...")
+        status_placeholder = st.empty()
+        progress_bar = st.progress(0.0)
+        detail_placeholder = st.empty()
+        prog_prefix = "Colab CLI 音訊進度" if only_audio else "Colab CLI 進度"
+
+        def _on_prog(item_name, pct, speed_mb, log_msg):
+            progress_bar.progress(min(max(float(pct), 0.0), 1.0))
+            speed_text = f" | ⚡ {speed_mb:.2f} MB/s" if speed_mb > 0 else ""
+            status_placeholder.markdown(
+                f"⚡ **{prog_prefix}**: `{item_name}` ({int(pct * 100)}%){speed_text}"
+            )
+            if log_msg:
+                detail_placeholder.caption(f"📝 最新訊息: `{log_msg}`")
+
+        def _on_log(msg):
+            detail_placeholder.caption(f"📝 最新訊息: `{msg}`")
+
+        spinner_msg = "⏳ Colab CLI 雲端主機提取音訊中..." if only_audio else "⏳ Colab CLI 雲端主機下載並直傳中..."
+        with st.spinner(spinner_msg):
+            res = colab_cli_service.run_media_task_via_colab_cli(
+                urls=urls,
+                resolved_map=resolved_map,
+                save_folder=save_folder,
+                target_folder_id=target_id,
+                only_audio=only_audio,
+                cookies=cookies,
+                token_path=gdrive_service.TOKEN_FILE,
+                skip_duplicates=st.session_state.get("gdrive_skip_dup", True),
+                on_progress=_on_prog,
+                on_log=_on_log,
+            )
+
+        if res.get("status") == "completed":
+            progress_bar.progress(1.0)
+            folder_link = (
+                gdrive_service.get_folder_link(target_id)
+                if target_id
+                else "https://drive.google.com/drive/my-drive"
+            )
+            st.balloons()
+            done_msg = (
+                f"🎉 Colab CLI 已全數提取完成並自動釋放 VM！音訊檔已保存在 [我的雲端硬碟 `/{save_folder}/`]({folder_link})。"
+                if only_audio
+                else f"🎉 Colab CLI 已全數下載並直傳完成（VM 已自動關閉）！檔案已保存在 [我的雲端硬碟 `/{save_folder}/`]({folder_link})。"
+            )
+            st.success(done_msg)
+            if res.get("failed_items"):
+                with st.expander(f"⚠️ 部分項目失敗 ({len(res['failed_items'])} 個)", expanded=True):
+                    st.json(res["failed_items"])
+        else:
+            st.error(f"❌ Colab CLI 執行失敗: {res.get('log', '未知錯誤')}")
+            if res.get("error"):
+                with st.expander("🔍 查看詳細雲端錯誤日誌", expanded=True):
+                    st.code(res["error"])
+        return
+
     st.info(f"🚀 正在將 {len(urls)} 個{noun}派送至 Google Colab Worker...")
     try:
         task_id = gdrive_bridge.submit_cloud_task(
